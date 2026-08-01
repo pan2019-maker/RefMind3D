@@ -1051,15 +1051,17 @@ export function App() {
     const point = lastCanvasPointRef.current;
     const spacing = 36;
     const offset = index * spacing;
+    const width = Math.max(24, asset.width);
+    const height = Math.max(24, asset.height);
     useProjectStore.getState().addAssetsAndNodes([asset], [{
       id: nodeId,
       type: 'image',
       assetId: asset.id,
       title: asset.name,
-      x: Math.round(point.x + offset),
-      y: Math.round(point.y + offset),
-      width: Math.max(24, asset.width),
-      height: Math.max(24, asset.height),
+      x: Math.round(point.x - width / 2 + offset),
+      y: Math.round(point.y - height / 2 + offset),
+      width,
+      height,
       rotation: 0,
       zIndex: nextZIndex()
     }]);
@@ -2578,13 +2580,13 @@ export function App() {
         // system-first order could paste an older OS clipboard image instead
         // of the text node the user had just copied on another canvas.
         if (preferInternalClipboardRef.current && useProjectStore.getState().clipboardNodes.length > 0) {
-          pasteClipboard();
+          pasteClipboard(lastCanvasPointRef.current);
           setStatus('已粘贴复制的节点');
           return;
         }
         void handleSystemClipboardPaste().then((handled) => {
           if (!handled) {
-            pasteClipboard();
+            pasteClipboard(lastCanvasPointRef.current);
             setStatus('已粘贴');
           }
         });
@@ -2978,7 +2980,7 @@ export function App() {
           <div className="menu-separator" />
           <button onClick={runMenuAction(() => { copySelected(); setStatus('已复制选中节点'); closeMenu(); })} disabled={selectedNodeIds.length === 0}>复制节点布局</button>
           <button onClick={runMenuAction(async () => { await copySelectedImageToSystemClipboard(); closeMenu(); })} disabled={!project.nodes.some((node) => selectedNodeIds.includes(node.id) && node.type === 'image')}>复制图片到系统剪贴板 {shortcutLabel(settings.shortcuts.copy)}</button>
-          <button onClick={runMenuAction(() => { pasteClipboard(); setStatus('已粘贴'); closeMenu(); })} disabled={clipboardNodes.length === 0}>粘贴 {shortcutLabel(settings.shortcuts.paste)}</button>
+          <button onClick={runMenuAction(() => { pasteClipboard(lastCanvasPointRef.current); setStatus('已粘贴'); closeMenu(); })} disabled={clipboardNodes.length === 0}>粘贴 {shortcutLabel(settings.shortcuts.paste)}</button>
           <button onClick={runMenuAction(() => createText(lastCanvasPoint.x, lastCanvasPoint.y))}>文本 {shortcutLabel(settings.shortcuts.text)}</button>
           <button onClick={runMenuAction(toggleDraw)}>绘制 {shortcutLabel(settings.shortcuts.draw)}</button>
           <div className="menu-row has-submenu">组<span className="submenu-arrow">›</span>
