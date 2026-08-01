@@ -839,6 +839,7 @@ export function App() {
   const [settings, setSettings] = useState<AppSettings>(() => readSettings());
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
+  const preferInternalClipboardRef = useRef(false);
 
   useLayoutEffect(() => {
     if (contextMenu && menuRef.current) {
@@ -1616,7 +1617,6 @@ export function App() {
     }
     try {
       await invoke('copy_image_asset_to_clipboard', { asset });
-      copySelected();
       setStatus(`已复制图片到系统剪贴板：${asset.name}`);
       return true;
     } catch (error) {
@@ -2552,16 +2552,36 @@ export function App() {
       }
       if (matchesShortcut(event, settings.shortcuts.copy)) {
         prevent();
-        void copySelectedImageToSystemClipboard().then((copiedImage) => {
-          if (!copiedImage) {
-            copySelected();
-            setStatus('已复制选中节点');
-          }
-        });
+        if (selectedNodeIds.length === 0) {
+          setStatus('请先选择要复制的节点');
+          return;
+        }
+
+        // The internal node clipboard is authoritative for canvas-to-canvas
+        // copy/paste. Save it synchronously before the optional system image
+        // clipboard write so text nodes cannot be lost behind stale image data.
+        copySelected();
+        preferInternalClipboardRef.current = true;
+        const includesImage = project.nodes.some((node) => (
+          selectedNodeIds.includes(node.id) && node.type === 'image' && node.assetId
+        ));
+        if (includesImage) {
+          void copySelectedImageToSystemClipboard();
+        } else {
+          setStatus(`已复制 ${selectedNodeIds.length} 个节点`);
+        }
         return;
       }
       if (matchesShortcut(event, settings.shortcuts.paste)) {
         prevent();
+        // Prefer the app's node clipboard after an in-app copy. The previous
+        // system-first order could paste an older OS clipboard image instead
+        // of the text node the user had just copied on another canvas.
+        if (preferInternalClipboardRef.current && useProjectStore.getState().clipboardNodes.length > 0) {
+          pasteClipboard();
+          setStatus('已粘贴复制的节点');
+          return;
+        }
         void handleSystemClipboardPaste().then((handled) => {
           if (!handled) {
             pasteClipboard();
@@ -2589,11 +2609,17 @@ export function App() {
       setContextMenu(null);
       setOpacityPanelOpen(false);
     };
+    const onBlur = () => {
+      close();
+      // Returning from another application usually means its clipboard is
+      // newer, so allow externally copied images to take precedence again.
+      preferInternalClipboardRef.current = false;
+    };
     window.addEventListener('click', close);
-    window.addEventListener('blur', close);
+    window.addEventListener('blur', onBlur);
     return () => {
       window.removeEventListener('click', close);
-      window.removeEventListener('blur', close);
+      window.removeEventListener('blur', onBlur);
     };
   }, []);
 
