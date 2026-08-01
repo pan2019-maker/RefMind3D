@@ -24,7 +24,7 @@ interface ProjectState {
   undo: () => void;
   redo: () => void;
   copySelected: () => void;
-  pasteClipboard: () => void;
+  pasteClipboard: (at?: { x: number; y: number }) => void;
   bringNodesToFront: (ids: string[]) => void;
   bringSelectedToFront: () => void;
   sendSelectedToBack: () => void;
@@ -356,15 +356,21 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     set({ clipboardNodes: cloneProject({ ...state.project, nodes }).nodes });
   },
 
-  pasteClipboard: () => set((state) => {
+  pasteClipboard: (at) => set((state) => {
     if (state.clipboardNodes.length === 0) return state;
     let z = maxZ(state.project.nodes);
+    const minX = Math.min(...state.clipboardNodes.map((node) => node.x));
+    const minY = Math.min(...state.clipboardNodes.map((node) => node.y));
+    const maxX = Math.max(...state.clipboardNodes.map((node) => node.x + node.width));
+    const maxY = Math.max(...state.clipboardNodes.map((node) => node.y + node.height));
+    const offsetX = at ? Math.round(at.x - (minX + maxX) / 2) : 36;
+    const offsetY = at ? Math.round(at.y - (minY + maxY) / 2) : 36;
     const pasted = state.clipboardNodes.map((node) => ({
       ...node,
       id: crypto.randomUUID(),
       groupId: undefined,
-      x: node.x + 36,
-      y: node.y + 36,
+      x: node.x + offsetX,
+      y: node.y + offsetY,
       zIndex: ++z
     }));
     return {
