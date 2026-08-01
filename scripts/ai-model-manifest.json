@@ -1,0 +1,37 @@
+{
+  "vision": [
+    {
+      "id": "qwen25vl-7b-6g",
+      "displayName": "Qwen2.5-VL 7B",
+      "runtime": "ollama",
+      "ollamaModelName": "qwen2.5vl:7b",
+      "recommendedVramGb": 6,
+      "installSize": "~5-6 GB",
+      "licenseLabel": "Apache-2.0",
+      "installerComponentId": "vision.qwen25vl7b",
+      "description": "Lightweight vision understanding for documents and reference images"
+    },
+    {
+      "id": "minicpm-v45-8g",
+      "displayName": "MiniCPM-V 4.5",
+      "runtime": "ollama",
+      "ollamaModelName": "minicpm-v4.5",
+      "recommendedVramGb": 8,
+      "installSize": "~6-8 GB",
+      "licenseLabel": "Verify before commercial release",
+      "installerComponentId": "vision.minicpmv45",
+      "description": "Enhanced vision understanding and Chinese image-text analysis"
+    },
+    {
+      "id": "gemma3-12b-12g",
+      "displayName": "Gemma 3 12B",
+      "runtime": "ollama",
+      "ollamaModelName": "gemma3:12b",
+      "recommendedVramGb": 12,
+      "installSize": "~8-9 GB",
+      "licenseLabel": "Gemma Terms of Use",
+      "installerComponentId": "vision.gemma312b",
+      "description": "Higher quality visual reasoning and image Q&A"
+    }
+  ]
+}

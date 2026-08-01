@@ -1,0 +1,39 @@
+[package]
+name = "refmind3d"
+version = "1.1.1"
+description = "Maintainable PureRef-like image and 3D reference board"
+authors = ["RefMind3D Team"]
+edition = "2021"
+
+[lib]
+name = "refmind3d_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["protocol-asset"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+thiserror = "1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "tiff", "tga", "hdr", "exr", "avif", "ico", "bmp", "dds"] }
+psd = "0.3"
+infer = "0.16"
+gltf = "1.4"
+walkdir = "2"
+time = "=0.3.36"
+
+base64 = "0.22"
+calamine = "0.24"
+arboard = "3.4"
+
+zip = { version = "2", default-features = false, features = ["deflate"] }
+encoding_rs = "0.8"
+
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "system-proxy"] }

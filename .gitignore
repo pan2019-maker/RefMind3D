@@ -1,0 +1,17 @@
+node_modules/
+dist/
+.DS_Store
+src-tauri/target/
+RefMind3D_Project/
+PROJECT_HANDOFF.md
+release/
+vendor/
+.env
+.env.*
+!.env.example
+*.refmind3d
+*.refmind
+*.exe
+*.msi
+*.zip
+*.log
