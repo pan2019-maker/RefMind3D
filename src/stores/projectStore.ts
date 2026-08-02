@@ -117,6 +117,9 @@ function normalizeProject(project: RefMindProject): RefMindProject {
     })),
     doodles: (project.doodles || []).map((stroke) => ({
       id: stroke.id || crypto.randomUUID(),
+      tool: (stroke.tool === 'arrow' || stroke.tool === 'rectangle' || stroke.tool === 'ellipse'
+        ? stroke.tool
+        : 'brush') as DoodleStroke['tool'],
       color: /^#[0-9a-fA-F]{6}$/.test(stroke.color || '') ? stroke.color : '#ff4d4f',
       width: Math.max(1, Math.min(40, Number(stroke.width) || 6)),
       points: (stroke.points || [])
