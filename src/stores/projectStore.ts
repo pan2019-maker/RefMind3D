@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { AssetRecord, CanvasNode, ImportedImage, MindLink, RefMindProject } from '../shared/types';
+import type { AssetRecord, CanvasNode, DoodleStroke, ImportedImage, MindLink, RefMindProject } from '../shared/types';
 import { FREE_TEXT_FONT_FAMILY, freeTextNodeSize } from '../shared/freeText';
 
 interface ProjectState {
@@ -32,6 +32,9 @@ interface ProjectState {
   moveSelectedBackward: () => void;
   createTextNode: (x?: number, y?: number, startEditing?: boolean) => string;
   createDrawBox: (x: number, y: number, width: number, height: number) => void;
+  addDoodleStroke: (stroke: DoodleStroke) => void;
+  undoLastDoodle: () => void;
+  clearDoodles: () => void;
   groupSelected: () => void;
   ungroupSelected: () => void;
   toggleSelectedGroupLock: () => void;
@@ -58,6 +61,7 @@ function createEmptyProject(): RefMindProject {
     assets: [],
     nodes: [],
     links: [],
+    doodles: [],
     createdAt: now(),
     updatedAt: now()
   };
@@ -111,6 +115,18 @@ function normalizeProject(project: RefMindProject): RefMindProject {
       color: link.color || '#8a8a8a',
       width: link.width || 2
     })),
+    doodles: (project.doodles || []).map((stroke) => ({
+      id: stroke.id || crypto.randomUUID(),
+      color: /^#[0-9a-fA-F]{6}$/.test(stroke.color || '') ? stroke.color : '#ff4d4f',
+      width: Math.max(1, Math.min(40, Number(stroke.width) || 6)),
+      points: (stroke.points || [])
+        .filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y))
+        .map((point) => ({
+          x: point.x,
+          y: point.y,
+          pressure: Math.max(0.05, Math.min(1, Number(point.pressure) || 1))
+        }))
+    })).filter((stroke) => stroke.points.length > 0),
     createdAt: project.createdAt || now(),
     updatedAt: project.updatedAt || now()
   };
@@ -487,6 +503,35 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
       ...withHistory(state),
       project: { ...state.project, nodes: applyGroupRules([...state.project.nodes, node]), updatedAt: now() },
       selectedNodeIds: [node.id]
+    };
+  }),
+
+  addDoodleStroke: (stroke) => set((state) => {
+    if (stroke.points.length === 0) return state;
+    return {
+      ...withHistory(state),
+      project: {
+        ...state.project,
+        doodles: [...(state.project.doodles || []), stroke],
+        updatedAt: now()
+      }
+    };
+  }),
+
+  undoLastDoodle: () => set((state) => {
+    const doodles = state.project.doodles || [];
+    if (doodles.length === 0) return state;
+    return {
+      ...withHistory(state),
+      project: { ...state.project, doodles: doodles.slice(0, -1), updatedAt: now() }
+    };
+  }),
+
+  clearDoodles: () => set((state) => {
+    if ((state.project.doodles || []).length === 0) return state;
+    return {
+      ...withHistory(state),
+      project: { ...state.project, doodles: [], updatedAt: now() }
     };
   }),
 

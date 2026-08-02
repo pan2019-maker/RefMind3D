@@ -164,6 +164,19 @@ export interface MindLink {
   width: number;
 }
 
+export interface DoodlePoint {
+  x: number;
+  y: number;
+  pressure: number;
+}
+
+export interface DoodleStroke {
+  id: string;
+  color: string;
+  width: number;
+  points: DoodlePoint[];
+}
+
 export interface RefMindProject {
   version: 1;
   name: string;
@@ -171,6 +184,7 @@ export interface RefMindProject {
   assets: AssetRecord[];
   nodes: CanvasNode[];
   links: MindLink[];
+  doodles?: DoodleStroke[];
   createdAt: string;
   updatedAt: string;
 }

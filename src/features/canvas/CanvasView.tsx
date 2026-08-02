@@ -1,7 +1,7 @@
-import { MouseEvent as ReactMouseEvent, useEffect, useMemo, useRef, useState, type CSSProperties, type MutableRefObject } from 'react';
+import { MouseEvent as ReactMouseEvent, useEffect, useMemo, useRef, useState, type CSSProperties, type MutableRefObject, type PointerEvent as ReactPointerEvent } from 'react';
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { useProjectStore } from '../../stores/projectStore';
-import type { AssetRecord, CanvasNode, ImportedModel, SpreadsheetCell, SpreadsheetCellStyle, SpreadsheetMerge, SpreadsheetSheet, SpreadsheetWorkbook } from '../../shared/types';
+import type { AssetRecord, CanvasNode, DoodleStroke, ImportedModel, SpreadsheetCell, SpreadsheetCellStyle, SpreadsheetMerge, SpreadsheetSheet, SpreadsheetWorkbook } from '../../shared/types';
 import { ModelViewer } from '../model-viewer/ModelViewer';
 import { FREE_TEXT_FONT_FAMILY, FREE_TEXT_PLACEHOLDER, freeTextNodeSize } from '../../shared/freeText';
 
@@ -518,6 +518,9 @@ export function CanvasView({
   focusContentKey,
   showGrid = true,
   drawMode = false,
+  doodleMode = false,
+  doodleColor = '#ff4d4f',
+  doodleWidth = 6,
   mindChildShortcut = 'Alt+RightMouse',
   onOpenModel,
   onPointerWorldChange
@@ -525,6 +528,9 @@ export function CanvasView({
   focusContentKey?: string;
   showGrid?: boolean;
   drawMode?: boolean;
+  doodleMode?: boolean;
+  doodleColor?: string;
+  doodleWidth?: number;
   mindChildShortcut?: string;
   onOpenModel?: (asset: ImportedModel) => void;
   onPointerWorldChange?: (point: Point) => void;
@@ -540,6 +546,7 @@ export function CanvasView({
     beginHistory,
     bringNodesToFront,
     createDrawBox,
+    addDoodleStroke,
     createMindChild,
     createMindLink,
     deleteMindLink,
@@ -566,6 +573,7 @@ export function CanvasView({
     scopeGroupId?: string;
   } | null>(null);
   const [drawRect, setDrawRect] = useState<{ startX: number; startY: number; endX: number; endY: number } | null>(null);
+  const [activeDoodleStroke, setActiveDoodleStroke] = useState<DoodleStroke | null>(null);
   const [editingNodeId, setEditingNodeId] = useState<string | null>(null);
   const [activeSheetByNode, setActiveSheetByNode] = useState<Record<string, number>>({});
   const [selectedSheetCellByNode, setSelectedSheetCellByNode] = useState<Record<string, { row: number; col: number }>>({});
@@ -598,6 +606,8 @@ export function CanvasView({
   } | null>(null);
   const zoomRef = useRef<ViewState | null>(null);
   const wheelTimeoutRef = useRef<number | null>(null);
+  const activeDoodleRef = useRef<DoodleStroke | null>(null);
+  const activeDoodlePointerRef = useRef<number | null>(null);
 
   const flushZoom = () => {
     if (wheelTimeoutRef.current !== null) {
@@ -869,6 +879,79 @@ export function CanvasView({
     return point;
   };
 
+  const samplePressure = (event: PointerEvent) => {
+    if (event.pointerType !== 'pen') return 1;
+    return Math.max(0.05, Math.min(1, event.pressure || 0.05));
+  };
+
+  const extendDoodleStroke = (stroke: DoodleStroke, samples: PointerEvent[]) => {
+    const points = stroke.points.slice();
+    for (const sample of samples) {
+      const point = worldPoint(sample.clientX, sample.clientY);
+      const previous = points[points.length - 1];
+      if (previous && Math.hypot(point.x - previous.x, point.y - previous.y) * view.scale < 0.75) continue;
+      points.push({ ...point, pressure: samplePressure(sample) });
+    }
+    return points.length === stroke.points.length ? stroke : { ...stroke, points };
+  };
+
+  const beginDoodleStroke = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!doodleMode || event.button !== 0 || event.altKey) return;
+    flushZoom();
+    event.preventDefault();
+    event.stopPropagation();
+    window.getSelection()?.removeAllRanges();
+    clearSelection();
+    setEditingNodeId(null);
+    setActiveGroupId(null);
+    const point = rememberPointer(event.clientX, event.clientY);
+    const stroke: DoodleStroke = {
+      id: crypto.randomUUID(),
+      color: doodleColor,
+      width: doodleWidth,
+      points: [{ ...point, pressure: samplePressure(event.nativeEvent) }]
+    };
+    activeDoodleRef.current = stroke;
+    activeDoodlePointerRef.current = event.pointerId;
+    setActiveDoodleStroke(stroke);
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+
+  const continueDoodleStroke = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!doodleMode || activeDoodlePointerRef.current !== event.pointerId || !activeDoodleRef.current) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const coalesced = event.nativeEvent.getCoalescedEvents?.() || [];
+    const samples = coalesced.length > 0 ? coalesced : [event.nativeEvent];
+    const next = extendDoodleStroke(activeDoodleRef.current, samples);
+    if (next === activeDoodleRef.current) return;
+    activeDoodleRef.current = next;
+    setActiveDoodleStroke(next);
+    const finalPoint = next.points[next.points.length - 1];
+    onPointerWorldChange?.(finalPoint);
+  };
+
+  const finishDoodleStroke = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (activeDoodlePointerRef.current !== event.pointerId || !activeDoodleRef.current) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const finalStroke = extendDoodleStroke(activeDoodleRef.current, [event.nativeEvent]);
+    addDoodleStroke(finalStroke);
+    activeDoodleRef.current = null;
+    activeDoodlePointerRef.current = null;
+    setActiveDoodleStroke(null);
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+  };
+
+  useEffect(() => {
+    if (doodleMode) return;
+    activeDoodleRef.current = null;
+    activeDoodlePointerRef.current = null;
+    setActiveDoodleStroke(null);
+  }, [doodleMode]);
+
   useEffect(() => {
     const bridge = window as unknown as { __refmind3dClientToWorld?: (clientX: number, clientY: number) => Point };
     bridge.__refmind3dClientToWorld = (clientX: number, clientY: number) => worldPoint(clientX, clientY);
@@ -1039,6 +1122,7 @@ export function CanvasView({
   const onCanvasMouseDown = (event: ReactMouseEvent) => {
     flushZoom();
     if (mouseShortcutMatches(event, mindChildShortcut)) return;
+    if (doodleMode && event.button === 0) return;
     setSelectedLinkId(null);
     if (event.button === 2) return;
     event.preventDefault();
@@ -1713,8 +1797,12 @@ export function CanvasView({
   return (
     <div
       ref={viewportRef}
-      className={`canvas-viewport ${drawMode ? 'draw-mode' : ''} ${activeGroupId ? 'group-edit-mode' : ''} ${lowZoom ? 'low-zoom' : ''} ${(drag || resize) ? 'is-interacting' : ''} ${drag?.pan ? 'is-panning' : ''}`}
+      className={`canvas-viewport ${drawMode ? 'draw-mode' : ''} ${doodleMode ? 'doodle-mode' : ''} ${activeGroupId ? 'group-edit-mode' : ''} ${lowZoom ? 'low-zoom' : ''} ${(drag || resize) ? 'is-interacting' : ''} ${drag?.pan ? 'is-panning' : ''}`}
       onWheel={onWheel}
+      onPointerDownCapture={beginDoodleStroke}
+      onPointerMoveCapture={continueDoodleStroke}
+      onPointerUpCapture={finishDoodleStroke}
+      onPointerCancelCapture={finishDoodleStroke}
       onMouseDown={onCanvasMouseDown}
       onMouseMove={onMouseMove}
       onMouseUp={onMouseUp}
@@ -1992,6 +2080,43 @@ export function CanvasView({
             />
           );
         })()}
+        <svg
+          className="doodle-layer"
+          width={viewportSize.width}
+          height={viewportSize.height}
+          viewBox={`0 0 ${viewportSize.width} ${viewportSize.height}`}
+          aria-hidden="true"
+        >
+          {[...(project.doodles || []), ...(activeDoodleStroke ? [activeDoodleStroke] : [])].map((stroke) => (
+            <g key={stroke.id}>
+              {stroke.points.length === 1 && (() => {
+                const point = toScreenPoint(stroke.points[0]);
+                const pressureWidth = stroke.width * (0.2 + stroke.points[0].pressure * 0.8) * view.scale;
+                return <circle cx={point.x} cy={point.y} r={Math.max(0.5, pressureWidth / 2)} fill={stroke.color} />;
+              })()}
+              {stroke.points.slice(1).map((point, index) => {
+                const previous = stroke.points[index];
+                const from = toScreenPoint(previous);
+                const to = toScreenPoint(point);
+                const pressure = (previous.pressure + point.pressure) / 2;
+                const pressureWidth = stroke.width * (0.2 + pressure * 0.8) * view.scale;
+                return (
+                  <line
+                    key={`${stroke.id}-${index}`}
+                    x1={from.x}
+                    y1={from.y}
+                    x2={to.x}
+                    y2={to.y}
+                    stroke={stroke.color}
+                    strokeWidth={Math.max(0.5, pressureWidth)}
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                );
+              })}
+            </g>
+          ))}
+        </svg>
       </div>
       {activeGroupId && <div className="group-edit-indicator">组内编辑：双击组后已解锁组内物体，点击空白处退出</div>}
     </div>

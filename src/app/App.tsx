@@ -130,6 +130,7 @@ function createEmptyCanvasProject(name: string): RefMindProject {
     assets: [],
     nodes: [],
     links: [],
+    doodles: [],
     createdAt: now,
     updatedAt: now
   };
@@ -825,6 +826,8 @@ export function App() {
     moveSelectedForward,
     moveSelectedBackward,
     fitSelectedImagesToNaturalSize,
+    undoLastDoodle,
+    clearDoodles,
     history,
     future,
     clipboardNodes
@@ -885,6 +888,9 @@ export function App() {
   const [closePromptMode, setClosePromptMode] = useState<'unsaved' | 'confirm' | null>(null);
   const [closeSaveBusy, setCloseSaveBusy] = useState(false);
   const [drawMode, setDrawMode] = useState(false);
+  const [doodleMode, setDoodleMode] = useState(false);
+  const [doodleColor, setDoodleColor] = useState('#ff4d4f');
+  const [doodleWidth, setDoodleWidth] = useState(6);
   const [modelPreview, setModelPreview] = useState<ImportedModel | null>(null);
   const [aiPrompt, setAiPrompt] = useState('');
   const [aiResponse, setAiResponse] = useState('');
@@ -2016,7 +2022,18 @@ export function App() {
     closeMenu();
     setDrawMode((current) => {
       const next = !current;
+      if (next) setDoodleMode(false);
       setStatus(next ? '绘制模式已开启：在画布拖拽可绘制框' : '绘制模式已关闭');
+      return next;
+    });
+  };
+
+  const toggleDoodle = () => {
+    closeMenu();
+    setDoodleMode((current) => {
+      const next = !current;
+      if (next) setDrawMode(false);
+      setStatus(next ? '涂鸦模式已开启：画笔会始终显示在所有画布内容上方' : '涂鸦模式已关闭');
       return next;
     });
   };
@@ -2714,6 +2731,9 @@ export function App() {
           focusContentKey={activeCanvasId}
           showGrid={settings.showGrid}
           drawMode={drawMode}
+          doodleMode={doodleMode}
+          doodleColor={doodleColor}
+          doodleWidth={doodleWidth}
           mindChildShortcut={settings.shortcuts.mindChild}
           onOpenModel={(asset) => {
             setModelPreview(asset);
@@ -2899,6 +2919,51 @@ export function App() {
         </div>
       </aside>
       {drawMode && <div className="floating-mode">绘制模式</div>}
+      {doodleMode && (
+        <section
+          className="doodle-toolbar"
+          aria-label="涂鸦工具"
+          onMouseDown={(event) => event.stopPropagation()}
+          onPointerDown={(event) => event.stopPropagation()}
+        >
+          <strong>涂鸦</strong>
+          <label className="doodle-color-control" title="画笔颜色">
+            <span>颜色</span>
+            <input
+              type="color"
+              value={doodleColor}
+              aria-label="画笔颜色"
+              onChange={(event) => setDoodleColor(event.currentTarget.value)}
+            />
+          </label>
+          <label className="doodle-width-control" title="画笔粗细">
+            <span>粗细</span>
+            <input
+              type="range"
+              min="1"
+              max="40"
+              step="1"
+              value={doodleWidth}
+              aria-label="画笔粗细"
+              onChange={(event) => setDoodleWidth(Number(event.currentTarget.value))}
+            />
+            <output>{doodleWidth}px</output>
+          </label>
+          <span className="doodle-pressure-badge" title="数位笔压力会实时改变线条宽度">压感开启</span>
+          <button
+            type="button"
+            onClick={() => { undoLastDoodle(); setStatus('已撤销当前画布的上一笔涂鸦'); }}
+            disabled={(project.doodles || []).length === 0}
+          >撤销上一笔</button>
+          <button
+            type="button"
+            className="doodle-clear-button"
+            onClick={() => { clearDoodles(); setStatus('已清除当前画布的全部涂鸦'); }}
+            disabled={(project.doodles || []).length === 0}
+          >一键清除</button>
+          <button type="button" onClick={() => { setDoodleMode(false); setStatus('涂鸦模式已关闭'); }}>完成</button>
+        </section>
+      )}
 
       {pendingCanvasDeletionId && (() => {
         const canvas = canvases.find((item) => item.id === pendingCanvasDeletionId);
@@ -2983,6 +3048,7 @@ export function App() {
           <button onClick={runMenuAction(() => { pasteClipboard(lastCanvasPointRef.current); setStatus('已粘贴'); closeMenu(); })} disabled={clipboardNodes.length === 0}>粘贴 {shortcutLabel(settings.shortcuts.paste)}</button>
           <button onClick={runMenuAction(() => createText(lastCanvasPoint.x, lastCanvasPoint.y))}>文本 {shortcutLabel(settings.shortcuts.text)}</button>
           <button onClick={runMenuAction(toggleDraw)}>绘制 {shortcutLabel(settings.shortcuts.draw)}</button>
+          <button onClick={runMenuAction(toggleDoodle)}>涂鸦</button>
           <div className="menu-row has-submenu">组<span className="submenu-arrow">›</span>
             <div className="submenu">
               <button onClick={runMenuAction(createGroup)} disabled={selectedNodeIds.length === 0}>打组 {shortcutLabel(settings.shortcuts.group)}</button>
@@ -3015,8 +3081,9 @@ export function App() {
           <div className="menu-separator" />
           <div className="menu-row has-submenu">模式<span className="submenu-arrow">›</span>
             <div className="submenu">
-              <button onClick={runMenuAction(() => { setDrawMode(false); setStatus('已切换到选择模式'); closeMenu(); })}>选择模式</button>
-              <button onClick={runMenuAction(() => { setDrawMode(true); setStatus('已切换到绘制模式'); closeMenu(); })}>绘制模式</button>
+              <button onClick={runMenuAction(() => { setDrawMode(false); setDoodleMode(false); setStatus('已切换到选择模式'); closeMenu(); })}>选择模式</button>
+              <button onClick={runMenuAction(() => { setDrawMode(true); setDoodleMode(false); setStatus('已切换到绘制模式'); closeMenu(); })}>绘制模式</button>
+              <button onClick={runMenuAction(() => { setDrawMode(false); setDoodleMode(true); setStatus('已切换到涂鸦模式'); closeMenu(); })}>涂鸦模式</button>
             </div>
           </div>
           <div className="menu-row has-submenu">窗口<span className="submenu-arrow">›</span>
