@@ -54,13 +54,13 @@ $shortcutIcon = Join-Path $Root "src-tauri\icons\icon.ico"
 if (!(Test-Path -LiteralPath $shortcutIcon)) {
   throw "Shortcut icon was not found: $shortcutIcon"
 }
-Copy-Item -LiteralPath $shortcutIcon -Destination (Join-Path $AppStage "RefMind3D-App-1.1.3.ico") -Force
+Copy-Item -LiteralPath $shortcutIcon -Destination (Join-Path $AppStage "RefMind3D-App-1.1.4.ico") -Force
 
 $projectIcon = Join-Path $Root "src-tauri\icons\refmind3d-file.ico"
 if (!(Test-Path -LiteralPath $projectIcon)) {
   throw "Project icon was not found: $projectIcon"
 }
-Copy-Item -LiteralPath $projectIcon -Destination (Join-Path $AppStage "RefMind3D-Project-1.1.3.ico") -Force
+Copy-Item -LiteralPath $projectIcon -Destination (Join-Path $AppStage "RefMind3D-Project-1.1.4.ico") -Force
 
 $downloadDir = Join-Path $Root "vendor\downloads"
 $webView2Installer = Join-Path $downloadDir "MicrosoftEdgeWebView2RuntimeInstallerX64.exe"
