@@ -170,8 +170,11 @@ export interface DoodlePoint {
   pressure: number;
 }
 
+export type DoodleTool = 'brush' | 'arrow' | 'rectangle' | 'ellipse';
+
 export interface DoodleStroke {
   id: string;
+  tool?: DoodleTool;
   color: string;
   width: number;
   points: DoodlePoint[];

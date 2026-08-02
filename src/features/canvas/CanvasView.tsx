@@ -1,7 +1,7 @@
 import { MouseEvent as ReactMouseEvent, useEffect, useMemo, useRef, useState, type CSSProperties, type MutableRefObject, type PointerEvent as ReactPointerEvent } from 'react';
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { useProjectStore } from '../../stores/projectStore';
-import type { AssetRecord, CanvasNode, DoodleStroke, ImportedModel, SpreadsheetCell, SpreadsheetCellStyle, SpreadsheetMerge, SpreadsheetSheet, SpreadsheetWorkbook } from '../../shared/types';
+import type { AssetRecord, CanvasNode, DoodleStroke, DoodleTool, ImportedModel, SpreadsheetCell, SpreadsheetCellStyle, SpreadsheetMerge, SpreadsheetSheet, SpreadsheetWorkbook } from '../../shared/types';
 import { ModelViewer } from '../model-viewer/ModelViewer';
 import { FREE_TEXT_FONT_FAMILY, FREE_TEXT_PLACEHOLDER, freeTextNodeSize } from '../../shared/freeText';
 
@@ -521,6 +521,7 @@ export function CanvasView({
   doodleMode = false,
   doodleColor = '#ff4d4f',
   doodleWidth = 6,
+  doodleTool = 'brush',
   mindChildShortcut = 'Alt+RightMouse',
   onOpenModel,
   onPointerWorldChange
@@ -531,6 +532,7 @@ export function CanvasView({
   doodleMode?: boolean;
   doodleColor?: string;
   doodleWidth?: number;
+  doodleTool?: DoodleTool;
   mindChildShortcut?: string;
   onOpenModel?: (asset: ImportedModel) => void;
   onPointerWorldChange?: (point: Point) => void;
@@ -885,6 +887,12 @@ export function CanvasView({
   };
 
   const extendDoodleStroke = (stroke: DoodleStroke, samples: PointerEvent[]) => {
+    if ((stroke.tool || 'brush') !== 'brush') {
+      const sample = samples[samples.length - 1];
+      if (!sample || !stroke.points[0]) return stroke;
+      const point = worldPoint(sample.clientX, sample.clientY);
+      return { ...stroke, points: [stroke.points[0], { ...point, pressure: 1 }] };
+    }
     const points = stroke.points.slice();
     for (const sample of samples) {
       const point = worldPoint(sample.clientX, sample.clientY);
@@ -907,6 +915,7 @@ export function CanvasView({
     const point = rememberPointer(event.clientX, event.clientY);
     const stroke: DoodleStroke = {
       id: crypto.randomUUID(),
+      tool: doodleTool,
       color: doodleColor,
       width: doodleWidth,
       points: [{ ...point, pressure: samplePressure(event.nativeEvent) }]
@@ -936,7 +945,13 @@ export function CanvasView({
     event.preventDefault();
     event.stopPropagation();
     const finalStroke = extendDoodleStroke(activeDoodleRef.current, [event.nativeEvent]);
-    addDoodleStroke(finalStroke);
+    const start = finalStroke.points[0];
+    const end = finalStroke.points[finalStroke.points.length - 1];
+    const isVisibleShape = (finalStroke.tool || 'brush') === 'brush'
+      || !start
+      || !end
+      || Math.hypot(end.x - start.x, end.y - start.y) * view.scale >= 2;
+    if (isVisibleShape) addDoodleStroke(finalStroke);
     activeDoodleRef.current = null;
     activeDoodlePointerRef.current = null;
     setActiveDoodleStroke(null);
@@ -2087,35 +2102,110 @@ export function CanvasView({
           viewBox={`0 0 ${viewportSize.width} ${viewportSize.height}`}
           aria-hidden="true"
         >
-          {[...(project.doodles || []), ...(activeDoodleStroke ? [activeDoodleStroke] : [])].map((stroke) => (
-            <g key={stroke.id}>
-              {stroke.points.length === 1 && (() => {
-                const point = toScreenPoint(stroke.points[0]);
-                const pressureWidth = stroke.width * (0.2 + stroke.points[0].pressure * 0.8) * view.scale;
-                return <circle cx={point.x} cy={point.y} r={Math.max(0.5, pressureWidth / 2)} fill={stroke.color} />;
-              })()}
-              {stroke.points.slice(1).map((point, index) => {
-                const previous = stroke.points[index];
-                const from = toScreenPoint(previous);
-                const to = toScreenPoint(point);
-                const pressure = (previous.pressure + point.pressure) / 2;
-                const pressureWidth = stroke.width * (0.2 + pressure * 0.8) * view.scale;
-                return (
+          {[...(project.doodles || []), ...(activeDoodleStroke ? [activeDoodleStroke] : [])].map((stroke) => {
+            const tool = stroke.tool || 'brush';
+            if (tool === 'brush') {
+              return (
+                <g key={stroke.id}>
+                  {stroke.points.length === 1 && (() => {
+                    const point = toScreenPoint(stroke.points[0]);
+                    const pressureWidth = stroke.width * (0.2 + stroke.points[0].pressure * 0.8) * view.scale;
+                    return <circle cx={point.x} cy={point.y} r={Math.max(0.5, pressureWidth / 2)} fill={stroke.color} />;
+                  })()}
+                  {stroke.points.slice(1).map((point, index) => {
+                    const previous = stroke.points[index];
+                    const from = toScreenPoint(previous);
+                    const to = toScreenPoint(point);
+                    const pressure = (previous.pressure + point.pressure) / 2;
+                    const pressureWidth = stroke.width * (0.2 + pressure * 0.8) * view.scale;
+                    return (
+                      <line
+                        key={`${stroke.id}-${index}`}
+                        x1={from.x}
+                        y1={from.y}
+                        x2={to.x}
+                        y2={to.y}
+                        stroke={stroke.color}
+                        strokeWidth={Math.max(0.5, pressureWidth)}
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                      />
+                    );
+                  })}
+                </g>
+              );
+            }
+
+            if (stroke.points.length < 2) return null;
+            const from = toScreenPoint(stroke.points[0]);
+            const to = toScreenPoint(stroke.points[stroke.points.length - 1]);
+            const outlineWidth = Math.max(0.75, stroke.width * view.scale);
+
+            if (tool === 'arrow') {
+              const dx = to.x - from.x;
+              const dy = to.y - from.y;
+              const length = Math.hypot(dx, dy);
+              if (length < 0.5) return null;
+              const ux = dx / length;
+              const uy = dy / length;
+              const headLength = Math.min(length * 0.6, Math.max(12, stroke.width * 3.5 * view.scale));
+              const headHalfWidth = Math.min(length * 0.35, Math.max(5, stroke.width * 1.75 * view.scale));
+              const baseX = to.x - ux * headLength;
+              const baseY = to.y - uy * headLength;
+              const px = -uy;
+              const py = ux;
+              const shaftWidth = Math.max(1, stroke.width * 0.35 * view.scale);
+              return (
+                <g key={stroke.id}>
                   <line
-                    key={`${stroke.id}-${index}`}
                     x1={from.x}
                     y1={from.y}
-                    x2={to.x}
-                    y2={to.y}
+                    x2={baseX + ux}
+                    y2={baseY + uy}
                     stroke={stroke.color}
-                    strokeWidth={Math.max(0.5, pressureWidth)}
+                    strokeWidth={shaftWidth}
                     strokeLinecap="round"
-                    strokeLinejoin="round"
                   />
-                );
-              })}
-            </g>
-          ))}
+                  <polygon
+                    points={`${to.x},${to.y} ${baseX + px * headHalfWidth},${baseY + py * headHalfWidth} ${baseX - px * headHalfWidth},${baseY - py * headHalfWidth}`}
+                    fill={stroke.color}
+                  />
+                </g>
+              );
+            }
+
+            const x = Math.min(from.x, to.x);
+            const y = Math.min(from.y, to.y);
+            const width = Math.abs(to.x - from.x);
+            const height = Math.abs(to.y - from.y);
+            if (tool === 'rectangle') {
+              return (
+                <rect
+                  key={stroke.id}
+                  x={x}
+                  y={y}
+                  width={width}
+                  height={height}
+                  fill="none"
+                  stroke={stroke.color}
+                  strokeWidth={outlineWidth}
+                  strokeLinejoin="round"
+                />
+              );
+            }
+            return (
+              <ellipse
+                key={stroke.id}
+                cx={x + width / 2}
+                cy={y + height / 2}
+                rx={width / 2}
+                ry={height / 2}
+                fill="none"
+                stroke={stroke.color}
+                strokeWidth={outlineWidth}
+              />
+            );
+          })}
         </svg>
       </div>
       {activeGroupId && <div className="group-edit-indicator">组内编辑：双击组后已解锁组内物体，点击空白处退出</div>}

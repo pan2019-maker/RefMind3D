@@ -13,7 +13,7 @@ import { exportEditableDocumentAsset, importClipboardImageDataUrl } from '../fea
 import { AI_VISION_MODELS, type AiModelManifest } from '../features/ai/modelManifest';
 import { loadProjectDataUrl, loadProjectFile, saveProjectFile } from '../features/project/projectIO';
 import { useProjectStore } from '../stores/projectStore';
-import type { AssetRecord, CanvasNode, ImportedModel, RefMindProject, RefMindProjectFile, RefMindWorkspaceFile } from '../shared/types';
+import type { AssetRecord, CanvasNode, DoodleTool, ImportedModel, RefMindProject, RefMindProjectFile, RefMindWorkspaceFile } from '../shared/types';
 import { exportProjectToPng, exportSelectedNodesToPng } from '../features/export/exportCanvas';
 
 interface ShortcutSettings {
@@ -891,6 +891,7 @@ export function App() {
   const [doodleMode, setDoodleMode] = useState(false);
   const [doodleColor, setDoodleColor] = useState('#ff4d4f');
   const [doodleWidth, setDoodleWidth] = useState(6);
+  const [doodleTool, setDoodleTool] = useState<DoodleTool>('brush');
   const [modelPreview, setModelPreview] = useState<ImportedModel | null>(null);
   const [aiPrompt, setAiPrompt] = useState('');
   const [aiResponse, setAiResponse] = useState('');
@@ -2734,6 +2735,7 @@ export function App() {
           doodleMode={doodleMode}
           doodleColor={doodleColor}
           doodleWidth={doodleWidth}
+          doodleTool={doodleTool}
           mindChildShortcut={settings.shortcuts.mindChild}
           onOpenModel={(asset) => {
             setModelPreview(asset);
@@ -2926,6 +2928,25 @@ export function App() {
           onMouseDown={(event) => event.stopPropagation()}
           onPointerDown={(event) => event.stopPropagation()}
         >
+          <div className="doodle-tool-picker" role="group" aria-label="涂鸦类型">
+            {([
+              ['brush', '✎', '画笔'],
+              ['arrow', '➜', '箭头'],
+              ['rectangle', '□', '矩形'],
+              ['ellipse', '○', '圆形']
+            ] as const).map(([tool, icon, label]) => (
+              <button
+                key={tool}
+                type="button"
+                className={doodleTool === tool ? 'active' : ''}
+                aria-pressed={doodleTool === tool}
+                title={label}
+                onClick={() => setDoodleTool(tool)}
+              >
+                <span aria-hidden="true">{icon}</span>{label}
+              </button>
+            ))}
+          </div>
           <strong>涂鸦</strong>
           <label className="doodle-color-control" title="画笔颜色">
             <span>颜色</span>
