@@ -1835,6 +1835,22 @@ h3 { font-size: 13px; color: #c8c8c8; margin-top: 16px; }
   border-top: 1px solid #444;
   border-bottom: 1px solid #444;
 }
+.cache-status-card {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 10px;
+  border: 1px solid #454545;
+  border-radius: 6px;
+  background: #292929;
+}
+.cache-status-card.is-error { border-color: #b95a5a; }
+.cache-status-card code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #d8d8d8; }
+.cache-status-label { color: #aaa; }
+.cache-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.cache-actions button.primary { border-color: #6f94e8; background: #365b9f; }
+.cache-error { margin: 0; color: #ff8d8d; }
 
 .ai-local-model-manager {
   display: grid;

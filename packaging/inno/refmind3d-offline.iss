@@ -1,5 +1,5 @@
 #define AppName "RefMind3D"
-#define AppVersion "1.0.0"
+#define AppVersion "1.1.6"
 #define Publisher "RefMind3D Team"
 #define StagingDir "..\..\release\offline-staging"
 
@@ -54,3 +54,36 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 Filename: "{tmp}\MicrosoftEdgeWebView2RuntimeInstallerX64.exe"; Parameters: "/silent /install"; StatusMsg: "Installing WebView2 Runtime..."; Flags: waituntilterminated skipifdoesntexist; Components: runtime
 Filename: "{tmp}\VC_redist.x64.exe"; Parameters: "/install /quiet /norestart"; StatusMsg: "Installing Visual C++ Runtime..."; Flags: waituntilterminated skipifdoesntexist; Components: runtime
 Filename: "{app}\refmind3d.exe"; Description: "Launch RefMind3D"; Flags: nowait postinstall skipifsilent
+
+[Code]
+var
+  DeleteCacheCheckbox: TNewCheckBox;
+
+procedure InitializeUninstallProgressForm();
+begin
+  DeleteCacheCheckbox := TNewCheckBox.Create(UninstallProgressForm);
+  DeleteCacheCheckbox.Parent := UninstallProgressForm;
+  DeleteCacheCheckbox.Left := UninstallProgressForm.StatusLabel.Left;
+  DeleteCacheCheckbox.Top := UninstallProgressForm.StatusLabel.Top + 44;
+  DeleteCacheCheckbox.Width := UninstallProgressForm.StatusLabel.Width;
+  DeleteCacheCheckbox.Caption := '同时删除 RefMind3D 图片缓存（默认保留）';
+  DeleteCacheCheckbox.Checked := False;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  CacheDir, CacheDirFile: String;
+  CacheDirRaw: AnsiString;
+begin
+  if (CurUninstallStep = usUninstall) and DeleteCacheCheckbox.Checked then
+  begin
+    CacheDirFile := ExpandConstant('{localappdata}\RefMind3D\cache-directory.txt');
+    CacheDir := ExpandConstant('{localappdata}\RefMind3D\ImageCache');
+    if FileExists(CacheDirFile) and LoadStringFromFile(CacheDirFile, CacheDirRaw) then CacheDir := String(CacheDirRaw);
+    CacheDir := Trim(CacheDir);
+    if (CacheDir <> '') and FileExists(AddBackslash(CacheDir) + '.refmind3d-image-cache') then
+      DelTree(CacheDir, True, True, True);
+    DeleteFile(ExpandConstant('{localappdata}\RefMind3D\cache-settings.json'));
+    DeleteFile(CacheDirFile);
+  end;
+end;

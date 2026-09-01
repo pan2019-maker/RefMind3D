@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
+use std::path::PathBuf;
+use std::time::UNIX_EPOCH;
 use std::sync::{Mutex, OnceLock};
 
 use tauri::http;
@@ -9,6 +11,7 @@ use zip::ZipArchive;
 #[derive(Clone)]
 pub enum ResourceBacking {
     Memory(Vec<u8>),
+    File(PathBuf),
     Packed {
         package_path: String,
         zip_path: String,
@@ -120,6 +123,32 @@ pub fn register_packed_resource(
     resource_url(&resource.asset_id, &resource.field)
 }
 
+pub fn register_file_resource(
+    asset_id: &str,
+    field: &str,
+    file_name: String,
+    mime: String,
+    path: PathBuf,
+) -> String {
+    resources().lock().unwrap().insert(
+        key(asset_id, field),
+        RuntimeResource { file_name, mime, backing: ResourceBacking::File(path) },
+    );
+    resource_url(asset_id, field)
+}
+
+pub fn resource_source_signature(value: &str) -> Option<(u64, u64)> {
+    let (asset_id, field) = parse_resource_url(value)?;
+    let resource = resources().lock().ok()?.get(&key(&asset_id, &field)).cloned()?;
+    let metadata = match resource.backing {
+        ResourceBacking::File(path) => std::fs::metadata(path).ok()?,
+        ResourceBacking::Packed { package_path, .. } => std::fs::metadata(package_path).ok()?,
+        ResourceBacking::Memory(bytes) => return Some((bytes.len() as u64, 0)),
+    };
+    let modified = metadata.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_millis() as u64;
+    Some((metadata.len(), modified))
+}
+
 pub fn read_resource(asset_id: &str, field: &str) -> Result<(Vec<u8>, String, String), String> {
     let resource = resources()
         .lock()
@@ -129,6 +158,8 @@ pub fn read_resource(asset_id: &str, field: &str) -> Result<(Vec<u8>, String, St
         .ok_or_else(|| "Resource is no longer available in this session".to_string())?;
     let bytes = match resource.backing {
         ResourceBacking::Memory(bytes) => bytes,
+        ResourceBacking::File(path) => std::fs::read(path)
+            .map_err(|e| format!("Read cached resource failed: {e}"))?,
         ResourceBacking::Packed {
             package_path,
             zip_path,

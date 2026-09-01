@@ -3,6 +3,7 @@ import { convertFileSrc } from '@tauri-apps/api/core';
 import { useProjectStore } from '../../stores/projectStore';
 import type { AssetRecord, CanvasNode, DoodleStroke, DoodleTool, ImportedModel, SpreadsheetCell, SpreadsheetCellStyle, SpreadsheetMerge, SpreadsheetSheet, SpreadsheetWorkbook } from '../../shared/types';
 import { ModelViewer } from '../model-viewer/ModelViewer';
+import { prepareImageCache, type PreparedImageCache } from '../assets/imageCache';
 import { FREE_TEXT_FONT_FAMILY, FREE_TEXT_PLACEHOLDER, freeTextNodeSize } from '../../shared/freeText';
 
 interface ViewState {
@@ -27,6 +28,7 @@ type ResizeHandle = 'n' | 's' | 'e' | 'w' | 'ne' | 'nw' | 'se' | 'sw';
 type SelectionMode = 'replace' | 'add' | 'subtract';
 
 const DIRECT_IMAGE_FORMATS = new Set(['png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif', 'ico', 'avif', 'svg']);
+const preparedImageCache = new Map<string, { value: PreparedImageCache; checkedAt: number }>();
 
 function isRuntimeResourceUrl(path: string) {
   return path.startsWith('refmind3d://') || path.startsWith('http://refmind3d.localhost') || path.startsWith('https://refmind3d.localhost');
@@ -470,23 +472,47 @@ function cloneWorkbook(workbook: SpreadsheetWorkbook): SpreadsheetWorkbook {
   return JSON.parse(JSON.stringify(workbook)) as SpreadsheetWorkbook;
 }
 
-const CanvasImage = ({ asset, lowZoom, alt, selected, title }: {
+const CanvasImage = ({ asset, projectCacheId, lowZoom, alt, selected, title }: {
   asset: AssetRecord;
+  projectCacheId: string;
   lowZoom: boolean;
   alt?: string;
   selected: boolean;
   title?: string;
 }) => {
-  const [highResLoaded, setHighResLoaded] = useState(false);
-  
-  useEffect(() => {
-    if (!lowZoom) {
-      setHighResLoaded(true);
-    }
-  }, [lowZoom]);
+  const cacheKey = `${projectCacheId}:${asset.id}`;
+  const [cached, setCached] = useState<PreparedImageCache | null>(() => preparedImageCache.get(cacheKey)?.value || null);
+  const [cacheEpoch, setCacheEpoch] = useState(0);
 
-  const useThumbnail = lowZoom && !highResLoaded;
-  const src = assetUrl(asset, useThumbnail);
+  useEffect(() => {
+    const reset = () => {
+      preparedImageCache.clear();
+      setCached(null);
+      setCacheEpoch((value) => value + 1);
+    };
+    window.addEventListener('refmind3d-image-cache-reset', reset);
+    return () => window.removeEventListener('refmind3d-image-cache-reset', reset);
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const existing = preparedImageCache.get(cacheKey);
+    if (existing && Date.now() - existing.checkedAt < 30_000) {
+      setCached(existing.value);
+      return () => { cancelled = true; };
+    }
+    void prepareImageCache(projectCacheId, asset).then((value) => {
+      preparedImageCache.set(cacheKey, { value, checkedAt: Date.now() });
+      if (!cancelled) setCached(value);
+    }).catch((error) => {
+      window.dispatchEvent(new CustomEvent('refmind3d-image-cache-error', { detail: String(error) }));
+    });
+    return () => { cancelled = true; };
+  }, [asset, cacheEpoch, cacheKey, projectCacheId]);
+
+  const src = cached
+    ? (lowZoom ? cached.thumbnailUrl : cached.previewUrl)
+    : assetUrl(asset, lowZoom);
 
   return (
     <>
@@ -516,6 +542,7 @@ const CanvasImage = ({ asset, lowZoom, alt, selected, title }: {
 
 export function CanvasView({
   focusContentKey,
+  projectCacheId,
   showGrid = true,
   drawMode = false,
   doodleMode = false,
@@ -527,6 +554,7 @@ export function CanvasView({
   onPointerWorldChange
 }: {
   focusContentKey?: string;
+  projectCacheId: string;
   showGrid?: boolean;
   drawMode?: boolean;
   doodleMode?: boolean;
@@ -695,8 +723,8 @@ export function CanvasView({
     // Keep a generous pre-render margin so normal pans never reveal an empty
     // edge, while excluding distant high-resolution images from WebView decode,
     // layout, paint and GPU texture work.
-    const overscanX = Math.max(1200, viewportSize.width * 1.5);
-    const overscanY = Math.max(900, viewportSize.height * 1.5);
+    const overscanX = Math.max(640, viewportSize.width * 0.75);
+    const overscanY = Math.max(480, viewportSize.height * 0.75);
     return project.nodes.filter((node) => {
       if (node.id === editingNodeId || node.id === activeGroupId) return true;
       const left = node.x * view.scale + view.x;
@@ -1937,6 +1965,7 @@ export function CanvasView({
                 {node.type === 'image' && asset && (
                   <CanvasImage
                     asset={asset}
+                    projectCacheId={projectCacheId}
                     lowZoom={lowZoom}
                     alt={node.title}
                     selected={selected}

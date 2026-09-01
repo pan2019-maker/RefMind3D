@@ -34,6 +34,15 @@ DDS 的生产文件差异很大，尤其是 BCn 压缩和 DX10 头的 DDS。当�
 
 
 
+## 图片缓存与大工程性能（Image cache and large-project performance）
+
+- 画布只挂载当前视野及附近的节点，远处图片不会占用 WebView 解码和 GPU 纹理资源。
+- 图片缩略图与标准化解码预览会写入持久缓存；再次打开工程时直接复用，不重复解码原图。
+- 缓存按工程内部 ID 关联，工程文件改名或移动后仍可复用；原文件大小或修改时间变化时会自动重建。
+- 默认缓存目录位于系统盘，首次启动会提示确认，也可在“设置 → 图片缓存”中自定义。
+- 缓存容量上限为 10 GB，可一键清理 30 天前缓存或全部缓存。卸载默认保留缓存，卸载界面可选择同时删除。
+- 缓存只影响显示速度，不替代工程内嵌素材，也不会改变导出内容。
+
 ## AI 接口介绍与使用规则（Introduction and Usage Rules of AI Interface）
 
 RefMind3D configures "content analysis" and "image generation" as two separate interfaces, which can connect to local Ollama, OpenAI compatible services, Doubao, or custom HTTP services. The AI can read the currently selected text, images, and node information, and write the analysis results back to the canvas. After the image generation is successful, the new image will be directly inserted into the current canvas and automatically establish a connection line with the reference image.

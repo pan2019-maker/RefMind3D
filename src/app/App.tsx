@@ -15,6 +15,7 @@ import { loadProjectDataUrl, loadProjectFile, saveProjectFile } from '../feature
 import { useProjectStore } from '../stores/projectStore';
 import type { AssetRecord, CanvasNode, DoodleTool, ImportedModel, RefMindProject, RefMindProjectFile, RefMindWorkspaceFile } from '../shared/types';
 import { exportProjectToPng, exportSelectedNodesToPng } from '../features/export/exportCanvas';
+import { clearImageCache, confirmDefaultImageCacheDirectory, getImageCacheStatus, setImageCacheDirectory, type ImageCacheStatus } from '../features/assets/imageCache';
 
 interface ShortcutSettings {
   help: string;
@@ -187,12 +188,14 @@ function workspaceContentSignature(
 function createWorkspaceFile(
   canvases: CanvasWorkspace[],
   activeCanvasId: string,
-  activeProject: RefMindProject
+  activeProject: RefMindProject,
+  cacheId: string
 ): RefMindWorkspaceFile {
   const now = new Date().toISOString();
   const snapshot = workspaceSnapshot(canvases, activeCanvasId, activeProject);
   return {
     version: 2,
+    cacheId,
     fileType: 'refmind3d-workspace',
     name: 'RefMind3D 多画布工程',
     activeCanvasId,
@@ -884,6 +887,9 @@ export function App() {
     }
   }, [contextMenu]);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [workspaceCacheId, setWorkspaceCacheId] = useState<string>(() => crypto.randomUUID());
+  const [imageCacheStatus, setImageCacheStatus] = useState<ImageCacheStatus | null>(null);
+  const [cacheBusy, setCacheBusy] = useState(false);
   const [pendingCanvasDeletionId, setPendingCanvasDeletionId] = useState<string | null>(null);
   const [closePromptMode, setClosePromptMode] = useState<'unsaved' | 'confirm' | null>(null);
   const [closeSaveBusy, setCloseSaveBusy] = useState(false);
@@ -1012,6 +1018,72 @@ export function App() {
       localStorage.setItem('refmind3d.settings', JSON.stringify(next));
       return next;
     });
+  };
+
+  const refreshImageCacheStatus = async () => {
+    try {
+      const next = await getImageCacheStatus();
+      setImageCacheStatus(next);
+      if (!next.available) {
+        setSettingsOpen(true);
+        setStatus('图片缓存目录不可用，请在设置中重新选择');
+      }
+      return next;
+    } catch (error) {
+      setStatus(`读取图片缓存状态失败：${String(error)}`);
+      return null;
+    }
+  };
+
+  useEffect(() => {
+    void getImageCacheStatus().then((next) => {
+      setImageCacheStatus(next);
+      if (!next.initialized || !next.available) {
+        setSettingsOpen(true);
+        setStatus(next.available ? '首次使用：请确认或修改图片缓存目录' : '图片缓存目录不可用，请重新选择');
+      }
+    }).catch((error) => setStatus(`图片缓存初始化失败：${String(error)}`));
+  }, []);
+
+  useEffect(() => {
+    const onCacheError = (event: Event) => {
+      const message = (event as CustomEvent<string>).detail || '缓存目录不可用';
+      setStatus('图片缓存不可用，请重新选择目录');
+      setSettingsOpen(true);
+      setImageCacheStatus((current) => current ? { ...current, available: false, error: message } : current);
+    };
+    window.addEventListener('refmind3d-image-cache-error', onCacheError);
+    return () => window.removeEventListener('refmind3d-image-cache-error', onCacheError);
+  }, []);
+
+  const chooseImageCacheDirectory = async () => {
+    const selected = await open({ directory: true, multiple: false, title: '选择 RefMind3D 图片缓存目录' });
+    if (!selected || Array.isArray(selected)) return;
+    setCacheBusy(true);
+    try {
+      setImageCacheStatus(await setImageCacheDirectory(selected));
+      window.dispatchEvent(new Event('refmind3d-image-cache-reset'));
+      setStatus('图片缓存目录已更新');
+    } catch (error) {
+      alert(`缓存目录不可用，请重新选择。\n\n${String(error)}`);
+    } finally { setCacheBusy(false); }
+  };
+
+  const confirmDefaultCache = async () => {
+    setCacheBusy(true);
+    try { setImageCacheStatus(await confirmDefaultImageCacheDirectory()); setStatus('已使用默认图片缓存目录'); }
+    catch (error) { alert(`默认缓存目录不可用：${String(error)}`); }
+    finally { setCacheBusy(false); }
+  };
+
+  const runCacheCleanup = async (olderThanDays?: number) => {
+    setCacheBusy(true);
+    try {
+      setImageCacheStatus(await clearImageCache(olderThanDays));
+      window.dispatchEvent(new Event('refmind3d-image-cache-reset'));
+      setStatus(olderThanDays ? '已清理 30 天前未使用的图片缓存' : '图片缓存已全部清理');
+    } catch (error) { alert(`清理缓存失败：${String(error)}`); }
+    finally { setCacheBusy(false); }
   };
 
   const updateAISettings = (patch: Partial<AISettings>) => {
@@ -1282,7 +1354,7 @@ export function App() {
   };
 
   const saveWorkspaceToPath = async (path: string) => {
-    const workspaceFile = createWorkspaceFile(canvases, activeCanvasId, project);
+    const workspaceFile = createWorkspaceFile(canvases, activeCanvasId, project, workspaceCacheId);
     await saveProjectFile(path, workspaceFile);
     const savedCanvases = workspaceSnapshot(canvases, activeCanvasId, project);
     setCanvases(savedCanvases);
@@ -1310,6 +1382,7 @@ export function App() {
   const loadProjectFromPath = async (path: string) => {
     const loaded = await loadProjectFile(path);
     if (isWorkspaceFile(loaded)) {
+      setWorkspaceCacheId(loaded.cacheId || crypto.randomUUID());
       const loadedCanvases = loaded.canvases.length > 0 ? loaded.canvases : [{ id: 'main-canvas', name: '主画布', project: createEmptyCanvasProject('主画布') }];
       const nextActiveId = loadedCanvases.some((canvas) => canvas.id === loaded.activeCanvasId)
         ? loaded.activeCanvasId
@@ -1324,6 +1397,7 @@ export function App() {
       return;
     }
 
+    setWorkspaceCacheId(loaded.cacheId || crypto.randomUUID());
     const legacyCanvas = { id: 'main-canvas', name: loaded.name || '主画布', project: loaded };
     setCanvases([legacyCanvas]);
     setActiveCanvasId(legacyCanvas.id);
@@ -1336,6 +1410,7 @@ export function App() {
   const loadProjectFromDataUrl = async (dataUrl: string, name: string) => {
     const loaded = await loadProjectDataUrl(dataUrl, name);
     if (isWorkspaceFile(loaded)) {
+      setWorkspaceCacheId(loaded.cacheId || crypto.randomUUID());
       const loadedCanvases = loaded.canvases.length > 0 ? loaded.canvases : [{ id: 'main-canvas', name: '主画布', project: createEmptyCanvasProject('主画布') }];
       const nextActiveId = loadedCanvases.some((canvas) => canvas.id === loaded.activeCanvasId)
         ? loaded.activeCanvasId
@@ -1350,6 +1425,7 @@ export function App() {
       return;
     }
 
+    setWorkspaceCacheId(loaded.cacheId || crypto.randomUUID());
     const legacyCanvas = { id: 'main-canvas', name: loaded.name || '主画布', project: loaded };
     setCanvases([legacyCanvas]);
     setActiveCanvasId(legacyCanvas.id);
@@ -2254,6 +2330,7 @@ export function App() {
       setCanvases([{ id: 'main-canvas', name: '主画布', project: blank }]);
       setActiveCanvasId('main-canvas');
       setProject(blank);
+      setWorkspaceCacheId(crypto.randomUUID());
       setCurrentProjectPath(null);
       setStatus('已新建场景');
     }
@@ -2730,6 +2807,7 @@ export function App() {
         {settings.showAssetPanel && <AssetPanel />}
         <CanvasView
           focusContentKey={activeCanvasId}
+          projectCacheId={workspaceCacheId}
           showGrid={settings.showGrid}
           drawMode={drawMode}
           doodleMode={doodleMode}
@@ -3230,7 +3308,20 @@ export function App() {
             </label>
             <section className="storage-settings">
               <div className="settings-section-title">
-                <strong>存储方式</strong>
+                <strong>图片缓存</strong>
+                <button onClick={() => void refreshImageCacheStatus()} disabled={cacheBusy}>刷新状态</button>
+              </div>
+              <div className={`cache-status-card ${imageCacheStatus?.available === false ? 'is-error' : ''}`}>
+                <span className="cache-status-label">缓存目录</span>
+                <code title={imageCacheStatus?.directory}>{imageCacheStatus?.directory || '正在读取…'}</code>
+                <span>{imageCacheStatus ? `${(imageCacheStatus.sizeBytes / 1024 / 1024).toFixed(1)} MB / 10 GB` : '—'}</span>
+              </div>
+              {imageCacheStatus?.error && <p className="cache-error">{imageCacheStatus.error}</p>}
+              <div className="cache-actions">
+                <button onClick={() => void chooseImageCacheDirectory()} disabled={cacheBusy}>更改目录</button>
+                {!imageCacheStatus?.initialized && <button className="primary" onClick={() => void confirmDefaultCache()} disabled={cacheBusy}>使用默认目录</button>}
+                <button onClick={() => void runCacheCleanup(30)} disabled={cacheBusy}>清理 30 天前缓存</button>
+                <button onClick={() => { if (confirm('确定清理全部图片缓存吗？工程文件和原图不会被删除。')) void runCacheCleanup(); }} disabled={cacheBusy}>清理全部缓存</button>
               </div>
               <label className="storage-checkbox-row">
                 <input
@@ -3241,7 +3332,7 @@ export function App() {
                 />
                 保存工程时内嵌图片、模型、视频和文档本体
               </label>
-              <p className="muted">当前为无缓存模式：导入素材时直接把资源本体写进工程数据，不再复制到 AppData 或自定义缓存目录。保存后单个 .refmind3d 文件即可发给别人。关闭内嵌资源只适合临时轻量测试。</p>
+              <p className="muted">工程仍会内嵌原始素材，方便独立传输；画布显示使用持久化缩略图和解码缓存。仅加载视野内及附近节点，原文件大小或修改时间变化后会自动重建缓存。缓存上限固定为 10 GB，跨版本和卸载默认保留。</p>
             </section>
             <section className="ai-settings-section">
               {!API_ONLY_EDITION && <section className="ai-local-model-manager">
