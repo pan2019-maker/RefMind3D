@@ -183,6 +183,7 @@ export interface DoodleStroke {
 export interface RefMindProject {
   version: 1;
   cacheId?: string;
+  cacheDirectory?: string;
   name: string;
   rootPath?: string;
   assets: AssetRecord[];
@@ -202,6 +203,7 @@ export interface CanvasWorkspaceRecord {
 export interface RefMindWorkspaceFile {
   version: 2;
   cacheId?: string;
+  cacheDirectory?: string;
   fileType: 'refmind3d-workspace';
   name: string;
   activeCanvasId: string;

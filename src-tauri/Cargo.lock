@@ -3187,7 +3187,7 @@ dependencies = [
 
 [[package]]
 name = "refmind3d"
-version = "1.1.6"
+version = "1.1.7"
 dependencies = [
  "anyhow",
  "arboard",

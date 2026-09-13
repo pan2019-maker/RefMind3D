@@ -142,7 +142,14 @@ pub fn resource_source_signature(value: &str) -> Option<(u64, u64)> {
     let resource = resources().lock().ok()?.get(&key(&asset_id, &field)).cloned()?;
     let metadata = match resource.backing {
         ResourceBacking::File(path) => std::fs::metadata(path).ok()?,
-        ResourceBacking::Packed { package_path, .. } => std::fs::metadata(package_path).ok()?,
+        ResourceBacking::Packed { package_path, zip_path } => {
+            // Use the ZIP entry's own stable fingerprint. Project saves and
+            // renames change the package timestamp but not unchanged images.
+            let file = File::open(package_path).ok()?;
+            let mut archive = ZipArchive::new(file).ok()?;
+            let entry = archive.by_name(&zip_path).ok()?;
+            return Some((entry.size(), entry.crc32() as u64));
+        }
         ResourceBacking::Memory(bytes) => return Some((bytes.len() as u64, 0)),
     };
     let modified = metadata.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_millis() as u64;
@@ -187,11 +194,11 @@ pub fn read_resource_url(value: &str) -> Result<(Vec<u8>, String, String), Strin
     read_resource(&asset_id, &field)
 }
 
-fn response(status: u16, content_type: &str, body: Vec<u8>) -> http::Response<Vec<u8>> {
+fn response(status: u16, content_type: &str, body: Vec<u8>, cacheable: bool) -> http::Response<Vec<u8>> {
     http::Response::builder()
         .status(status)
         .header("Access-Control-Allow-Origin", "*")
-        .header("Cache-Control", "no-store")
+        .header("Cache-Control", if cacheable { "public, max-age=31536000, immutable" } else { "no-store" })
         .header("Content-Type", content_type)
         .body(body)
         .unwrap()
@@ -199,8 +206,9 @@ fn response(status: u16, content_type: &str, body: Vec<u8>) -> http::Response<Ve
 
 pub fn protocol_response(request: http::Request<Vec<u8>>) -> http::Response<Vec<u8>> {
     let uri = request.uri().to_string();
+    let cacheable = parse_resource_url(&uri).map(|(_, field)| field.starts_with("cachePreview:") || field.starts_with("cacheThumbnail:")).unwrap_or(false);
     match read_resource_url(&uri) {
-        Ok((bytes, mime, _)) => response(200, &mime, bytes),
-        Err(message) => response(404, "text/plain; charset=utf-8", message.into_bytes()),
+        Ok((bytes, mime, _)) => response(200, &mime, bytes, cacheable),
+        Err(message) => response(404, "text/plain; charset=utf-8", message.into_bytes(), false),
     }
 }

@@ -29,6 +29,7 @@ type SelectionMode = 'replace' | 'add' | 'subtract';
 
 const DIRECT_IMAGE_FORMATS = new Set(['png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif', 'ico', 'avif', 'svg']);
 const preparedImageCache = new Map<string, { value: PreparedImageCache; checkedAt: number }>();
+const pendingImageCache = new Map<string, Promise<PreparedImageCache>>();
 
 function isRuntimeResourceUrl(path: string) {
   return path.startsWith('refmind3d://') || path.startsWith('http://refmind3d.localhost') || path.startsWith('https://refmind3d.localhost');
@@ -472,21 +473,25 @@ function cloneWorkbook(workbook: SpreadsheetWorkbook): SpreadsheetWorkbook {
   return JSON.parse(JSON.stringify(workbook)) as SpreadsheetWorkbook;
 }
 
-const CanvasImage = ({ asset, projectCacheId, lowZoom, alt, selected, title }: {
+const CanvasImage = ({ asset, projectCacheId, cacheDirectory, lowZoom, displaySize, visible, alt, selected, title }: {
   asset: AssetRecord;
   projectCacheId: string;
+  cacheDirectory?: string;
   lowZoom: boolean;
+  displaySize: number;
+  visible: boolean;
   alt?: string;
   selected: boolean;
   title?: string;
 }) => {
-  const cacheKey = `${projectCacheId}:${asset.id}`;
+  const cacheKey = `${projectCacheId}:${cacheDirectory || 'default'}:${asset.id}`;
   const [cached, setCached] = useState<PreparedImageCache | null>(() => preparedImageCache.get(cacheKey)?.value || null);
   const [cacheEpoch, setCacheEpoch] = useState(0);
 
   useEffect(() => {
     const reset = () => {
       preparedImageCache.clear();
+      pendingImageCache.clear();
       setCached(null);
       setCacheEpoch((value) => value + 1);
     };
@@ -496,23 +501,39 @@ const CanvasImage = ({ asset, projectCacheId, lowZoom, alt, selected, title }: {
 
   useEffect(() => {
     let cancelled = false;
+    let preloadTimer: number | null = null;
     const existing = preparedImageCache.get(cacheKey);
     if (existing && Date.now() - existing.checkedAt < 30_000) {
       setCached(existing.value);
       return () => { cancelled = true; };
     }
-    void prepareImageCache(projectCacheId, asset).then((value) => {
-      preparedImageCache.set(cacheKey, { value, checkedAt: Date.now() });
-      if (!cancelled) setCached(value);
-    }).catch((error) => {
-      window.dispatchEvent(new CustomEvent('refmind3d-image-cache-error', { detail: String(error) }));
-    });
-    return () => { cancelled = true; };
-  }, [asset, cacheEpoch, cacheKey, projectCacheId]);
+    const prepare = () => {
+      let pending = pendingImageCache.get(cacheKey);
+      if (!pending) {
+        pending = prepareImageCache(projectCacheId, cacheDirectory, asset);
+        pendingImageCache.set(cacheKey, pending);
+      }
+      void pending.then((value) => {
+        preparedImageCache.set(cacheKey, { value, checkedAt: Date.now() });
+        pendingImageCache.delete(cacheKey);
+        if (!cancelled) setCached(value);
+      }).catch((error) => {
+        pendingImageCache.delete(cacheKey);
+        window.dispatchEvent(new CustomEvent('refmind3d-image-cache-error', { detail: String(error) }));
+      });
+    };
+    if (visible) prepare();
+    else preloadTimer = window.setTimeout(prepare, 350);
+    return () => {
+      cancelled = true;
+      if (preloadTimer !== null) window.clearTimeout(preloadTimer);
+    };
+  }, [asset, cacheDirectory, cacheEpoch, cacheKey, projectCacheId, visible]);
 
+  const useThumbnail = lowZoom || displaySize <= 900;
   const src = cached
-    ? (lowZoom ? cached.thumbnailUrl : cached.previewUrl)
-    : assetUrl(asset, lowZoom);
+    ? (useThumbnail ? cached.thumbnailUrl : cached.previewUrl)
+    : assetUrl(asset, true);
 
   return (
     <>
@@ -521,7 +542,7 @@ const CanvasImage = ({ asset, projectCacheId, lowZoom, alt, selected, title }: {
         className="image-node"
         src={src}
         draggable={false}
-        loading="lazy"
+        loading={visible ? 'eager' : 'lazy'}
         decoding="async"
         fetchPriority={selected ? 'high' : 'low'}
         alt={alt}
@@ -543,6 +564,7 @@ const CanvasImage = ({ asset, projectCacheId, lowZoom, alt, selected, title }: {
 export function CanvasView({
   focusContentKey,
   projectCacheId,
+  cacheDirectory,
   showGrid = true,
   drawMode = false,
   doodleMode = false,
@@ -555,6 +577,7 @@ export function CanvasView({
 }: {
   focusContentKey?: string;
   projectCacheId: string;
+  cacheDirectory?: string;
   showGrid?: boolean;
   drawMode?: boolean;
   doodleMode?: boolean;
@@ -723,8 +746,8 @@ export function CanvasView({
     // Keep a generous pre-render margin so normal pans never reveal an empty
     // edge, while excluding distant high-resolution images from WebView decode,
     // layout, paint and GPU texture work.
-    const overscanX = Math.max(640, viewportSize.width * 0.75);
-    const overscanY = Math.max(480, viewportSize.height * 0.75);
+    const overscanX = Math.max(480, viewportSize.width * 0.5);
+    const overscanY = Math.max(360, viewportSize.height * 0.5);
     return project.nodes.filter((node) => {
       if (node.id === editingNodeId || node.id === activeGroupId) return true;
       const left = node.x * view.scale + view.x;
@@ -1966,7 +1989,10 @@ export function CanvasView({
                   <CanvasImage
                     asset={asset}
                     projectCacheId={projectCacheId}
+                    cacheDirectory={cacheDirectory}
                     lowZoom={lowZoom}
+                    displaySize={Math.max(screenRect.width, screenRect.height)}
+                    visible={screenRect.x + screenRect.width >= 0 && screenRect.x <= viewportSize.width && screenRect.y + screenRect.height >= 0 && screenRect.y <= viewportSize.height}
                     alt={node.title}
                     selected={selected}
                     title={node.title}

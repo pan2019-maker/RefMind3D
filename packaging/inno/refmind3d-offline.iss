@@ -1,5 +1,5 @@
 #define AppName "RefMind3D"
-#define AppVersion "1.1.6"
+#define AppVersion "1.1.7"
 #define Publisher "RefMind3D Team"
 #define StagingDir "..\..\release\offline-staging"
 

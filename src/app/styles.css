@@ -1429,7 +1429,9 @@ h3 { font-size: 13px; color: #c8c8c8; margin-top: 16px; }
 .canvas-viewport.is-panning .canvas-node,
 .canvas-viewport.is-zooming .canvas-node {
   pointer-events: none !important;
-  will-change: transform, left, top, width, height !important;
+  /* The world is the single composited layer during camera gestures. Promoting
+     every image node separately causes GPU-layer churn on large boards. */
+  will-change: auto !important;
 }
 .canvas-world.screen-space-renderer .mindmap-layer {
   position: absolute !important;
