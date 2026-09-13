@@ -159,8 +159,20 @@ pub async fn prepare_image_cache(project_cache_id: String, cache_directory: Opti
 }
 
 fn prepare_sync(project_id: &str, cache_directory: Option<&str>, asset: &Value) -> anyhow::Result<PreparedImageCache> {
-    let root = project_cache_dir(project_id, cache_directory);
-    ensure_dir(&root)?;
+    let requested_root = project_cache_dir(project_id, cache_directory);
+    // A missing removable drive or a stale per-project path must never prevent
+    // images from appearing. Preserve the configured path for the settings UI,
+    // but transparently serve this session from the system cache until the user
+    // chooses a writable location.
+    let root = match ensure_dir(&requested_root) {
+        Ok(()) => requested_root,
+        Err(_) if cache_directory.is_some() => {
+            let fallback = project_cache_dir(project_id, None);
+            ensure_dir(&fallback)?;
+            fallback
+        }
+        Err(error) => return Err(error),
+    };
     let asset_id = safe(asset.get("id").and_then(Value::as_str).unwrap_or("image"));
     let dir = root.join(&asset_id);
     fs::create_dir_all(&dir)?;

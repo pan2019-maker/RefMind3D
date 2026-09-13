@@ -1,89 +1,75 @@
-# RefMind3D 
+# RefMind3D
 
-A high-performance, unlimited reference canvas for designers and 3D creators, designed to unify and organize images, videos, documents, 3D models, mind maps, and creative inspiration.
-面向设计师与 3D 创作者的高性能无限参考画布，用于统一整理图片、视频、文档、3D 模型、思维导图与创作灵感。
+RefMind3D 是面向设计师和 3D 创作者的无限参考画布，用于统一整理图片、视频、文档、表格、3D 模型、思维导图与创意资料。
 
-## Windows 一键运行（One-click run）
+## 主要能力
 
-To run the development version for the first time: double-click `run-dev.bat`.
+- 多画布工程以及图片、文本、视频、文档、表格和 3D 模型节点。
+- 文本与图片节点支持跨画布复制、粘贴，并以鼠标位置为节点中心。
+- 支持自由画笔、压感、箭头、空心矩形和空心圆形涂鸦；涂鸦保存在工程中，但不随图片导出。
+- 每个工程拥有独立图片缓存目录，缓存可跨版本保留，默认容量上限为 10 GB。
+- 支持本地 Ollama、OpenAI 兼容服务、豆包和自定义 HTTP AI 服务。
 
-To package the release exe: double-click `build-release.bat`.
+## v1.2.0 性能与可靠性
 
-第一次运行开发版：双击 `run-dev.bat`。
+- 使用空间索引查询视野附近节点，大型画布移动时不再遍历全部节点。
+- 画布平移与节点拖动采用合成层预览，操作结束后才提交工程状态。
+- 涂鸦改由双 Canvas 图层绘制，已完成笔迹与当前笔迹分层渲染。
+- 图片按照缩略图、缓存预览、原始分辨率三级渐进加载。
+- 撤销历史采用结构共享，避免每次修改都完整复制大型工程。
+- 工程脏状态使用轻量修订签名，不再在每次界面更新时序列化整个工程。
+- 3D 引擎按需加载，明显缩小首屏 JavaScript 体积。
+- 工程采用临时文件完整写入后原子替换，并为已保存工程生成崩溃恢复副本。
+- 工程指定的缓存目录暂时不可用时，图片加载会回退到系统缓存目录。
 
-打包 release exe：双击 `build-release.bat`。
+## 开发
 
-
-## 使用（Use）
+首次运行开发版可以双击 `run-dev.bat`，也可以执行：
 
 ```powershell
 npm install
 npm run tauri:dev
 ```
 
-打包（pack）：
+检查、测试和构建前端：
 
 ```powershell
-npm run tauri:build
+npm run check
+npm test
+npm run build
 ```
 
-## 说明（Explanation）
+运行 Rust 测试：
 
-The production files of DDS vary greatly, especially those with BCn compression and DX10 headers. The current version will prioritize real decoding; if there is no available decoder on the local machine and the built-in decoding fails, a placeholder preview will be generated, but the original DDS file will be retained in the project resource directory.
-DDS 的生产文件差异很大，尤其是 BCn 压缩和 DX10 头的 DDS。当前版本会优先尝试真实解码；如果本机没有可用解码器且内置解码失败，会生成占位预览，但原始 DDS 文件会保留在工程资源目录中。
+```powershell
+cargo test --manifest-path src-tauri/Cargo.toml
+```
 
+生成 Windows 发布包可以双击 `build-release.bat`。
 
+## 图片缓存
 
-## 图片缓存与大工程性能（Image cache and large-project performance）
+- 默认目录位于 `%LOCALAPPDATA%\RefMind3D\ImageCache\<工程缓存 ID>`。
+- 用户可以在“设置 → 图片缓存”中为每个工程选择不同目录。
+- 工程中的所有画布共用该工程的缓存目录。
+- 原始文件大小或修改时间发生变化时，缓存自动失效并重新生成。
+- 可以清理当前工程 30 天前的缓存或全部缓存；清理缓存不会删除工程和原始素材。
+- 自定义目录不可用时，设置界面会提示重新选择，但图片会临时使用系统缓存继续加载。
 
-- 画布只挂载当前视野及附近的节点，远处图片不会占用 WebView 解码和 GPU 纹理资源。
-- 图片缩略图与标准化解码预览会写入持久缓存；再次打开工程时直接复用，不重复解码原图。
-- 缓存按工程内部 ID 关联，工程文件改名或移动后仍可复用；原文件大小或修改时间变化时会自动重建。
-- 默认缓存目录位于系统盘，首次启动会提示确认，也可在“设置 → 图片缓存”中自定义。
-- 缓存容量上限为 10 GB，可一键清理 30 天前缓存或全部缓存。卸载默认保留缓存，卸载界面可选择同时删除。
-- 缓存只影响显示速度，不替代工程内嵌素材，也不会改变导出内容。
-- 从 v1.1.7 起，每个工程可保存完全独立的缓存目录，工程内多个画布共享同一目录；并修复并发目录检测误报“不可写”、保存工程导致缓存整体失效、平移时 GPU 图层抖动等问题。
+## AI 接口与使用规则
 
-## AI 接口介绍与使用规则（Introduction and Usage Rules of AI Interface）
+“内容分析”和“图片生成”使用两套独立配置。内容分析用于文字回复、内容整理和图片理解；图片生成必须连接真正支持图像生成的服务。
 
-RefMind3D configures "content analysis" and "image generation" as two separate interfaces, which can connect to local Ollama, OpenAI compatible services, Doubao, or custom HTTP services. The AI can read the currently selected text, images, and node information, and write the analysis results back to the canvas. After the image generation is successful, the new image will be directly inserted into the current canvas and automatically establish a connection line with the reference image.
-RefMind3D 将“内容分析”和“图片生成”作为两套独立接口配置，既可以连接本地 Ollama，也可以连接 OpenAI 兼容服务、豆包或自定义 HTTP 服务。AI 可以读取当前选中的文本、图片及节点信息，将分析结果写回画布；图片生成成功后，新图会直接插入当前画布，并可与参考图自动建立牵引线。
+1. 在画布中右键打开“设置 → AI 接口”。
+2. 分别填写服务类型、API 地址、API Key 和模型名称。
+3. 选择画布节点后使用“发送分析”，或使用“生成图片到画布”。
+4. 单次视觉分析最多附带 4 张选中图片，以避免请求体过大。
 
-### 接口配置（interface configuration）
+使用第三方服务时，请遵守服务商的内容政策、授权条款、计费规则和速率限制。发送分析时，选中节点的文字、元信息和图片可能上传到所配置的服务；处理敏感信息前请确认服务商的数据与隐私政策。AI 输出仅作为创作辅助，发布或商用前应人工核对准确性、版权和可用性。
 
-- Right-click in the canvas to open "Settings → AI Interface", and configure the analysis model and image generation model separately.
-- The analysis model is used for text response, content organization, and image understanding.
-- The image generation model is used for text-to-image and reference image generation, and it must use a provider that truly supports image generation; the visual understanding model cannot replace the image generation model.
-- The API address should be filled in with the basic address provided by the service provider. OpenAI compatible services usually end with `/v1`.
-- The model name must be completely consistent with the actual model existing on the server.
-After configuration, first use "Test Connection" to confirm the validity of the address, key, and model before starting the official call.
-- 在画布中右键打开“设置 → AI 接口”，分别配置分析模型和图片生成模型。
-- 分析模型用于文字回复、内容整理和图片理解。
-- 图片生成模型用于文生图和参考图生成，必须使用真正支持图片生成的 Provider；视觉理解模型不能代替出图模型。
-- API 地址应填写服务商提供的基础地址。OpenAI 兼容服务通常以 `/v1` 结尾。
-- 模型名称必须与服务端实际存在的模型完全一致。
-- 配置完成后，先使用“测试连接”确认地址、密钥和模型有效，再开始正式调用。
+## 构建文档
 
-### 使用方法（Usage）
-
-1. Select the text, images, or other nodes that need to be analyzed on the canvas; a visual analysis can attach up to 4 images at a time.
-2. Open the AI panel on the left and enter your requirements. Press Enter to send, and use Shift+Enter for line breaks.
-3. Click "Send Analysis" to perform text or visual analysis; click "Generate Image to Canvas" to call the image generation interface.
-4. The analysis results can be written back as text or mind map nodes; the generated images will be inserted into the current canvas and automatically positioned.
-1. 在画布中选择需要分析的文本、图片或其他节点；视觉分析单次最多附加 4 张图片。
-2. 打开左侧 AI 面板，输入要求。按 Enter 发送，使用 Shift+Enter 换行。
-3. 点击“发送分析”进行文字或视觉分析；点击“生成图片到画布”调用图片生成接口。
-4. 分析结果可以写回为文本或思维导图节点；生成的图片会插入当前画布，并自动定位。
-
-### 使用规则与安全说明（Usage rules and safety instructions）
-
-- Please comply with the content policies, licensing terms, billing rules, and rate limits of the model service provider you are using.
-- When sending analysis, the text, metadata, and selected images of the selected nodes may be uploaded to the configured service provider; please confirm the data and privacy policies of the service provider before processing sensitive information.
-- The local Ollama is suitable for offline analysis, but only models that have been installed and possess visual capabilities can view images; it does not undertake image generation tasks by default.
-- If the interface returns a message indicating that the model does not exist, the context exceeds the limit, or the format is incompatible, please first verify the model name, interface type, base address, and server capabilities.
-- AI output is solely intended as a creative aid. Prior to publishing or commercial use, please manually verify the accuracy, copyright, and usability of the content.
-- 请遵守所使用模型服务商的内容政策、授权条款、计费规则和速率限制。
-- 发送分析时，选中节点的文字、元信息及所选图片可能会上传到配置的服务商；处理敏感资料前请确认服务商的数据与隐私政策。
-- 本地 Ollama 适合离线分析，但只有已安装且具备视觉能力的模型才能看图；它默认不承担图片生成任务。
-- 如果接口返回模型不存在、上下文超限或格式不兼容，请先核对模型名称、接口类型、基础地址及服务端能力。
-- AI 输出仅作为创作辅助。发布或商用前，请人工检查内容准确性、版权和可用性。
+- [功能说明](docs/features.md)
+- [测试清单](docs/testing.md)
+- [开发路线](docs/roadmap.md)
+- [构建说明](docs/build.md)

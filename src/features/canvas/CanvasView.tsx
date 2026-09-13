@@ -1,10 +1,13 @@
-import { MouseEvent as ReactMouseEvent, useEffect, useMemo, useRef, useState, type CSSProperties, type MutableRefObject, type PointerEvent as ReactPointerEvent } from 'react';
+import { lazy, MouseEvent as ReactMouseEvent, Suspense, useEffect, useMemo, useRef, useState, type CSSProperties, type MutableRefObject, type PointerEvent as ReactPointerEvent } from 'react';
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { useProjectStore } from '../../stores/projectStore';
 import type { AssetRecord, CanvasNode, DoodleStroke, DoodleTool, ImportedModel, SpreadsheetCell, SpreadsheetCellStyle, SpreadsheetMerge, SpreadsheetSheet, SpreadsheetWorkbook } from '../../shared/types';
-import { ModelViewer } from '../model-viewer/ModelViewer';
 import { prepareImageCache, type PreparedImageCache } from '../assets/imageCache';
 import { FREE_TEXT_FONT_FAMILY, FREE_TEXT_PLACEHOLDER, freeTextNodeSize } from '../../shared/freeText';
+import { DoodleCanvas } from './DoodleCanvas';
+import { SpatialGridIndex } from './spatialIndex';
+
+const LazyModelViewer = lazy(() => import('../model-viewer/ModelViewer').then((module) => ({ default: module.ModelViewer })));
 
 interface ViewState {
   x: number;
@@ -50,6 +53,11 @@ function assetUrl(asset?: AssetRecord, preferThumbnail = false) {
   const path = DIRECT_IMAGE_FORMATS.has(format)
     ? (asset.projectAssetPath || asset.originalPath || asset.previewPath || '')
     : (asset.previewPath || asset.projectAssetPath || asset.originalPath);
+  return displayAssetPath(path);
+}
+
+function fullResolutionAssetUrl(asset: AssetRecord) {
+  const path = asset.embeddedDataUrl || asset.projectAssetPath || asset.originalPath || asset.previewPath || '';
   return displayAssetPath(path);
 }
 
@@ -531,8 +539,9 @@ const CanvasImage = ({ asset, projectCacheId, cacheDirectory, lowZoom, displaySi
   }, [asset, cacheDirectory, cacheEpoch, cacheKey, projectCacheId, visible]);
 
   const useThumbnail = lowZoom || displaySize <= 900;
+  const useFullResolution = !lowZoom && displaySize > 2400;
   const src = cached
-    ? (useThumbnail ? cached.thumbnailUrl : cached.previewUrl)
+    ? (useThumbnail ? cached.thumbnailUrl : (useFullResolution ? fullResolutionAssetUrl(asset) : cached.previewUrl))
     : assetUrl(asset, true);
 
   return (
@@ -661,6 +670,7 @@ export function CanvasView({
   const wheelTimeoutRef = useRef<number | null>(null);
   const activeDoodleRef = useRef<DoodleStroke | null>(null);
   const activeDoodlePointerRef = useRef<number | null>(null);
+  const nodeDragPreviewRef = useRef({ dx: 0, dy: 0 });
 
   const flushZoom = () => {
     if (wheelTimeoutRef.current !== null) {
@@ -728,6 +738,8 @@ export function CanvasView({
     return map;
   }, [project.nodes]);
 
+  const nodeSpatialIndex = useMemo(() => new SpatialGridIndex(project.nodes), [project.nodes]);
+
   const groupVisualZIndexes = useMemo(() => {
     const minimumChildZ = new Map<string, number>();
     project.nodes.forEach((node) => {
@@ -748,18 +760,25 @@ export function CanvasView({
     // layout, paint and GPU texture work.
     const overscanX = Math.max(480, viewportSize.width * 0.5);
     const overscanY = Math.max(360, viewportSize.height * 0.5);
-    return project.nodes.filter((node) => {
-      if (node.id === editingNodeId || node.id === activeGroupId) return true;
-      const left = node.x * view.scale + view.x;
-      const top = node.y * view.scale + view.y;
-      const right = left + node.width * view.scale;
-      const bottom = top + node.height * view.scale;
-      return right >= -overscanX
-        && left <= viewportSize.width + overscanX
-        && bottom >= -overscanY
-        && top <= viewportSize.height + overscanY;
-    });
-  }, [project.nodes, view, viewportSize, editingNodeId, activeGroupId]);
+    const worldRect = {
+      x: (-overscanX - view.x) / view.scale,
+      y: (-overscanY - view.y) / view.scale,
+      width: (viewportSize.width + overscanX * 2) / view.scale,
+      height: (viewportSize.height + overscanY * 2) / view.scale
+    };
+    const result = nodeSpatialIndex.query(worldRect);
+    for (const id of [editingNodeId, activeGroupId]) {
+      if (!id || result.some((node) => node.id === id)) continue;
+      const node = nodesById.get(id);
+      if (node) result.push(node);
+    }
+    return result;
+  }, [nodeSpatialIndex, nodesById, view, viewportSize, editingNodeId, activeGroupId]);
+
+  const renderedLinks = useMemo(() => {
+    const visibleIds = new Set(renderedNodes.map((node) => node.id));
+    return project.links.filter((link) => visibleIds.has(link.fromNodeId) && visibleIds.has(link.toNodeId));
+  }, [project.links, renderedNodes]);
 
   useEffect(() => {
     if (selectedLinkId && !project.links.some((link) => link.id === selectedLinkId)) {
@@ -1332,6 +1351,7 @@ export function CanvasView({
         .map((item) => [item.id, { x: item.x, y: item.y }])
     );
     interactionHistoryRecordedRef.current = false;
+    nodeDragPreviewRef.current = { dx: 0, dy: 0 };
     setDrag({ ids: activeIds, startX: event.clientX, startY: event.clientY, origins, originX: target.x, originY: target.y });
   };
 
@@ -1420,14 +1440,15 @@ export function CanvasView({
     const dx = event.clientX - drag.startX;
     const dy = event.clientY - drag.startY;
     if (drag.ids && drag.origins) {
-      recordInteractionHistory();
-      scheduleNodeUpdates(drag.ids.map((id) => ({
-        id,
-        patch: {
-          x: (drag.origins?.[id]?.x ?? 0) + dx / view.scale,
-          y: (drag.origins?.[id]?.y ?? 0) + dy / view.scale
+      nodeDragPreviewRef.current = { dx: dx / view.scale, dy: dy / view.scale };
+      for (const id of drag.ids) {
+        const element = viewportRef.current?.querySelector<HTMLElement>(`[data-node-id="${id}"]`);
+        const node = nodesById.get(id);
+        if (element && node) {
+          element.style.transform = `translate3d(${dx}px, ${dy}px, 0) rotate(${node.rotation}deg)`;
+          element.style.willChange = 'transform';
         }
-      })));
+      }
     }
   };
 
@@ -1491,7 +1512,27 @@ export function CanvasView({
       }
       setDrawRect(null);
     }
-    if (drag?.ids) {
+    if (drag?.ids && drag.origins) {
+      const preview = nodeDragPreviewRef.current;
+      if (preview.dx !== 0 || preview.dy !== 0) {
+        recordInteractionHistory();
+        updateNodes(drag.ids.map((id) => ({
+          id,
+          patch: {
+            x: (drag.origins?.[id]?.x ?? 0) + preview.dx,
+            y: (drag.origins?.[id]?.y ?? 0) + preview.dy
+          }
+        })), false, false);
+      }
+      for (const id of drag.ids) {
+        const element = viewportRef.current?.querySelector<HTMLElement>(`[data-node-id="${id}"]`);
+        if (element) {
+          element.style.removeProperty('will-change');
+          const node = nodesById.get(id);
+          element.style.transform = `rotate(${node?.rotation || 0}deg)`;
+        }
+      }
+      nodeDragPreviewRef.current = { dx: 0, dy: 0 };
       completeGroupDrop(drag.ids);
     }
     if (drag?.ids || resize) {
@@ -1889,7 +1930,7 @@ export function CanvasView({
       >
         {showGrid && !lowZoom && <div className="canvas-grid" />}
         <svg className="mindmap-layer" width={viewportSize.width} height={viewportSize.height} viewBox={`0 0 ${viewportSize.width} ${viewportSize.height}`}>
-          {project.links.map((link) => {
+          {renderedLinks.map((link) => {
             const fromNode = nodesById.get(link.fromNodeId);
             const toNode = nodesById.get(link.toNodeId);
             const { from, to } = horizontalConnectionPoints(fromNode, toNode);
@@ -2047,11 +2088,13 @@ export function CanvasView({
                     <div className="model-move-edge edge-bottom" onMouseDown={(event) => onNodeMouseDown(event, node)} title="拖动边缘移动 3D 窗口" />
                     <div className="model-move-edge edge-left" onMouseDown={(event) => onNodeMouseDown(event, node)} title="拖动边缘移动 3D 窗口" />
                     <div className="model-move-edge edge-right" onMouseDown={(event) => onNodeMouseDown(event, node)} title="拖动边缘移动 3D 窗口" />
-                    <ModelViewer
-                      modelPath={assetModelSource(asset)}
-                      modelFormat={asset.format}
-                      compact
-                    />
+                    <Suspense fallback={<div className="node-low-zoom-placeholder">正在载入 3D 预览…</div>}>
+                      <LazyModelViewer
+                        modelPath={assetModelSource(asset)}
+                        modelFormat={asset.format}
+                        compact
+                      />
+                    </Suspense>
                     <div className="node-low-zoom-placeholder">
                       3D 模型<br />
                       {node.title}<br />
@@ -2150,118 +2193,13 @@ export function CanvasView({
             />
           );
         })()}
-        <svg
-          className="doodle-layer"
+        <DoodleCanvas
+          strokes={project.doodles || []}
+          activeStroke={activeDoodleStroke}
+          view={view}
           width={viewportSize.width}
           height={viewportSize.height}
-          viewBox={`0 0 ${viewportSize.width} ${viewportSize.height}`}
-          aria-hidden="true"
-        >
-          {[...(project.doodles || []), ...(activeDoodleStroke ? [activeDoodleStroke] : [])].map((stroke) => {
-            const tool = stroke.tool || 'brush';
-            if (tool === 'brush') {
-              return (
-                <g key={stroke.id}>
-                  {stroke.points.length === 1 && (() => {
-                    const point = toScreenPoint(stroke.points[0]);
-                    const pressureWidth = stroke.width * (0.2 + stroke.points[0].pressure * 0.8) * view.scale;
-                    return <circle cx={point.x} cy={point.y} r={Math.max(0.5, pressureWidth / 2)} fill={stroke.color} />;
-                  })()}
-                  {stroke.points.slice(1).map((point, index) => {
-                    const previous = stroke.points[index];
-                    const from = toScreenPoint(previous);
-                    const to = toScreenPoint(point);
-                    const pressure = (previous.pressure + point.pressure) / 2;
-                    const pressureWidth = stroke.width * (0.2 + pressure * 0.8) * view.scale;
-                    return (
-                      <line
-                        key={`${stroke.id}-${index}`}
-                        x1={from.x}
-                        y1={from.y}
-                        x2={to.x}
-                        y2={to.y}
-                        stroke={stroke.color}
-                        strokeWidth={Math.max(0.5, pressureWidth)}
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                      />
-                    );
-                  })}
-                </g>
-              );
-            }
-
-            if (stroke.points.length < 2) return null;
-            const from = toScreenPoint(stroke.points[0]);
-            const to = toScreenPoint(stroke.points[stroke.points.length - 1]);
-            const outlineWidth = Math.max(0.75, stroke.width * view.scale);
-
-            if (tool === 'arrow') {
-              const dx = to.x - from.x;
-              const dy = to.y - from.y;
-              const length = Math.hypot(dx, dy);
-              if (length < 0.5) return null;
-              const ux = dx / length;
-              const uy = dy / length;
-              const headLength = Math.min(length * 0.6, Math.max(12, stroke.width * 3.5 * view.scale));
-              const headHalfWidth = Math.min(length * 0.35, Math.max(5, stroke.width * 1.75 * view.scale));
-              const baseX = to.x - ux * headLength;
-              const baseY = to.y - uy * headLength;
-              const px = -uy;
-              const py = ux;
-              const shaftWidth = Math.max(1, stroke.width * 0.35 * view.scale);
-              return (
-                <g key={stroke.id}>
-                  <line
-                    x1={from.x}
-                    y1={from.y}
-                    x2={baseX + ux}
-                    y2={baseY + uy}
-                    stroke={stroke.color}
-                    strokeWidth={shaftWidth}
-                    strokeLinecap="round"
-                  />
-                  <polygon
-                    points={`${to.x},${to.y} ${baseX + px * headHalfWidth},${baseY + py * headHalfWidth} ${baseX - px * headHalfWidth},${baseY - py * headHalfWidth}`}
-                    fill={stroke.color}
-                  />
-                </g>
-              );
-            }
-
-            const x = Math.min(from.x, to.x);
-            const y = Math.min(from.y, to.y);
-            const width = Math.abs(to.x - from.x);
-            const height = Math.abs(to.y - from.y);
-            if (tool === 'rectangle') {
-              return (
-                <rect
-                  key={stroke.id}
-                  x={x}
-                  y={y}
-                  width={width}
-                  height={height}
-                  fill="none"
-                  stroke={stroke.color}
-                  strokeWidth={outlineWidth}
-                  strokeLinejoin="round"
-                />
-              );
-            }
-            return (
-              <ellipse
-                key={stroke.id}
-                cx={x + width / 2}
-                cy={y + height / 2}
-                rx={width / 2}
-                ry={height / 2}
-                fill="none"
-                stroke={stroke.color}
-                strokeWidth={outlineWidth}
-              />
-            );
-          })}
-        </svg>
+        />
       </div>
       {activeGroupId && <div className="group-edit-indicator">组内编辑：双击组后已解锁组内物体，点击空白处退出</div>}
     </div>

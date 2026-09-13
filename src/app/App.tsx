@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useLayoutEffect, type PointerEvent as ReactPointerEvent } from 'react';
+import { lazy, Suspense, useEffect, useRef, useState, useLayoutEffect, type PointerEvent as ReactPointerEvent } from 'react';
 import { open, save } from '@tauri-apps/plugin-dialog';
 import { desktopDir, join } from '@tauri-apps/api/path';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
@@ -7,15 +7,16 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 import { AssetPanel } from '../components/AssetPanel';
 import { InspectorPanel } from '../components/InspectorPanel';
 import { CanvasView } from '../features/canvas/CanvasView';
-import { ModelViewer } from '../features/model-viewer/ModelViewer';
 import { documentExtensions, imageExtensions, importFileDataCandidatesToProject, importImageCandidatesToProject, importPathsToProject, modelExtensions, videoExtensions, type FileDataImportCandidate, type ImageImportCandidate, type ImportLayoutDirection } from '../features/assets/importController';
 import { exportEditableDocumentAsset, importClipboardImageDataUrl } from '../features/assets/assetImport';
 import { AI_VISION_MODELS, type AiModelManifest } from '../features/ai/modelManifest';
-import { loadProjectDataUrl, loadProjectFile, saveProjectFile } from '../features/project/projectIO';
+import { clearRecoveryProject, loadNewerRecoveryProject, loadProjectDataUrl, loadProjectFile, saveProjectFile, saveRecoveryProject } from '../features/project/projectIO';
 import { useProjectStore } from '../stores/projectStore';
 import type { AssetRecord, CanvasNode, DoodleTool, ImportedModel, RefMindProject, RefMindProjectFile, RefMindWorkspaceFile } from '../shared/types';
 import { exportProjectToPng, exportSelectedNodesToPng } from '../features/export/exportCanvas';
 import { clearImageCache, confirmDefaultImageCacheDirectory, getImageCacheStatus, setImageCacheDirectory, type ImageCacheStatus } from '../features/assets/imageCache';
+
+const LazyModelViewer = lazy(() => import('../features/model-viewer/ModelViewer').then((module) => ({ default: module.ModelViewer })));
 
 interface ShortcutSettings {
   help: string;
@@ -179,10 +180,14 @@ function workspaceContentSignature(
   activeCanvasId: string,
   activeProject: RefMindProject
 ) {
-  return JSON.stringify({
-    activeCanvasId,
-    canvases: workspaceSnapshot(canvases, activeCanvasId, activeProject)
-  });
+  // This runs on every application render. Serializing a complete workspace
+  // here made UI work proportional to every embedded document and asset. All
+  // project mutations refresh updatedAt, so a compact revision signature is
+  // sufficient for dirty-state tracking.
+  return [activeCanvasId, ...canvases.map((canvas) => {
+    const value = canvas.id === activeCanvasId ? activeProject : canvas.project;
+    return `${canvas.id}:${canvas.name}:${value.updatedAt}:${value.nodes.length}:${value.assets.length}:${value.links.length}:${value.doodles?.length || 0}`;
+  })].join('|');
 }
 
 function createWorkspaceFile(
@@ -930,6 +935,7 @@ export function App() {
   const canvasSwitchTimerRef = useRef<number | null>(null);
   const lastDropKeyRef = useRef<{ key: string; time: number } | null>(null);
   const saveNoticeTimerRef = useRef<number | null>(null);
+  const recoverySaveBusyRef = useRef(false);
   const [savedWorkspaceSignature, setSavedWorkspaceSignature] = useState<string | null>(null);
   const currentWorkspaceSignature = workspaceContentSignature(canvases, activeCanvasId, project);
   const hasUnsavedChanges = cachePathDirty || (savedWorkspaceSignature !== null && savedWorkspaceSignature !== currentWorkspaceSignature);
@@ -1380,6 +1386,7 @@ export function App() {
     setCanvases(savedCanvases);
     setSavedWorkspaceSignature(workspaceContentSignature(savedCanvases, activeCanvasId, project));
     setCachePathDirty(false);
+    void clearRecoveryProject(workspaceCacheId).catch(() => undefined);
     setStatus(`多画布工程已保存：${path}`);
     showProjectSavedNotice(path);
   };
@@ -1400,10 +1407,39 @@ export function App() {
     return true;
   };
 
+  useEffect(() => {
+    if (!currentProjectPath || !hasUnsavedChanges) return;
+    const timer = window.setTimeout(() => {
+      if (recoverySaveBusyRef.current) return;
+      recoverySaveBusyRef.current = true;
+      const recovery = createWorkspaceFile(canvases, activeCanvasId, project, workspaceCacheId, workspaceCacheDirectory);
+      void saveRecoveryProject(workspaceCacheId, recovery)
+        .catch((error) => console.warn('写入自动恢复副本失败', error))
+        .finally(() => { recoverySaveBusyRef.current = false; });
+    }, 45_000);
+    return () => window.clearTimeout(timer);
+  }, [activeCanvasId, canvases, currentProjectPath, currentWorkspaceSignature, hasUnsavedChanges, project, workspaceCacheDirectory, workspaceCacheId]);
+
   const loadProjectFromPath = async (path: string) => {
-    const loaded = await loadProjectFile(path);
+    const original = await loadProjectFile(path);
+    const originalCacheId = original.cacheId || crypto.randomUUID();
+    let loaded = original;
+    let restoredRecovery = false;
+    try {
+      const recovery = await loadNewerRecoveryProject(originalCacheId, path);
+      if (recovery) {
+        if (confirm('检测到比工程文件更新的自动恢复副本。是否恢复未保存的修改？')) {
+          loaded = recovery;
+          restoredRecovery = true;
+        } else {
+          void clearRecoveryProject(originalCacheId);
+        }
+      }
+    } catch (error) {
+      console.warn('读取自动恢复副本失败', error);
+    }
     if (isWorkspaceFile(loaded)) {
-      setWorkspaceCacheId(loaded.cacheId || crypto.randomUUID());
+      setWorkspaceCacheId(loaded.cacheId || originalCacheId);
       setWorkspaceCacheDirectory(loaded.cacheDirectory);
       setCachePathDirty(false);
       const loadedCanvases = loaded.canvases.length > 0 ? loaded.canvases : [{ id: 'main-canvas', name: '主画布', project: createEmptyCanvasProject('主画布') }];
@@ -1414,20 +1450,20 @@ export function App() {
       setCanvases(loadedCanvases.map((canvas) => ({ ...canvas, project: cloneProjectSnapshot(canvas.project) })));
       setActiveCanvasId(nextActiveId);
       setProject(cloneProjectSnapshot(active.project));
-      setSavedWorkspaceSignature(workspaceContentSignature(loadedCanvases, nextActiveId, useProjectStore.getState().project));
+      setSavedWorkspaceSignature(restoredRecovery ? '__recovered__' : workspaceContentSignature(loadedCanvases, nextActiveId, useProjectStore.getState().project));
       setCurrentProjectPath(path);
       setStatus(`多画布工程已打开：${path}`);
       return;
     }
 
-    setWorkspaceCacheId(loaded.cacheId || crypto.randomUUID());
+    setWorkspaceCacheId(loaded.cacheId || originalCacheId);
     setWorkspaceCacheDirectory(loaded.cacheDirectory);
     setCachePathDirty(false);
     const legacyCanvas = { id: 'main-canvas', name: loaded.name || '主画布', project: loaded };
     setCanvases([legacyCanvas]);
     setActiveCanvasId(legacyCanvas.id);
     setProject(loaded);
-    setSavedWorkspaceSignature(workspaceContentSignature([legacyCanvas], legacyCanvas.id, useProjectStore.getState().project));
+    setSavedWorkspaceSignature(restoredRecovery ? '__recovered__' : workspaceContentSignature([legacyCanvas], legacyCanvas.id, useProjectStore.getState().project));
     setCurrentProjectPath(path);
     setStatus(`旧版单画布工程已打开：${path}`);
   };
@@ -3292,7 +3328,9 @@ export function App() {
               </div>
               <button onClick={() => setModelPreview(null)}>关闭</button>
             </header>
-            <ModelViewer modelPath={modelPreview.embeddedDataUrl || modelPreview.projectAssetPath} modelFormat={modelPreview.format} />
+            <Suspense fallback={<div className="model-preview-loading">正在载入 3D 预览…</div>}>
+              <LazyModelViewer modelPath={modelPreview.embeddedDataUrl || modelPreview.projectAssetPath} modelFormat={modelPreview.format} />
+            </Suspense>
           </section>
         </div>
       )}

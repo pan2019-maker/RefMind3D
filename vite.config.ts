@@ -25,6 +25,16 @@ export default defineConfig({
   build: {
     target: process.env.TAURI_PLATFORM === 'windows' ? 'chrome105' : 'safari13',
     minify: !process.env.TAURI_DEBUG ? 'esbuild' : false,
-    sourcemap: !!process.env.TAURI_DEBUG
+    sourcemap: !!process.env.TAURI_DEBUG,
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (id.includes('node_modules/three')) return 'three';
+          if (id.includes('node_modules/@tauri-apps')) return 'tauri';
+          if (id.includes('node_modules/react') || id.includes('node_modules/zustand')) return 'ui';
+          return undefined;
+        }
+      }
+    }
   }
 });

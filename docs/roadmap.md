@@ -1,39 +1,28 @@
-# Roadmap
+# 开发路线
 
-## 0.1.0
+## v1.2.0 性能专项
 
-- 工程骨架
-- 无限画布
-- 图片导入管线
-- 模型导入管线
-- Three.js 预览
-- 工程保存打开
+- 节点空间索引与视口裁剪。
+- 连线视口裁剪。
+- 画布平移及节点拖动的合成层预览。
+- 双 Canvas 涂鸦渲染。
+- 图片三级渐进加载与缓存目录故障回退。
+- 结构共享撤销历史。
+- 轻量工程修改检测。
+- 3D 模块按需加载与前端代码拆包。
+- 原子工程保存和崩溃恢复副本。
+- TypeScript 与 Rust 自动化回归测试。
 
-## 0.2.0
+## 后续性能工作
 
-- 拖拽导入
-- 加载任务队列
-- 模型加载取消
-- 代理模型预览
-- 缩略图列表
+- 将节点缩放也改为合成层预览并在结束时一次提交。
+- 为大型思维导图建立连线空间索引。
+- 增加可重复执行的帧率、内存和工程打开时间基准工具。
+- 对超长自由画笔轨迹进行无损显示级简化，减少工程文件体积。
+- 增加缓存生成任务优先级，保证当前视野始终优先于附近预热节点。
 
-## 0.3.0
+## 后续可靠性工作
 
-- 思维导图节点
-- 节点连线
-- 分组
-- 标签系统
-
-## 0.4.0
-
-- 批量导入
-- 素材库
-- 搜索
-- 最近项目
-
-## fixed6 update
-- UI changed to a PureRef-like minimal dark gray canvas.
-- Top toolbar is hidden by default; main actions are available from the right-click context menu.
-- Settings dialog moved into the right-click menu.
-- Asset panel, inspector panel, grid, and status bar can be toggled in Settings.
-- JPG/PNG/WebP/BMP/GIF/ICO import now uses a fast path: copy original + read dimensions only, no PNG preview generation.
+- 恢复副本保留最近多个版本，并在设置中提供管理入口。
+- 增加工程资源完整性检查和损坏资源定位。
+- 在发布流水线中自动执行前端测试、Rust 测试和 Windows 安装包校验。

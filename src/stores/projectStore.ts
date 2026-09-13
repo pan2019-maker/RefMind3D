@@ -46,7 +46,12 @@ interface ProjectState {
   normalizeGroups: () => void;
 }
 
-const now = () => new Date().toISOString();
+let lastRevisionTime = 0;
+const now = () => {
+  const wallClock = Date.now();
+  lastRevisionTime = Math.max(wallClock, lastRevisionTime + 1);
+  return new Date(lastRevisionTime).toISOString();
+};
 const GROUP_PADDING = 28;
 const HISTORY_LIMIT = 100;
 const DEFAULT_FREE_TEXT_FILL = 'transparent';
@@ -67,8 +72,16 @@ function createEmptyProject(): RefMindProject {
   };
 }
 
-function cloneProject(project: RefMindProject): RefMindProject {
-  return JSON.parse(JSON.stringify(project)) as RefMindProject;
+function cloneNodes(nodes: CanvasNode[]): CanvasNode[] {
+  return JSON.parse(JSON.stringify(nodes)) as CanvasNode[];
+}
+
+// Store mutations always replace the affected arrays/objects. History can keep
+// the immutable project root directly and share unchanged assets, document
+// payloads and doodle points instead of serializing the entire project on every
+// edit. Clipboard data still uses cloneProject because it is detached data.
+function historySnapshot(project: RefMindProject): RefMindProject {
+  return project;
 }
 
 function defaultTextPatch(node: CanvasNode): CanvasNode {
@@ -138,7 +151,7 @@ function normalizeProject(project: RefMindProject): RefMindProject {
 
 function withHistory(state: ProjectState) {
   return {
-    history: [...state.history.slice(-(HISTORY_LIMIT - 1)), cloneProject(state.project)],
+    history: [...state.history.slice(-(HISTORY_LIMIT - 1)), historySnapshot(state.project)],
     future: []
   };
 }
@@ -354,7 +367,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
       project: normalizeProject(previous),
       selectedNodeIds: [],
       history: state.history.slice(0, -1),
-      future: [cloneProject(state.project), ...state.future].slice(0, HISTORY_LIMIT)
+      future: [historySnapshot(state.project), ...state.future].slice(0, HISTORY_LIMIT)
     };
   }),
 
@@ -364,7 +377,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     return {
       project: normalizeProject(next),
       selectedNodeIds: [],
-      history: [...state.history, cloneProject(state.project)].slice(-HISTORY_LIMIT),
+      history: [...state.history, historySnapshot(state.project)].slice(-HISTORY_LIMIT),
       future: state.future.slice(1)
     };
   }),
@@ -372,7 +385,9 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
   copySelected: () => {
     const state = get();
     const nodes = state.project.nodes.filter((node) => state.selectedNodeIds.includes(node.id));
-    set({ clipboardNodes: cloneProject({ ...state.project, nodes }).nodes });
+    // Copy only selected nodes. Serializing the whole project here previously
+    // duplicated every embedded asset merely to obtain this small node array.
+    set({ clipboardNodes: cloneNodes(nodes) });
   },
 
   pasteClipboard: (at) => set((state) => {

@@ -122,6 +122,46 @@ pub fn load_project(path: String, _extract_root: Option<String>) -> Result<Value
     Ok(project)
 }
 
+fn recovery_directory() -> PathBuf {
+    env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(env::temp_dir)
+        .join("RefMind3D")
+        .join("Recovery")
+}
+
+fn recovery_path(cache_id: &str) -> PathBuf {
+    recovery_directory().join(format!("{}.refmind3d", sanitize_file_name(cache_id)))
+}
+
+#[tauri::command]
+pub async fn save_recovery_project(cache_id: String, project: Value) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let directory = recovery_directory();
+        fs::create_dir_all(&directory).map_err(|e| format!("Create recovery directory failed: {e}"))?;
+        save_packed_project(recovery_path(&cache_id).to_string_lossy().to_string(), project)
+    }).await.map_err(|e| format!("Recovery task failed: {e}"))?
+}
+
+#[tauri::command]
+pub async fn load_newer_recovery_project(cache_id: String, project_path: String) -> Result<Option<Value>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let recovery = recovery_path(&cache_id);
+        if !recovery.is_file() { return Ok(None); }
+        let recovery_modified = fs::metadata(&recovery).and_then(|value| value.modified()).unwrap_or(UNIX_EPOCH);
+        let project_modified = fs::metadata(&project_path).and_then(|value| value.modified()).unwrap_or(UNIX_EPOCH);
+        if recovery_modified <= project_modified { return Ok(None); }
+        load_project(recovery.to_string_lossy().to_string(), None).map(Some)
+    }).await.map_err(|e| format!("Read recovery task failed: {e}"))?
+}
+
+#[tauri::command]
+pub fn clear_recovery_project(cache_id: String) -> Result<(), String> {
+    let path = recovery_path(&cache_id);
+    if !path.exists() { return Ok(()); }
+    fs::remove_file(path).map_err(|e| format!("Clear recovery project failed: {e}"))
+}
+
 #[tauri::command]
 pub fn get_launch_project_path() -> Option<String> {
     env::args_os()
@@ -192,7 +232,11 @@ fn save_packed_project(path: String, mut project: Value) -> Result<(), String> {
         packed_at,
     };
 
-    let file = fs::File::create(&path).map_err(|e| format!("Create project file failed: {e}"))?;
+    let destination = PathBuf::from(&path);
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|e| format!("Create project directory failed: {e}"))?;
+    let temporary = parent.join(format!(".refmind3d-save-{}.tmp", Uuid::new_v4()));
+    let file = fs::File::create(&temporary).map_err(|e| format!("Create temporary project file failed: {e}"))?;
     let mut zip = ZipWriter::new(file);
     let deflated = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
 
@@ -235,8 +279,26 @@ fn save_packed_project(path: String, mut project: Value) -> Result<(), String> {
         }
     }
 
-    zip.finish()
+    let finished = zip.finish()
         .map_err(|e| format!("Finish project package failed: {e}"))?;
+    finished.sync_all().map_err(|e| format!("Flush project package failed: {e}"))?;
+
+    // Write to the same directory first, then replace the destination. A crash
+    // or full disk can no longer leave the user's only project half-written.
+    let backup = parent.join(format!(".refmind3d-backup-{}.tmp", Uuid::new_v4()));
+    let had_destination = destination.exists();
+    if had_destination {
+        fs::rename(&destination, &backup).map_err(|e| {
+            let _ = fs::remove_file(&temporary);
+            format!("Prepare existing project for replacement failed: {e}")
+        })?;
+    }
+    if let Err(error) = fs::rename(&temporary, &destination) {
+        if had_destination { let _ = fs::rename(&backup, &destination); }
+        let _ = fs::remove_file(&temporary);
+        return Err(format!("Replace project file failed: {error}"));
+    }
+    if had_destination { let _ = fs::remove_file(backup); }
     Ok(())
 }
 
@@ -1047,5 +1109,22 @@ mod tests {
             legacy_embedded_resource_mime(&asset, &resource),
             "image/png"
         );
+    }
+
+    #[test]
+    fn packed_project_save_replaces_existing_file_atomically() {
+        let root = env::temp_dir().join(format!("refmind3d-atomic-save-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("project.refmind3d");
+        let first = json!({ "version": 1, "name": "first", "assets": [], "nodes": [], "links": [] });
+        let second = json!({ "version": 1, "name": "second", "assets": [], "nodes": [], "links": [] });
+
+        save_packed_project(path.to_string_lossy().to_string(), first).unwrap();
+        save_packed_project(path.to_string_lossy().to_string(), second).unwrap();
+        let loaded = load_project(path.to_string_lossy().to_string(), None).unwrap();
+
+        assert_eq!(loaded.get("name").and_then(Value::as_str), Some("second"));
+        assert_eq!(fs::read_dir(&root).unwrap().filter_map(Result::ok).count(), 1);
+        let _ = fs::remove_dir_all(root);
     }
 }
