@@ -100,7 +100,7 @@ function expandSelectedNodes(project: RefMindProject, nodeIds: string[]) {
 }
 
 async function renderNodesToPng(project: RefMindProject, outputPath: string, sourceNodes: CanvasNode[], background = 'transparent') {
-  const nodes = sourceNodes.slice().sort((a, b) => (a.zIndex || 0) - (b.zIndex || 0));
+  const nodes = sourceNodes.filter((node) => !node.hidden).slice().sort((a, b) => (a.zIndex || 0) - (b.zIndex || 0));
   if (nodes.length === 0) throw new Error('没有可导出的节点');
 
   const assetsById = new Map(project.assets.map((asset) => [asset.id, asset]));
@@ -142,6 +142,8 @@ async function renderNodesToPng(project: RefMindProject, outputPath: string, sou
 
   for (const node of nodes) {
     ctx.save();
+    ctx.globalAlpha = node.opacity ?? 1;
+    ctx.filter = project.canvasGrayscale || node.grayscale ? 'grayscale(1)' : 'none';
     ctx.translate(node.x + node.width / 2, node.y + node.height / 2);
     ctx.rotate((node.rotation || 0) * Math.PI / 180);
     ctx.translate(-node.width / 2, -node.height / 2);
@@ -159,7 +161,18 @@ async function renderNodesToPng(project: RefMindProject, outputPath: string, sou
         const img = await loadImage(path.startsWith('data:') || path.startsWith('blob:') || isRuntimeResourceUrl(path) ? path : convertFileSrc(path));
         ctx.fillStyle = '#2e2e2e';
         ctx.fillRect(0, 0, node.width, node.height);
-        ctx.drawImage(img, 0, 0, node.width, node.height);
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(0, 0, node.width, node.height);
+        ctx.clip();
+        const baseScale = node.cropEnabled
+          ? Math.max(node.width / img.naturalWidth, node.height / img.naturalHeight)
+          : Math.min(node.width / img.naturalWidth, node.height / img.naturalHeight);
+        const scale = baseScale * (node.imageScale || 1);
+        ctx.translate(node.width / 2 + (node.imagePanX || 0) * node.width / 100, node.height / 2 + (node.imagePanY || 0) * node.height / 100);
+        ctx.scale(node.flipX ? -scale : scale, node.flipY ? -scale : scale);
+        ctx.drawImage(img, -img.naturalWidth / 2, -img.naturalHeight / 2);
+        ctx.restore();
       } catch {
         ctx.fillStyle = '#333';
         ctx.fillRect(0, 0, node.width, node.height);

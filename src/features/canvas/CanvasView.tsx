@@ -495,8 +495,10 @@ function cloneWorkbook(workbook: SpreadsheetWorkbook): SpreadsheetWorkbook {
   return JSON.parse(JSON.stringify(workbook)) as SpreadsheetWorkbook;
 }
 
-const CanvasImage = memo(function CanvasImage({ asset, projectCacheId, cacheDirectory, cacheEpoch, lowZoom, displaySize, visible, loadPriority, loadEnabled, allowFullResolution, alt, selected, title }: {
+const CanvasImage = memo(function CanvasImage({ asset, node, canvasGrayscale, projectCacheId, cacheDirectory, cacheEpoch, lowZoom, displaySize, visible, loadPriority, loadEnabled, allowFullResolution, alt, selected, title }: {
   asset: AssetRecord;
+  node: CanvasNode;
+  canvasGrayscale: boolean;
   projectCacheId: string;
   cacheDirectory?: string;
   cacheEpoch: number;
@@ -563,6 +565,13 @@ const CanvasImage = memo(function CanvasImage({ asset, projectCacheId, cacheDire
         : previewTier === 'full' ? fullResolutionAssetUrl(asset) : cached.previewUrl)
     : assetUrl(asset, true);
 
+  const imageTransform = [
+    `translate(${node.imagePanX || 0}%, ${node.imagePanY || 0}%)`,
+    `scale(${node.imageScale || 1})`,
+    `scaleX(${node.flipX ? -1 : 1})`,
+    `scaleY(${node.flipY ? -1 : 1})`
+  ].join(' ');
+
   return (
     <>
       <span className="image-node-fallback">{title || '图片预览'}</span>
@@ -574,8 +583,14 @@ const CanvasImage = memo(function CanvasImage({ asset, projectCacheId, cacheDire
         decoding="async"
         fetchPriority={selected ? 'high' : 'low'}
         alt={alt}
+        style={{
+          transform: imageTransform,
+          opacity: node.opacity ?? 1,
+          filter: canvasGrayscale || node.grayscale ? 'grayscale(1)' : undefined,
+          objectFit: node.cropEnabled ? 'cover' : 'contain'
+        }}
         onLoad={(event) => {
-          event.currentTarget.style.opacity = '1';
+          event.currentTarget.style.opacity = String(node.opacity ?? 1);
         }}
         onError={(event) => {
           const image = event.currentTarget;
@@ -956,7 +971,7 @@ export function CanvasView({
       const node = nodesById.get(id);
       if (node) result.push(node);
     }
-    return result;
+    return result.filter((node) => !node.hidden);
   }, [nodeSpatialIndex, project.nodes, nodesById, view, viewportSize, editingNodeId, activeGroupId]);
 
   const visibleNodes = useMemo(() => nodeSpatialIndex.query({
@@ -964,7 +979,7 @@ export function CanvasView({
     y: -view.y / view.scale,
     width: viewportSize.width / view.scale,
     height: viewportSize.height / view.scale
-  }), [nodeSpatialIndex, project.nodes, view, viewportSize]);
+  }).filter((node) => !node.hidden), [nodeSpatialIndex, project.nodes, view, viewportSize]);
   const visibleNodeIds = useMemo(() => new Set(visibleNodes.map((node) => node.id)), [visibleNodes]);
 
   const viewportWorldCenter = useMemo(() => ({
@@ -1559,6 +1574,11 @@ export function CanvasView({
   };
 
   const onNodeMouseDown = (event: ReactMouseEvent, node: CanvasNode) => {
+    if (project.canvasLocked || node.locked) {
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
     flushZoom();
     setSelectedLinkId(null);
     if (mouseShortcutMatches(event, mindChildShortcut)) {
@@ -2287,7 +2307,7 @@ export function CanvasView({
               <div
                 key={node.id}
                 data-node-id={node.id}
-                className={`canvas-node ${node.type}-canvas-node ${selected ? 'selected' : ''} ${editing ? 'editing' : ''} ${lockedByGroup ? 'group-child-locked' : ''} ${groupEditing ? 'group-edit-active' : ''}`}
+                className={`canvas-node ${node.type}-canvas-node ${selected ? 'selected' : ''} ${editing ? 'editing' : ''} ${lockedByGroup ? 'group-child-locked' : ''} ${groupEditing ? 'group-edit-active' : ''} ${node.locked ? 'node-locked' : ''}`}
                 style={{
                   left: screenRect.x,
                   top: screenRect.y,
@@ -2298,6 +2318,8 @@ export function CanvasView({
                   background: node.type === 'group' || isTextNode(node) ? node.fillColor : undefined,
                   borderColor: node.type === 'group' || isTextNode(node) ? node.strokeColor : undefined,
                   color: node.textColor,
+                  opacity: node.type === 'image' ? undefined : (node.opacity ?? 1),
+                  filter: project.canvasGrayscale || (node.type !== 'image' && node.grayscale) ? 'grayscale(1)' : undefined,
                   ...textStyle
                 }}
                 onMouseDown={(event) => onNodeMouseDown(event, node)}
@@ -2323,6 +2345,8 @@ export function CanvasView({
                 {node.type === 'image' && asset && (
                   <CanvasImage
                     asset={asset}
+                    node={node}
+                    canvasGrayscale={Boolean(project.canvasGrayscale)}
                     projectCacheId={projectCacheId}
                     cacheDirectory={cacheDirectory}
                     cacheEpoch={imageCacheEpoch}

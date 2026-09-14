@@ -47,4 +47,25 @@ describe('project history', () => {
     expect(useProjectStore.getState().project.assets).toHaveLength(1);
     expect(useProjectStore.getState().project.nodes.find((item) => item.id === 'node-2')?.assetId).toBe(first.id);
   });
+
+  it('normalizes and persists non-destructive image controls', () => {
+    useProjectStore.getState().setProject({ ...emptyProject(), nodes: [{ ...node(), opacity: 3, imageScale: 20, imagePanX: -250 }] });
+    const image = useProjectStore.getState().project.nodes[0];
+    expect(image.opacity).toBe(1);
+    expect(image.imageScale).toBe(8);
+    expect(image.imagePanX).toBe(-100);
+    useProjectStore.getState().updateNode(image.id, { cropEnabled: true, flipX: true, imageScale: 1.75 });
+    expect(useProjectStore.getState().project.nodes[0]).toMatchObject({ cropEnabled: true, flipX: true, imageScale: 1.75 });
+  });
+
+  it('tracks canvas modes and linked asset mode in undo history', () => {
+    const asset: AssetRecord = { id: 'asset-1', kind: 'image', name: 'a.png', originalPath: 'D:\\a.png', projectAssetPath: '', fileSize: 42, format: 'png', importedAt: '' };
+    useProjectStore.getState().addAsset(asset);
+    useProjectStore.getState().updateAsset(asset.id, { storageMode: 'linked' });
+    useProjectStore.getState().updateProjectOptions({ canvasLocked: true, canvasGrayscale: true });
+    expect(useProjectStore.getState().project.assets[0].storageMode).toBe('linked');
+    expect(useProjectStore.getState().project).toMatchObject({ canvasLocked: true, canvasGrayscale: true });
+    useProjectStore.getState().undo();
+    expect(useProjectStore.getState().project.canvasLocked).toBe(false);
+  });
 });

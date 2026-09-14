@@ -9,6 +9,7 @@ interface ProjectState {
   history: ProjectPatch[];
   future: ProjectPatch[];
   addAsset: (asset: AssetRecord) => void;
+  updateAsset: (id: string, patch: Partial<AssetRecord>) => void;
   addNode: (node: CanvasNode) => void;
   addAssetsAndNodes: (assets: AssetRecord[], nodes: CanvasNode[], selectedNodeIds?: string[]) => void;
   updateNode: (id: string, patch: Partial<CanvasNode>, recordHistory?: boolean, applyGroups?: boolean) => void;
@@ -20,6 +21,7 @@ interface ProjectState {
   clearSelection: () => void;
   setProject: (project: RefMindProject) => void;
   setProjectRoot: (rootPath: string) => void;
+  updateProjectOptions: (patch: Pick<Partial<RefMindProject>, 'canvasLocked' | 'canvasGrayscale'>) => void;
   newProject: () => void;
   undo: () => void;
   redo: () => void;
@@ -80,9 +82,9 @@ function cloneNodes(nodes: CanvasNode[]): CanvasNode[] {
 // the immutable project root directly and share unchanged assets, document
 // payloads and doodle points instead of serializing the entire project on every
 // edit. Clipboard data still uses cloneProject because it is detached data.
-type PatchField = 'name' | 'rootPath' | 'assets' | 'nodes' | 'links' | 'doodles';
+type PatchField = 'name' | 'rootPath' | 'assets' | 'nodes' | 'links' | 'doodles' | 'canvasLocked' | 'canvasGrayscale';
 type ProjectPatch = { fields: PatchField[]; values: Partial<RefMindProject>; updatedAt: string };
-const ALL_PATCH_FIELDS: PatchField[] = ['name', 'rootPath', 'assets', 'nodes', 'links', 'doodles'];
+const ALL_PATCH_FIELDS: PatchField[] = ['name', 'rootPath', 'assets', 'nodes', 'links', 'doodles', 'canvasLocked', 'canvasGrayscale'];
 
 function historySnapshot(project: RefMindProject, fields: PatchField[] = ALL_PATCH_FIELDS): ProjectPatch {
   const values: Partial<RefMindProject> = {};
@@ -129,7 +131,11 @@ function normalizeProject(project: RefMindProject): RefMindProject {
     nodes: (project.nodes || []).map((node, index) => defaultTextPatch({
       ...node,
       rotation: node.rotation ?? 0,
-      zIndex: node.zIndex ?? index + 1
+      zIndex: node.zIndex ?? index + 1,
+      opacity: Math.max(0.05, Math.min(1, node.opacity ?? 1)),
+      imageScale: Math.max(0.1, Math.min(8, node.imageScale ?? 1)),
+      imagePanX: Math.max(-100, Math.min(100, node.imagePanX ?? 0)),
+      imagePanY: Math.max(-100, Math.min(100, node.imagePanY ?? 0))
     })),
     links: (project.links || []).map((link) => ({
       id: link.id || crypto.randomUUID(),
@@ -153,6 +159,8 @@ function normalizeProject(project: RefMindProject): RefMindProject {
           pressure: Math.max(0.05, Math.min(1, Number(point.pressure) || 1))
         }))
     })).filter((stroke) => stroke.points.length > 0),
+    canvasLocked: Boolean(project.canvasLocked),
+    canvasGrayscale: Boolean(project.canvasGrayscale),
     createdAt: project.createdAt || now(),
     updatedAt: project.updatedAt || now()
   };
@@ -270,6 +278,14 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
   addAsset: (asset) => set((state) => ({
     ...withHistory(state, ['assets']),
     project: { ...state.project, assets: [...state.project.assets, asset], updatedAt: now() }
+  })),
+  updateAsset: (id, patch) => set((state) => ({
+    ...withHistory(state, ['assets']),
+    project: {
+      ...state.project,
+      assets: state.project.assets.map((asset) => asset.id === id ? { ...asset, ...patch } : asset),
+      updatedAt: now()
+    }
   })),
 
   addNode: (node) => set((state) => ({
@@ -389,6 +405,10 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 
   setProjectRoot: (rootPath) => set((state) => ({
     project: { ...state.project, rootPath, updatedAt: now() }
+  })),
+  updateProjectOptions: (patch) => set((state) => ({
+    ...withHistory(state, Object.keys(patch) as PatchField[]),
+    project: { ...state.project, ...patch, updatedAt: now() }
   })),
 
   newProject: () => set((state) => ({

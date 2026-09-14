@@ -28,6 +28,8 @@ export interface AssetRecord {
   contentHtml?: string;
   documentMedia?: DocumentMedia[];
   spreadsheetData?: SpreadsheetWorkbook;
+  /** Embedded keeps a portable copy in the project; linked keeps the source path. */
+  storageMode?: 'embedded' | 'linked';
 }
 
 export interface DocumentMedia {
@@ -156,6 +158,17 @@ export interface CanvasNode {
   isGroupContainer?: boolean;
   /** Content groups are locked by default and require double click to edit inside. */
   groupLocked?: boolean;
+  locked?: boolean;
+  hidden?: boolean;
+  opacity?: number;
+  grayscale?: boolean;
+  flipX?: boolean;
+  flipY?: boolean;
+  /** Non-destructive image framing controls. The node rectangle is the crop frame. */
+  cropEnabled?: boolean;
+  imageScale?: number;
+  imagePanX?: number;
+  imagePanY?: number;
 }
 
 export interface MindLink {
@@ -192,6 +205,8 @@ export interface RefMindProject {
   nodes: CanvasNode[];
   links: MindLink[];
   doodles?: DoodleStroke[];
+  canvasLocked?: boolean;
+  canvasGrayscale?: boolean;
   createdAt: string;
   updatedAt: string;
 }

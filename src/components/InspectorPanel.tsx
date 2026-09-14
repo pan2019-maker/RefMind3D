@@ -7,255 +7,89 @@ function numberValue(value: string, fallback: number) {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
-function proportionalSize(width: number, height: number, next: number, axis: 'width' | 'height') {
-  const ratio = height > 0 ? width / height : 1;
+function proportionalSize(node: CanvasNode, next: number, axis: 'width' | 'height') {
+  const ratio = node.height > 0 ? node.width / node.height : 1;
+  if (node.cropEnabled) return axis === 'width' ? { width: Math.max(20, next) } : { height: Math.max(20, next) };
   if (axis === 'width') {
-    const safeWidth = Math.max(20, next);
-    return { width: safeWidth, height: Math.max(20, Math.round(safeWidth / ratio)) };
+    const width = Math.max(20, next);
+    return { width, height: Math.max(20, Math.round(width / ratio)) };
   }
-  const safeHeight = Math.max(20, next);
-  return { width: Math.max(20, Math.round(safeHeight * ratio)), height: safeHeight };
+  const height = Math.max(20, next);
+  return { width: Math.max(20, Math.round(height * ratio)), height };
 }
-
-function centerOf(node: CanvasNode) {
-  return { x: node.x + node.width / 2, y: node.y + node.height / 2 };
-}
-
-const fontFamilies = [
-  'Segoe UI',
-  'Microsoft YaHei',
-  'SimHei',
-  'SimSun',
-  'Arial',
-  'Calibri',
-  'Times New Roman',
-  'Consolas',
-  'Cascadia Mono'
-];
 
 function toHexColor(value?: string, fallback = '#666666') {
   if (!value) return fallback;
-  const trimmed = value.trim();
-  if (/^#[0-9a-fA-F]{6}$/.test(trimmed)) return trimmed;
-  const short = trimmed.match(/^#([0-9a-fA-F]{3})$/);
-  if (short) {
-    return `#${short[1].split('').map((char) => char + char).join('')}`;
-  }
-  const rgba = trimmed.match(/rgba?\(([^)]+)\)/i);
-  if (rgba) {
-    const parts = rgba[1].split(',').map((part) => Number(part.trim()));
-    if (parts.length >= 3 && parts.slice(0, 3).every((part) => Number.isFinite(part))) {
-      return `#${parts.slice(0, 3).map((part) => Math.max(0, Math.min(255, Math.round(part))).toString(16).padStart(2, '0')).join('')}`;
-    }
-  }
-  return fallback;
+  return /^#[0-9a-fA-F]{6}$/.test(value.trim()) ? value.trim() : fallback;
 }
 
-function ColorField({
-  label,
-  value,
-  fallback,
-  swatches,
-  onChange
-}: {
-  label: string;
-  value?: string;
-  fallback: string;
-  swatches: string[];
-  onChange: (value: string) => void;
-}) {
-  const colorValue = toHexColor(value, fallback);
-  return (
-    <label>{label}
-      <div className="color-editor-row">
-        <input
-          type="color"
-          value={colorValue}
-          title="点击选择颜色"
-          onChange={(event) => onChange(event.currentTarget.value)}
-        />
-        <input
-          value={value || ''}
-          placeholder={fallback}
-          onChange={(event) => onChange(event.currentTarget.value)}
-        />
-      </div>
-      <div className="color-swatches">
-        {swatches.map((color) => (
-          <button
-            key={color}
-            type="button"
-            title={color}
-            style={{ background: color }}
-            onClick={() => onChange(color)}
-          />
-        ))}
-      </div>
-    </label>
-  );
-}
-
-const groupFillSwatches = ['#4f6fa8', '#6e8f6b', '#a87b4f', '#8f5fa8', '#9a6a6a', '#5f8fa8', '#3a3a3a', '#202020'];
-const groupStrokeSwatches = ['#9ab7ff', '#a9d89c', '#ffca8c', '#d89cff', '#ff9c9c', '#9ce0ff', '#d0d0d0', '#6b6b6b'];
-const textFillSwatches = ['#2a2a2a', '#ffffff', '#fff3c4', '#dff2ff', '#e9ffe4', '#f5e3ff', '#ffe5e5', '#101010'];
-const textColorSwatches = ['#e8e8e8', '#111111', '#ffffff', '#ffd166', '#8ab4ff', '#7ee787', '#ff9c9c', '#c792ea'];
+const fonts = ['Segoe UI', 'Microsoft YaHei', 'SimHei', 'SimSun', 'Arial', 'Calibri', 'Times New Roman', 'Consolas', 'Cascadia Mono'];
 
 export function InspectorPanel() {
-  const { project, selectedNodeIds, updateNode, updateNodes } = useProjectStore();
-  const selected = useMemo(() => project.nodes.find((node) => node.id === selectedNodeIds[0]), [project.nodes, selectedNodeIds]);
+  const { project, selectedNodeIds, updateNode, updateNodes, updateAsset } = useProjectStore();
+  const selectedNodes = useMemo(() => project.nodes.filter((node) => selectedNodeIds.includes(node.id)), [project.nodes, selectedNodeIds]);
+  const selected = selectedNodes[0];
   const asset = useMemo(() => selected?.assetId ? project.assets.find((item) => item.id === selected.assetId) : undefined, [project.assets, selected]);
+  const patchSelected = (patch: Partial<CanvasNode>) => updateNodes(selectedNodes.map((node) => ({ id: node.id, patch })), true, false);
 
-  const updateSize = (node: CanvasNode, next: number, axis: 'width' | 'height') => {
-    const size = proportionalSize(node.width, node.height, next, axis);
-    if (node.type !== 'group') {
-      updateNode(node.id, size, true);
-      return;
-    }
-    const center = centerOf(node);
-    const scale = axis === 'width'
-      ? size.width / Math.max(1, node.width)
-      : size.height / Math.max(1, node.height);
-    const updates = [
-      {
-        id: node.id,
-        patch: {
-          x: Math.round(center.x - size.width / 2),
-          y: Math.round(center.y - size.height / 2),
-          width: size.width,
-          height: size.height
-        }
-      },
-      ...project.nodes
-        .filter((child) => child.groupId === node.id)
-        .map((child) => ({
-          id: child.id,
-          patch: {
-            x: Math.round(center.x + (child.x - center.x) * scale),
-            y: Math.round(center.y + (child.y - center.y) * scale),
-            width: Math.max(18, Math.round(child.width * scale)),
-            height: Math.max(18, Math.round(child.height * scale))
-          }
-        }))
-    ];
-    updateNodes(updates, true);
-  };
+  if (!selected) return <aside className="inspector-panel"><h2>属性</h2><p className="muted">选择一个或多个节点后可编辑属性。</p></aside>;
 
   return (
     <aside className="inspector-panel">
-      <h2>属性</h2>
-      {!selected && <p className="muted">未选择节点</p>}
-      {selected && (
-        <div className="property-list">
-          <label>名称
-            <input value={selected.title} onChange={(event) => updateNode(selected.id, { title: event.currentTarget.value }, true)} />
-          </label>
-          <label>X
-            <input type="number" value={Math.round(selected.x)} onChange={(event) => updateNode(selected.id, { x: numberValue(event.currentTarget.value, selected.x) }, true)} />
-          </label>
-          <label>Y
-            <input type="number" value={Math.round(selected.y)} onChange={(event) => updateNode(selected.id, { y: numberValue(event.currentTarget.value, selected.y) }, true)} />
-          </label>
-          <label>宽（等比）
-            <input
-              type="number"
-              value={Math.round(selected.width)}
-              onChange={(event) => updateSize(selected, numberValue(event.currentTarget.value, selected.width), 'width')}
-            />
-          </label>
-          <label>高（等比）
-            <input
-              type="number"
-              value={Math.round(selected.height)}
-              onChange={(event) => updateSize(selected, numberValue(event.currentTarget.value, selected.height), 'height')}
-            />
-          </label>
-          <label>旋转
-            <input type="number" value={Math.round(selected.rotation)} onChange={(event) => updateNode(selected.id, { rotation: numberValue(event.currentTarget.value, selected.rotation) }, true)} />
-          </label>
-          {(selected.type === 'group' || ['note','mindmap','document','table','pdf'].includes(selected.type)) && (
-            <>
-              <ColorField
-                label={selected.type === 'group' ? '组背景颜色' : (['document','table','pdf'].includes(selected.type) ? '内容背景颜色' : '文本背景颜色')}
-                value={selected.fillColor}
-                fallback={selected.type === 'group' ? '#4f6fa8' : (['document','table','pdf'].includes(selected.type) ? '#ffffff' : '#2a2a2a')}
-                swatches={selected.type === 'group' ? groupFillSwatches : textFillSwatches}
-                onChange={(value) => updateNode(selected.id, { fillColor: value }, true)}
-              />
-              <ColorField
-                label={selected.type === 'group' ? '组边框颜色' : (['document','table','pdf'].includes(selected.type) ? '内容边框颜色' : '文本边框颜色')}
-                value={selected.strokeColor}
-                fallback={selected.type === 'group' ? '#9ab7ff' : '#747474'}
-                swatches={selected.type === 'group' ? groupStrokeSwatches : groupStrokeSwatches}
-                onChange={(value) => updateNode(selected.id, { strokeColor: value }, true)}
-              />
-            </>
-          )}
-          {(['note','mindmap','document','table','pdf'].includes(selected.type)) && (
-            <>
-              <label>字体
-                <select value={selected.fontFamily || 'Segoe UI'} onChange={(event) => updateNode(selected.id, { fontFamily: event.currentTarget.value }, true)}>
-                  {fontFamilies.map((font) => <option key={font} value={font}>{font}</option>)}
-                </select>
-              </label>
-              <label>字号
-                <input
-                  type="number"
-                  min={6}
-                  max={240}
-                  value={selected.fontSize || 16}
-                  onChange={(event) => updateNode(selected.id, { fontSize: numberValue(event.currentTarget.value, selected.fontSize || 16) }, true)}
-                />
-              </label>
-              <ColorField
-                label="文字颜色"
-                value={selected.textColor}
-                fallback="#e8e8e8"
-                swatches={textColorSwatches}
-                onChange={(value) => updateNode(selected.id, { textColor: value }, true)}
-              />
-              <label className="checkbox-row">
-                <input
-                  type="checkbox"
-                  checked={(selected.fontWeight || 'normal') === 'bold'}
-                  onChange={(event) => updateNode(selected.id, { fontWeight: event.currentTarget.checked ? 'bold' : 'normal' }, true)}
-                />
-                加粗
-              </label>
-              <label className="checkbox-row">
-                <input
-                  type="checkbox"
-                  checked={(selected.fontStyle || 'normal') === 'italic'}
-                  onChange={(event) => updateNode(selected.id, { fontStyle: event.currentTarget.checked ? 'italic' : 'normal' }, true)}
-                />
-                倾斜
-              </label>
-              <label>{['document','table','pdf'].includes(selected.type) ? '可编辑内容' : '文本内容'}
-                <textarea value={selected.text || ''} onChange={(event) => updateNode(selected.id, { text: event.currentTarget.value }, true)} />
-              </label>
-            </>
-          )}
-          {selected.type === 'group' && (
-            <p className="muted">这是组节点。单击组会移动整个组；双击组后才可选择组内物体。组外物体的中心点进入组范围后会自动归组，组边缘会按组内物体最外侧自动扩展。</p>
-          )}
+      <div className="panel-heading"><h2>属性</h2><span>{selectedNodes.length > 1 ? `${selectedNodes.length} 个节点` : selected.type}</span></div>
+      <div className="property-list">
+        {selectedNodes.length === 1 && <label>名称<input value={selected.title} onChange={(event) => updateNode(selected.id, { title: event.currentTarget.value }, true)} /></label>}
+        <div className="property-two-column">
+          <label>X<input type="number" value={Math.round(selected.x)} onChange={(event) => updateNode(selected.id, { x: numberValue(event.currentTarget.value, selected.x) }, true)} /></label>
+          <label>Y<input type="number" value={Math.round(selected.y)} onChange={(event) => updateNode(selected.id, { y: numberValue(event.currentTarget.value, selected.y) }, true)} /></label>
+          <label>宽<input type="number" value={Math.round(selected.width)} onChange={(event) => updateNode(selected.id, proportionalSize(selected, numberValue(event.currentTarget.value, selected.width), 'width'), true)} /></label>
+          <label>高<input type="number" value={Math.round(selected.height)} onChange={(event) => updateNode(selected.id, proportionalSize(selected, numberValue(event.currentTarget.value, selected.height), 'height'), true)} /></label>
         </div>
-      )}
-      {asset && (
-        <div className="asset-detail">
-          <h3>资源信息</h3>
-          <p>格式：{asset.format}</p>
-          <p>大小：{(asset.fileSize / 1024 / 1024).toFixed(2)} MB</p>
-          <p className="path-text">{asset.projectAssetPath}</p>
-          {asset.kind === 'model' && (
-            <div className="model-stats">
-              <h3>模型统计</h3>
-              <p>顶点：{(asset as ImportedModel).stats.vertices ?? '未知'}</p>
-              <p>面数：{(asset as ImportedModel).stats.faces ?? '未知'}</p>
-              <p>警告：{(asset as ImportedModel).stats.warningLevel}</p>
-              {(asset as ImportedModel).stats.warnings.map((warning) => <p className="warning" key={warning}>{warning}</p>)}
-            </div>
-          )}
+        <label>旋转<input type="number" value={Math.round(selected.rotation)} onChange={(event) => patchSelected({ rotation: numberValue(event.currentTarget.value, selected.rotation) })} /></label>
+        <label>透明度 <output>{Math.round((selected.opacity ?? 1) * 100)}%</output><input type="range" min="5" max="100" value={Math.round((selected.opacity ?? 1) * 100)} onChange={(event) => patchSelected({ opacity: Number(event.currentTarget.value) / 100 })} /></label>
+        <div className="property-action-grid">
+          <button className={selected.locked ? 'active' : ''} onClick={() => patchSelected({ locked: !selected.locked })}>{selected.locked ? '解除锁定' : '锁定节点'}</button>
+          <button onClick={() => patchSelected({ hidden: true })}>隐藏节点</button>
+          <button className={selected.grayscale ? 'active' : ''} onClick={() => patchSelected({ grayscale: !selected.grayscale })}>灰度</button>
         </div>
-      )}
+
+        {selected.type === 'image' && <section className="property-section">
+          <h3>图片无损编辑</h3>
+          <div className="property-action-grid">
+            <button className={selected.cropEnabled ? 'active' : ''} onClick={() => patchSelected({ cropEnabled: !selected.cropEnabled })}>裁切画框</button>
+            <button onClick={() => patchSelected({ flipX: !selected.flipX })}>水平镜像</button>
+            <button onClick={() => patchSelected({ flipY: !selected.flipY })}>垂直镜像</button>
+            <button onClick={() => patchSelected({ cropEnabled: false, imageScale: 1, imagePanX: 0, imagePanY: 0, flipX: false, flipY: false })}>重置图片</button>
+          </div>
+          <label>画面缩放 <output>{Math.round((selected.imageScale ?? 1) * 100)}%</output><input type="range" min="10" max="800" value={Math.round((selected.imageScale ?? 1) * 100)} onChange={(event) => patchSelected({ imageScale: Number(event.currentTarget.value) / 100 })} /></label>
+          <label>水平取景 <output>{selected.imagePanX ?? 0}%</output><input type="range" min="-100" max="100" value={selected.imagePanX ?? 0} onChange={(event) => patchSelected({ imagePanX: Number(event.currentTarget.value) })} /></label>
+          <label>垂直取景 <output>{selected.imagePanY ?? 0}%</output><input type="range" min="-100" max="100" value={selected.imagePanY ?? 0} onChange={(event) => patchSelected({ imagePanY: Number(event.currentTarget.value) })} /></label>
+          <p className="muted">开启“裁切画框”后可自由修改节点宽高，再用缩放和取景滑块调整画面；原始图片不会被改写。</p>
+        </section>}
+
+        {['note', 'mindmap', 'document', 'table', 'pdf'].includes(selected.type) && <section className="property-section">
+          <h3>文本</h3>
+          <label>字体<select value={selected.fontFamily || 'Segoe UI'} onChange={(event) => updateNode(selected.id, { fontFamily: event.currentTarget.value }, true)}>{fonts.map((font) => <option key={font}>{font}</option>)}</select></label>
+          <div className="property-two-column">
+            <label>字号<input type="number" min="6" max="240" value={selected.fontSize || 16} onChange={(event) => updateNode(selected.id, { fontSize: numberValue(event.currentTarget.value, 16) }, true)} /></label>
+            <label>文字颜色<input type="color" value={toHexColor(selected.textColor, '#e8e8e8')} onChange={(event) => updateNode(selected.id, { textColor: event.currentTarget.value }, true)} /></label>
+          </div>
+          <div className="property-action-grid"><button className={selected.fontWeight === 'bold' ? 'active' : ''} onClick={() => updateNode(selected.id, { fontWeight: selected.fontWeight === 'bold' ? 'normal' : 'bold' }, true)}>粗体</button><button className={selected.fontStyle === 'italic' ? 'active' : ''} onClick={() => updateNode(selected.id, { fontStyle: selected.fontStyle === 'italic' ? 'normal' : 'italic' }, true)}>斜体</button></div>
+          <label>内容<textarea value={selected.text || ''} onChange={(event) => updateNode(selected.id, { text: event.currentTarget.value }, true)} /></label>
+        </section>}
+      </div>
+
+      {asset && <div className="asset-detail">
+        <div className="panel-heading"><h3>资源</h3><span>{asset.format.toUpperCase()}</span></div>
+        <p>{(asset.fileSize / 1024 / 1024).toFixed(2)} MB</p>
+        <p className="path-text">{asset.originalPath || asset.projectAssetPath}</p>
+        <div className="segmented-control">
+          <button className={(asset.storageMode || 'embedded') === 'embedded' ? 'active' : ''} onClick={() => updateAsset(asset.id, { storageMode: 'embedded' })}>嵌入工程</button>
+          <button className={asset.storageMode === 'linked' ? 'active' : ''} onClick={() => updateAsset(asset.id, { storageMode: 'linked' })}>链接原文件</button>
+        </div>
+        <p className="muted">嵌入便于携带；链接可减小工程体积，但移动原文件后需要重新定位。</p>
+        {asset.kind === 'model' && <div className="model-stats"><p>顶点：{(asset as ImportedModel).stats.vertices ?? '未知'}</p><p>面数：{(asset as ImportedModel).stats.faces ?? '未知'}</p></div>}
+      </div>}
     </aside>
   );
 }

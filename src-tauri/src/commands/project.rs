@@ -517,6 +517,21 @@ fn collect_from_assets(
     used_paths: &mut HashSet<String>,
 ) -> Result<(), String> {
     for asset in assets {
+        // Linked assets deliberately remain outside the project package. Keep
+        // the absolute source path as the runtime path so reopening the project
+        // does not depend on a transient refmind3d:// registration.
+        if asset.get("storageMode").and_then(Value::as_str) == Some("linked") {
+            let source_path = asset.get("originalPath").and_then(Value::as_str).unwrap_or("").to_string();
+            if let Some(object) = asset.as_object_mut() {
+                if !source_path.is_empty() {
+                    object.insert("projectAssetPath".to_string(), Value::String(source_path));
+                }
+                object.remove("embeddedDataUrl");
+                object.remove("embeddedPreviewDataUrl");
+                object.remove("embeddedThumbnailDataUrl");
+            }
+            continue;
+        }
         let asset_id = asset
             .get("id")
             .and_then(Value::as_str)

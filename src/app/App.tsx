@@ -6,6 +6,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { AssetPanel } from '../components/AssetPanel';
 import { InspectorPanel } from '../components/InspectorPanel';
+import { HierarchyPanel } from '../components/HierarchyPanel';
 import { PerformanceDiagnostics } from '../components/PerformanceDiagnostics';
 import { ProjectHealthPanel } from '../components/ProjectHealthPanel';
 import { CanvasView } from '../features/canvas/CanvasView';
@@ -77,6 +78,18 @@ interface LocalAIRuntimeStatus {
 
 const API_ONLY_EDITION = import.meta.env.VITE_REFMIND_API_ONLY === '1';
 const WINDOW_OPACITY_STORAGE_KEY = 'refmind3d.window-opacity';
+const RECENT_PROJECTS_STORAGE_KEY = 'refmind3d.recent-projects';
+
+function readRecentProjects(): string[] {
+  try { return JSON.parse(localStorage.getItem(RECENT_PROJECTS_STORAGE_KEY) || '[]').filter((item: unknown) => typeof item === 'string').slice(0, 10); }
+  catch { return []; }
+}
+
+function persistRecentProject(path: string) {
+  const next = [path, ...readRecentProjects().filter((item) => item !== path)].slice(0, 10);
+  localStorage.setItem(RECENT_PROJECTS_STORAGE_KEY, JSON.stringify(next));
+  return next;
+}
 
 function readWindowOpacity() {
   const stored = Number(localStorage.getItem(WINDOW_OPACITY_STORAGE_KEY));
@@ -850,6 +863,7 @@ export function App() {
     setProject,
     deleteSelected,
     selectedNodeIds,
+    selectNode,
     undo,
     redo,
     copySelected,
@@ -857,6 +871,7 @@ export function App() {
     createTextNode,
     updateNode,
     updateNodes,
+    updateProjectOptions,
     groupSelected,
     ungroupSelected,
     toggleSelectedGroupLock,
@@ -879,6 +894,7 @@ export function App() {
   const [windowOpacity, setWindowOpacity] = useState(readWindowOpacity);
   const [opacityPanelOpen, setOpacityPanelOpen] = useState(false);
   const [settings, setSettings] = useState<AppSettings>(() => readSettings());
+  const [recentProjects, setRecentProjects] = useState<string[]>(readRecentProjects);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const preferInternalClipboardRef = useRef(false);
@@ -923,6 +939,10 @@ export function App() {
     }
   }, [contextMenu]);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [exportCenterOpen, setExportCenterOpen] = useState(false);
+  useEffect(() => {
+    if (currentProjectPath) setRecentProjects(persistRecentProject(currentProjectPath));
+  }, [currentProjectPath]);
   const [workspaceCacheId, setWorkspaceCacheId] = useState<string>(() => crypto.randomUUID());
   const [workspaceCacheDirectory, setWorkspaceCacheDirectory] = useState<string>();
   const [cachePathDirty, setCachePathDirty] = useState(false);
@@ -937,6 +957,9 @@ export function App() {
   const [doodleWidth, setDoodleWidth] = useState(6);
   const [doodleTool, setDoodleTool] = useState<DoodleTool>('brush');
   const [modelPreview, setModelPreview] = useState<ImportedModel | null>(null);
+  const [presentationMode, setPresentationMode] = useState(false);
+  const [presentationAutoPlay, setPresentationAutoPlay] = useState(false);
+  const [mousePassthrough, setMousePassthrough] = useState(false);
   const [aiPrompt, setAiPrompt] = useState('');
   const [aiResponse, setAiResponse] = useState('');
   const [aiBusy, setAiBusy] = useState(false);
@@ -952,6 +975,24 @@ export function App() {
   const aiDockRef = useRef<HTMLElement | null>(null);
   const aiDragRef = useRef<{ pointerId: number; startY: number; startTop: number } | null>(null);
   const [lastCanvasPoint, setLastCanvasPoint] = useState({ x: 160, y: 160 });
+
+  useEffect(() => {
+    const disable = () => {
+      setMousePassthrough(false);
+      void getCurrentWindow().setIgnoreCursorEvents(false);
+    };
+    const keyDown = (event: KeyboardEvent) => {
+      if (event.repeat || event.code !== 'KeyM' || !event.ctrlKey || !event.altKey) return;
+      event.preventDefault();
+      setMousePassthrough(true);
+      void getCurrentWindow().setIgnoreCursorEvents(true);
+    };
+    const keyUp = (event: KeyboardEvent) => { if (event.code === 'KeyM') disable(); };
+    window.addEventListener('keydown', keyDown, true);
+    window.addEventListener('keyup', keyUp, true);
+    window.addEventListener('blur', disable);
+    return () => { window.removeEventListener('keydown', keyDown, true); window.removeEventListener('keyup', keyUp, true); window.removeEventListener('blur', disable); };
+  }, []);
   const [activeCanvasId, setActiveCanvasId] = useState('main-canvas');
   const [canvasSwitching, setCanvasSwitching] = useState(false);
   const [canvases, setCanvases] = useState<CanvasWorkspace[]>(() => [{
@@ -2339,6 +2380,26 @@ export function App() {
     applyLayoutUpdates(updates, '已整理为网格');
   };
 
+  const arrangeSelectedByName = () => {
+    const nodes = selectedLayoutNodes().slice().sort((a, b) => a.title.localeCompare(b.title, undefined, { numeric: true }));
+    if (nodes.length < 2) return;
+    const bounds = boundsForNodes(nodes);
+    const columns = Math.ceil(Math.sqrt(nodes.length));
+    const cellWidth = Math.max(...nodes.map((node) => node.width)) + 24;
+    const cellHeight = Math.max(...nodes.map((node) => node.height)) + 24;
+    applyLayoutUpdates(nodes.map((node, index) => ({ id: node.id, patch: { x: Math.round(bounds.left + (index % columns) * cellWidth), y: Math.round(bounds.top + Math.floor(index / columns) * cellHeight) } })), '已按名称智能排列');
+  };
+
+  const normalizeSelectedArea = () => {
+    const nodes = selectedLayoutNodes();
+    if (nodes.length < 2) return;
+    const targetArea = nodes.reduce((sum, node) => sum + node.width * node.height, 0) / nodes.length;
+    applyLayoutUpdates(nodes.map((node) => {
+      const factor = Math.sqrt(targetArea / Math.max(1, node.width * node.height));
+      return { id: node.id, patch: { width: Math.max(20, Math.round(node.width * factor)), height: Math.max(20, Math.round(node.height * factor)) } };
+    }), '已统一选中对象的视觉面积');
+  };
+
   const alignSelected = (mode: 'left' | 'centerX' | 'right' | 'top' | 'centerY' | 'bottom') => {
     const nodes = selectedLayoutNodes();
     if (nodes.length < 2) {
@@ -2458,6 +2519,33 @@ export function App() {
     window.dispatchEvent(new CustomEvent('refmind3d-focus-selection'));
     setStatus(selectedNodeIds.length > 0 ? '已定位并拉近选中对象' : '已定位全部导入对象');
   };
+
+  const navigatePresentation = (direction: -1 | 1) => {
+    const nodes = visualOrder(project.nodes.filter((node) => !node.hidden && node.type !== 'group'));
+    if (nodes.length === 0) return;
+    const currentIndex = nodes.findIndex((node) => selectedNodeIds.includes(node.id));
+    const nextIndex = currentIndex < 0 ? 0 : (currentIndex + direction + nodes.length) % nodes.length;
+    selectNode(nodes[nextIndex].id);
+    window.dispatchEvent(new CustomEvent('refmind3d-focus-node-ids', { detail: { ids: [nodes[nextIndex].id] } }));
+    setStatus(`浏览 ${nextIndex + 1} / ${nodes.length}：${nodes[nextIndex].title}`);
+  };
+
+  useEffect(() => {
+    if (!presentationMode || !presentationAutoPlay) return;
+    const timer = window.setInterval(() => navigatePresentation(1), 3000);
+    return () => window.clearInterval(timer);
+  }, [presentationAutoPlay, presentationMode, project.nodes, selectedNodeIds]);
+
+  useEffect(() => {
+    if (!presentationMode) return;
+    const onPresentationKey = (event: KeyboardEvent) => {
+      if (event.key === 'ArrowRight' || event.key === 'PageDown') { event.preventDefault(); navigatePresentation(1); }
+      if (event.key === 'ArrowLeft' || event.key === 'PageUp') { event.preventDefault(); navigatePresentation(-1); }
+      if (event.key === 'Escape') { event.preventDefault(); setPresentationMode(false); setPresentationAutoPlay(false); }
+    };
+    window.addEventListener('keydown', onPresentationKey, true);
+    return () => window.removeEventListener('keydown', onPresentationKey, true);
+  }, [presentationMode, project.nodes, selectedNodeIds]);
 
   const resetView = () => {
     closeMenu();
@@ -2968,9 +3056,31 @@ export function App() {
           }}
           onPointerWorldChange={setLastCanvasPoint}
         />
+        {!currentProjectPath && project.nodes.length === 0 && recentProjects.length > 0 && <section className="welcome-recent-projects">
+          <strong>最近工程</strong><span>快速回到上次工作</span>
+          {recentProjects.slice(0, 6).map((path) => <button key={path} title={path} onClick={() => void loadProjectFromPath(path)}>{path.split(/[\\/]/).pop()}</button>)}
+          <button className="subtle" onClick={() => { localStorage.removeItem(RECENT_PROJECTS_STORAGE_KEY); setRecentProjects([]); }}>清空记录</button>
+        </section>}
         {settings.showInspectorPanel && <InspectorPanel />}
       </main>
 
+      {presentationMode && <div className="presentation-controls" onMouseDown={(event) => event.stopPropagation()}>
+        <button onClick={() => navigatePresentation(-1)}>上一个</button>
+        <button className={presentationAutoPlay ? 'active' : ''} onClick={() => setPresentationAutoPlay((value) => !value)}>{presentationAutoPlay ? '暂停' : '自动播放'}</button>
+        <button onClick={() => navigatePresentation(1)}>下一个</button>
+        <button onClick={() => { setPresentationMode(false); setPresentationAutoPlay(false); }}>退出演示</button>
+      </div>}
+      {exportCenterOpen && <div className="settings-backdrop" onMouseDown={() => setExportCenterOpen(false)}>
+        <section className="export-center" onMouseDown={(event) => event.stopPropagation()}>
+          <div className="panel-heading"><div><h2>导出中心</h2><p className="muted">集中导出画布、选区和原始资源。</p></div><button onClick={() => setExportCenterOpen(false)}>关闭</button></div>
+          <div className="export-center-grid">
+            <button onClick={() => void exportCanvasImage()}><b>整张画布 PNG</b><span>导出全部可见节点，不包含涂鸦层</span></button>
+            <button disabled={selectedNodeIds.length === 0} onClick={() => void exportSelectedAsPng()}><b>选区 PNG</b><span>保留当前排版和图片调整效果</span></button>
+            <button disabled={selectedNodeIds.length === 0} onClick={() => void exportSelectedOriginalFormat()}><b>选中原始资源</b><span>按源格式复制到目标目录</span></button>
+            <button onClick={() => void saveProjectAs()}><b>便携工程副本</b><span>另存完整工程和嵌入资源</span></button>
+          </div>
+        </section>
+      </div>}
       {saveNotice && <div className="project-save-notice" role="status" aria-live="polite">{saveNotice}</div>}
 
       <section
@@ -2993,6 +3103,15 @@ export function App() {
           <span>{windowOpacity}%</span>
         </button>
         <div id="canvas-opacity-panel" className="canvas-opacity-panel">
+          <div className="canvas-mode-actions">
+            <button className={project.canvasLocked ? 'active' : ''} onClick={() => updateProjectOptions({ canvasLocked: !project.canvasLocked })}>{project.canvasLocked ? '解除画布锁定' : '锁定画布内容'}</button>
+            <button className={project.canvasGrayscale ? 'active' : ''} onClick={() => updateProjectOptions({ canvasGrayscale: !project.canvasGrayscale })}>{project.canvasGrayscale ? '恢复画布彩色' : '画布灰度检查'}</button>
+            <button onClick={() => { setPresentationMode(true); navigatePresentation(1); setOpacityPanelOpen(false); }}>连续浏览 / 演示</button>
+            <button onClick={() => { setExportCenterOpen(true); setOpacityPanelOpen(false); }}>打开导出中心</button>
+            <button disabled={selectedNodeIds.length < 2} onClick={arrangeSelectedByName}>按名称智能排列</button>
+            <button disabled={selectedNodeIds.length < 2} onClick={normalizeSelectedArea}>统一视觉面积</button>
+            <span className="passthrough-hint">按住 Ctrl+Alt+M：临时鼠标穿透{mousePassthrough ? '（已启用）' : ''}</span>
+          </div>
           <div className="canvas-opacity-heading">
             <span>画布透明度</span>
             <output htmlFor="canvas-opacity-range">{windowOpacity}%</output>
@@ -3086,6 +3205,7 @@ export function App() {
               </div>
             ))}
           </div>
+          <HierarchyPanel />
           <div className="canvas-actions">
             <button onClick={runMenuAction(createCanvas)}>新建画布</button>
           </div>
