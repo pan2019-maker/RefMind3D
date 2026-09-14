@@ -1,11 +1,12 @@
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashSet, hash_map::DefaultHasher};
 use std::env;
 use std::fs;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -84,12 +85,13 @@ struct PathResource {
 }
 
 #[tauri::command]
-pub fn save_project(
+pub async fn save_project(
     path: String,
     project: Value,
     _embed_resources: Option<bool>,
 ) -> Result<(), String> {
-    save_packed_project(path, project)
+    tauri::async_runtime::spawn_blocking(move || save_packed_project(path, project))
+        .await.map_err(|e| format!("Project save task failed: {e}"))?
 }
 
 #[tauri::command]
@@ -102,7 +104,9 @@ pub fn load_project(path: String, _extract_root: Option<String>) -> Result<Value
         .map_err(|e| format!("Read project failed: {e}"))?;
 
     if magic == *b"PK" {
-        return load_packed_project(file, &path);
+        return load_packed_project(file, &path).or_else(|error| {
+            load_latest_index_backup(&path).map_err(|_| error)
+        });
     }
 
     let mut bytes = Vec::new();
@@ -126,6 +130,70 @@ pub fn load_project(path: String, _extract_root: Option<String>) -> Result<Value
     let mut project = bundled.project;
     restore_embedded_resources_to_data_urls(&mut project, &bundled.embedded_resources);
     Ok(project)
+}
+
+#[tauri::command]
+pub fn load_project_index(path: String) -> Result<Value, String> {
+    let file = File::open(&path).map_err(|e| format!("Read project failed: {e}"))?;
+    let mut archive = match ZipArchive::new(file) {
+        Ok(value) => value,
+        Err(_) => return load_project(path, None),
+    };
+    let mut manifest_text = String::new();
+    archive.by_name("project.json").map_err(|e| format!("Project package misses project.json: {e}"))?
+        .read_to_string(&mut manifest_text).map_err(|e| format!("Read project index failed: {e}"))?;
+    let manifest: PackedProjectFile = serde_json::from_str(&manifest_text).map_err(|e| format!("Project index parse failed: {e}"))?;
+    if manifest.version < 3 || manifest.canvases.is_empty() { return load_project(path, None); }
+    let mut path_resources = Vec::new();
+    for resource in &manifest.resources {
+        let out_path = runtime_assets::register_packed_resource(&path, &PackedResourceRegistration {
+            asset_id: resource.asset_id.clone(), field: resource.field.clone(), file_name: resource.file_name.clone(), mime: resource.mime.clone(), zip_path: resource.zip_path.clone()
+        });
+        path_resources.push(PathResource { asset_id: resource.asset_id.clone(), field: resource.field.clone(), path: out_path });
+    }
+    let active_id = manifest.project.get("activeCanvasId").and_then(Value::as_str).unwrap_or("").to_string();
+    let mut project = manifest.project;
+    if let Some(canvases) = project.get_mut("canvases").and_then(Value::as_array_mut) {
+        for canvas in canvases {
+            let id = canvas.get("id").and_then(Value::as_str).unwrap_or("");
+            if id == active_id {
+                if let Some(meta) = manifest.canvases.iter().find(|item| item.id == id) {
+                    let mut text = String::new();
+                    archive.by_name(&meta.zip_path).map_err(|e| format!("Canvas data missing {id}: {e}"))?
+                        .read_to_string(&mut text).map_err(|e| format!("Read canvas failed: {e}"))?;
+                    let mut value: Value = serde_json::from_str(&text).map_err(|e| format!("Parse canvas failed: {e}"))?;
+                    patch_path_resources(&mut value, &path_resources);
+                    canvas["project"] = value;
+                }
+            } else {
+                canvas.as_object_mut().map(|object| object.insert("lazy".into(), Value::Bool(true)));
+            }
+        }
+    }
+    Ok(project)
+}
+
+#[tauri::command]
+pub fn load_project_canvas(path: String, canvas_id: String) -> Result<Value, String> {
+    let file = File::open(&path).map_err(|e| format!("Read project failed: {e}"))?;
+    let mut archive = ZipArchive::new(file).map_err(|e| format!("Project package parse failed: {e}"))?;
+    let mut manifest_text = String::new();
+    archive.by_name("project.json").map_err(|e| format!("Project package misses project.json: {e}"))?
+        .read_to_string(&mut manifest_text).map_err(|e| format!("Read project index failed: {e}"))?;
+    let manifest: PackedProjectFile = serde_json::from_str(&manifest_text).map_err(|e| format!("Project index parse failed: {e}"))?;
+    let meta = manifest.canvases.iter().find(|item| item.id == canvas_id).ok_or_else(|| format!("Canvas not found: {canvas_id}"))?;
+    let mut text = String::new();
+    archive.by_name(&meta.zip_path).map_err(|e| format!("Canvas data missing {}: {e}", meta.id))?
+        .read_to_string(&mut text).map_err(|e| format!("Read canvas failed: {e}"))?;
+    let mut value: Value = serde_json::from_str(&text).map_err(|e| format!("Parse canvas failed: {e}"))?;
+    let resources = manifest.resources.iter().map(|resource| PathResource {
+        asset_id: resource.asset_id.clone(), field: resource.field.clone(),
+        path: runtime_assets::register_packed_resource(&path, &PackedResourceRegistration {
+            asset_id: resource.asset_id.clone(), field: resource.field.clone(), file_name: resource.file_name.clone(), mime: resource.mime.clone(), zip_path: resource.zip_path.clone()
+        })
+    }).collect::<Vec<_>>();
+    patch_path_resources(&mut value, &resources);
+    Ok(value)
 }
 
 fn recovery_directory() -> PathBuf {
@@ -233,6 +301,7 @@ pub fn load_project_data_url(data_url: String, name_hint: Option<String>) -> Res
 
 fn save_packed_project(path: String, mut project: Value) -> Result<(), String> {
     let sources = collect_packed_resources(&mut project)?;
+    write_index_backup(&path, &project);
     let mut canvas_payloads: Vec<(PackedCanvas, Value)> = Vec::new();
     if project.get("fileType").and_then(Value::as_str) == Some("refmind3d-workspace") {
         if let Some(canvases) = project.get_mut("canvases").and_then(Value::as_array_mut) {
@@ -319,6 +388,34 @@ fn save_packed_project(path: String, mut project: Value) -> Result<(), String> {
     // Write to the same directory first, then replace the destination. A crash
     // or full disk can no longer leave the user's only project half-written.
     replace_file_atomically(&temporary, &destination)
+}
+
+fn index_backup_directory(project_path: &str) -> PathBuf {
+    let mut hasher = DefaultHasher::new();
+    project_path.to_lowercase().hash(&mut hasher);
+    recovery_directory().join("Indexes").join(format!("{:016x}", hasher.finish()))
+}
+
+fn write_index_backup(project_path: &str, project: &Value) {
+    let directory = index_backup_directory(project_path);
+    if fs::create_dir_all(&directory).is_err() { return; }
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map(|value| value.as_millis()).unwrap_or(0);
+    if let Ok(bytes) = serde_json::to_vec(project) { let _ = fs::write(directory.join(format!("{stamp}.json")), bytes); }
+    let mut files = fs::read_dir(&directory).ok().into_iter().flatten().filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().and_then(|value| value.to_str()) == Some("json"))
+        .collect::<Vec<_>>();
+    files.sort_by_key(|entry| std::cmp::Reverse(entry.file_name()));
+    for old in files.into_iter().skip(3) { let _ = fs::remove_file(old.path()); }
+}
+
+fn load_latest_index_backup(project_path: &str) -> Result<Value, String> {
+    let directory = index_backup_directory(project_path);
+    let mut files = fs::read_dir(&directory).map_err(|e| format!("No project index backup: {e}"))?
+        .filter_map(Result::ok).collect::<Vec<_>>();
+    files.sort_by_key(|entry| std::cmp::Reverse(entry.file_name()));
+    let path = files.first().ok_or_else(|| "No project index backup".to_string())?.path();
+    let bytes = fs::read(path).map_err(|e| format!("Read project index backup failed: {e}"))?;
+    serde_json::from_slice(&bytes).map_err(|e| format!("Parse project index backup failed: {e}"))
 }
 
 fn replace_file_atomically(temporary: &Path, destination: &Path) -> Result<(), String> {
@@ -1197,6 +1294,10 @@ mod tests {
         drop(archive);
         let loaded = load_project(path.to_string_lossy().to_string(), None).unwrap();
         assert_eq!(loaded["canvases"][1]["project"]["name"], "B");
+        let index = load_project_index(path.to_string_lossy().to_string()).unwrap();
+        assert!(index["canvases"][0]["project"].is_object());
+        assert!(index["canvases"][1]["project"].is_null());
+        assert_eq!(load_project_canvas(path.to_string_lossy().to_string(), "b".into()).unwrap()["name"], "B");
         let _ = fs::remove_dir_all(root);
     }
 }

@@ -8,7 +8,8 @@ import { ImageLoadCancelledError, imageLoadScheduler } from '../assets/imageLoad
 import { LruCache } from '../assets/lruCache';
 import { getModelCover, modelCoverKey, setModelCover } from '../assets/modelCoverCache';
 import { closestNodeIds, nextImagePreviewTier } from '../assets/previewPolicy';
-import { recordImageCacheResult, updatePerformanceMetrics } from '../performance/performanceMetrics';
+import { performanceMetricsSnapshot, recordImageCacheResult, updatePerformanceMetrics } from '../performance/performanceMetrics';
+import { adaptiveResourceBudget } from '../performance/resourceBudget';
 import { FREE_TEXT_FONT_FAMILY, FREE_TEXT_PLACEHOLDER, freeTextNodeSize } from '../../shared/freeText';
 import { DoodleCanvas, type DoodleCanvasHandle } from './DoodleCanvas';
 import { SpatialGridIndex } from './spatialIndex';
@@ -714,6 +715,7 @@ export function CanvasView({
   const [view, setView] = useState<ViewState>({ x: 0, y: 0, scale: 1 });
   const [pageVisible, setPageVisible] = useState(() => document.visibilityState !== 'hidden');
   const [imageCacheEpoch, setImageCacheEpoch] = useState(0);
+  const [resourceBudget, setResourceBudget] = useState(() => adaptiveResourceBudget(project.nodes.length, (navigator as Navigator & { deviceMemory?: number }).deviceMemory || 8));
   const [drag, setDrag] = useState<{
     ids?: string[];
     startX: number;
@@ -806,6 +808,17 @@ export function CanvasView({
   }, []);
 
   useEffect(() => {
+    const update = () => setResourceBudget(adaptiveResourceBudget(
+      project.nodes.length,
+      (navigator as Navigator & { deviceMemory?: number }).deviceMemory || 8,
+      performanceMetricsSnapshot().fps
+    ));
+    update();
+    const timer = window.setInterval(update, 2_000);
+    return () => window.clearInterval(timer);
+  }, [project.nodes.length]);
+
+  useEffect(() => {
     const key = `refmind3d.viewport.${projectCacheId}.${focusContentKey || 'main'}`;
     try {
       const saved = JSON.parse(localStorage.getItem(key) || 'null') as ViewState | null;
@@ -834,6 +847,17 @@ export function CanvasView({
     window.addEventListener('refmind3d-image-cache-reset', reset);
     return () => window.removeEventListener('refmind3d-image-cache-reset', reset);
   }, []);
+
+  useEffect(() => {
+    if (!pageVisible) return;
+    // One board-level timer coalesces source-file checks for all visible images.
+    // Cache hits are cheap and changed size/mtime/content samples regenerate once.
+    const timer = window.setInterval(() => {
+      preparedImageCache.clear();
+      setImageCacheEpoch((value) => value + 1);
+    }, 30_000);
+    return () => window.clearInterval(timer);
+  }, [pageVisible]);
 
   const assetsById = useMemo(() => {
     const map = new Map<string, AssetRecord>();
@@ -947,9 +971,9 @@ export function CanvasView({
     x: (-view.x + viewportSize.width / 2) / view.scale,
     y: (-view.y + viewportSize.height / 2) / view.scale
   }), [view, viewportSize]);
-  const liveModelIds = useMemo(() => closestNodeIds(visibleNodes.filter((node) => node.type === 'model'), viewportWorldCenter, 4), [viewportWorldCenter, visibleNodes]);
-  const liveVideoIds = useMemo(() => closestNodeIds(visibleNodes.filter((node) => node.type === 'video'), viewportWorldCenter, 8), [viewportWorldCenter, visibleNodes]);
-  const fullResolutionImageIds = useMemo(() => closestNodeIds(visibleNodes.filter((node) => node.type === 'image'), viewportWorldCenter, 12), [viewportWorldCenter, visibleNodes]);
+  const liveModelIds = useMemo(() => closestNodeIds(visibleNodes.filter((node) => node.type === 'model'), viewportWorldCenter, resourceBudget.models), [resourceBudget.models, viewportWorldCenter, visibleNodes]);
+  const liveVideoIds = useMemo(() => closestNodeIds(visibleNodes.filter((node) => node.type === 'video'), viewportWorldCenter, resourceBudget.videos), [resourceBudget.videos, viewportWorldCenter, visibleNodes]);
+  const fullResolutionImageIds = useMemo(() => closestNodeIds(visibleNodes.filter((node) => node.type === 'image'), viewportWorldCenter, resourceBudget.fullImages), [resourceBudget.fullImages, viewportWorldCenter, visibleNodes]);
   const predictedPrefetchIds = useMemo(() => {
     const direction = panDirectionRef.current;
     if (direction.x === 0 && direction.y === 0) return new Set<string>();

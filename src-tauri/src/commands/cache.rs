@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
 use std::env;
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::sync::{Mutex, OnceLock};
@@ -178,12 +178,14 @@ fn prepare_sync(project_id: &str, cache_directory: Option<&str>, asset: &Value) 
         Err(error) => return Err(error),
     };
     repair_cache_once(&root);
-    let asset_id = safe(asset.get("id").and_then(Value::as_str).unwrap_or("image"));
-    let dir = root.join(&asset_id);
-    fs::create_dir_all(&dir)?;
-    let manifest_path = dir.join("manifest.json");
     let source = describe_source(asset)?;
     let (size, modified, hash) = (source.size, source.modified, source.hash);
+    let asset_id = safe(asset.get("id").and_then(Value::as_str).unwrap_or("image"));
+    // A content-addressed directory lets repeated imports reuse the exact same
+    // decoded files even when the asset records have different ids.
+    let dir = root.join(format!("content-{:016x}-{}", hash, size));
+    fs::create_dir_all(&dir)?;
+    let manifest_path = dir.join("manifest.json");
     if let Ok(raw) = fs::read(&manifest_path) {
         if let Ok(mut manifest) = serde_json::from_slice::<CacheManifest>(&raw) {
             let preview = dir.join(&manifest.preview_file);
@@ -237,7 +239,8 @@ fn describe_source(asset: &Value) -> anyhow::Result<SourceDescriptor> {
         if path.is_file() {
             let metadata = fs::metadata(&path)?;
             let modified = metadata.modified().ok().and_then(time_ms).unwrap_or(0);
-            return Ok(SourceDescriptor { location: SourceLocation::File(path), size: metadata.len(), modified, hash: 0, extension: extension(value, asset) });
+            let hash = sampled_file_hash(&path, metadata.len()).unwrap_or(0);
+            return Ok(SourceDescriptor { location: SourceLocation::File(path), size: metadata.len(), modified, hash, extension: extension(value, asset) });
         }
     }
     Err(anyhow!("找不到图片原始数据，请重新打开工程或重新导入图片"))
@@ -291,6 +294,21 @@ fn enforce_limit(root: &Path, limit: u64) {
         let removed = if path.is_dir() { fs::remove_dir_all(&path) } else { fs::remove_file(&path) };
         if removed.is_ok() { total = total.saturating_sub(size); }
     }
+}
+
+fn sampled_file_hash(path: &Path, size: u64) -> anyhow::Result<u64> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = DefaultHasher::new();
+    size.hash(&mut hasher);
+    let mut buffer = vec![0u8; 64 * 1024];
+    let read = file.read(&mut buffer)?;
+    buffer[..read].hash(&mut hasher);
+    if size > buffer.len() as u64 {
+        file.seek(SeekFrom::End(-(buffer.len() as i64)))?;
+        let read = file.read(&mut buffer)?;
+        buffer[..read].hash(&mut hasher);
+    }
+    Ok(hasher.finish())
 }
 
 #[tauri::command]
@@ -411,7 +429,8 @@ mod tests {
             "originalPath": source.to_string_lossy()
         });
         assert!(!prepare_sync("project-1", Some(cache.to_string_lossy().as_ref()), &asset).unwrap().cache_hit);
-        assert!(cache.join("asset-1").join("medium-preview.png").is_file());
+        assert!(WalkDir::new(&cache).into_iter().filter_map(Result::ok)
+            .any(|entry| entry.file_name() == "medium-preview.png" && entry.path().is_file()));
         assert!(prepare_sync("project-1", Some(cache.to_string_lossy().as_ref()), &asset).unwrap().cache_hit);
         DynamicImage::new_rgba8(96, 80).save(&source).unwrap();
         assert!(!prepare_sync("project-1", Some(cache.to_string_lossy().as_ref()), &asset).unwrap().cache_hit);

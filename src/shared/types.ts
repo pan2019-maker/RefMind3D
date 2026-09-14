@@ -200,6 +200,7 @@ export interface CanvasWorkspaceRecord {
   id: string;
   name: string;
   project: RefMindProject;
+  lazy?: boolean;
 }
 
 export interface RefMindWorkspaceFile {

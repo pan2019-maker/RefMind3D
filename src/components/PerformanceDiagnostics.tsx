@@ -31,7 +31,7 @@ export function PerformanceDiagnostics() {
           setBenchmarking(true);
           void runCanvasBenchmark().then(setBenchmark).finally(() => setBenchmarking(false));
         }}>{benchmarking ? '正在测试…' : '运行 10,000 节点基准'}</button>
-        {benchmark && <code>索引 {benchmark.buildMs} ms · 200 次视口查询 {benchmark.queryMs} ms · 平均 {benchmark.averageHits} 节点</code>}
+        {benchmark && <code>索引 {benchmark.buildMs} ms · 查询 {benchmark.queryMs} ms · 120 帧合成 {benchmark.transformMs} ms · 平均 {benchmark.averageHits} 节点</code>}
       </div>
     </section>
   );

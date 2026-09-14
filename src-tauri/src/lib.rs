@@ -43,6 +43,8 @@ pub fn run() {
             commands::project::clear_recovery_project,
             commands::project::force_close_window,
             commands::project::load_project,
+            commands::project::load_project_index,
+            commands::project::load_project_canvas,
             commands::project::get_launch_project_path,
             commands::project::load_project_data_url,
             commands::project::save_png_data_url,

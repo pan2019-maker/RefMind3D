@@ -9,6 +9,14 @@ export async function loadProjectFile(path: string): Promise<RefMindProjectFile>
   return invoke<RefMindProjectFile>('load_project', { path });
 }
 
+export async function loadProjectIndex(path: string): Promise<RefMindProjectFile> {
+  return invoke<RefMindProjectFile>('load_project_index', { path });
+}
+
+export async function loadProjectCanvas(path: string, canvasId: string): Promise<RefMindProject> {
+  return invoke<RefMindProject>('load_project_canvas', { path, canvasId });
+}
+
 export async function loadProjectDataUrl(dataUrl: string, nameHint?: string): Promise<RefMindProjectFile> {
   return invoke<RefMindProjectFile>('load_project_data_url', { dataUrl, nameHint });
 }
@@ -33,7 +41,7 @@ const resourceFields = [
 function projectsInFile(file: RefMindProjectFile): RefMindProject[] {
   const workspace = file as import('../../shared/types').RefMindWorkspaceFile;
   return workspace.fileType === 'refmind3d-workspace'
-    ? workspace.canvases.map((canvas) => canvas.project)
+    ? workspace.canvases.map((canvas) => canvas.project).filter(Boolean)
     : [file as RefMindProject];
 }
 
@@ -103,7 +111,9 @@ export function mergeRecoveryResources(base: RefMindProjectFile, recovered: RefM
       ...recoveredWorkspace,
       canvases: baseWorkspace.canvases.map((canvas) => {
         const recoveredCanvas = recoveredCanvases.get(canvas.id);
-        return recoveredCanvas ? { ...recoveredCanvas, project: mergeProjectResources(canvas.project, recoveredCanvas.project) } : canvas;
+        return recoveredCanvas
+          ? { ...recoveredCanvas, project: mergeProjectResources(canvas.project, recoveredCanvas.project) }
+          : canvas;
       }).concat(recoveredWorkspace.canvases.filter((canvas) => !baseCanvases.has(canvas.id)))
     };
   }
