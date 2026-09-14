@@ -1,4 +1,4 @@
-import { lazy, memo, MouseEvent as ReactMouseEvent, Suspense, useEffect, useMemo, useRef, useState, type CSSProperties, type MutableRefObject, type PointerEvent as ReactPointerEvent } from 'react';
+import { lazy, memo, MouseEvent as ReactMouseEvent, Suspense, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type MutableRefObject, type PointerEvent as ReactPointerEvent } from 'react';
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { useShallow } from 'zustand/react/shallow';
 import { useProjectStore } from '../../stores/projectStore';
@@ -6,6 +6,9 @@ import type { AssetRecord, CanvasNode, DoodleStroke, DoodleTool, ImportedModel, 
 import { prepareImageCache, type PreparedImageCache } from '../assets/imageCache';
 import { ImageLoadCancelledError, imageLoadScheduler } from '../assets/imageLoadScheduler';
 import { LruCache } from '../assets/lruCache';
+import { getModelCover, modelCoverKey, setModelCover } from '../assets/modelCoverCache';
+import { closestNodeIds, nextImagePreviewTier } from '../assets/previewPolicy';
+import { recordImageCacheResult, updatePerformanceMetrics } from '../performance/performanceMetrics';
 import { FREE_TEXT_FONT_FAMILY, FREE_TEXT_PLACEHOLDER, freeTextNodeSize } from '../../shared/freeText';
 import { DoodleCanvas, type DoodleCanvasHandle } from './DoodleCanvas';
 import { SpatialGridIndex } from './spatialIndex';
@@ -279,17 +282,23 @@ function freeTextPatch(node: CanvasNode, text: string): Partial<CanvasNode> {
   return { text, ...freeTextNodeSize(text, node) };
 }
 
-function renderSpreadsheetPreview(
-  node: CanvasNode,
-  activeSheetIndex = 0,
-  onSheetChange?: (index: number) => void
-) {
+const SpreadsheetPreview = memo(function SpreadsheetPreview({ node, activeSheetIndex = 0, onSheetChange }: {
+  node: CanvasNode;
+  activeSheetIndex?: number;
+  onSheetChange?: (index: number) => void;
+}) {
+  const [scrollTop, setScrollTop] = useState(0);
   const workbook = node.spreadsheetData;
   const active = activeSpreadsheetSheet(workbook, activeSheetIndex);
   if (!workbook || !active) return null;
   const { sheet, index } = active;
   const cellMap = spreadsheetCellMap(sheet);
   const { maxRow, maxCol } = spreadsheetBounds(sheet);
+  const rowHeight = 28;
+  const visibleRowCount = Math.min(maxRow, Math.max(12, Math.ceil(node.height / rowHeight) + 8));
+  const startRow = Math.max(1, Math.floor(scrollTop / rowHeight) - 4);
+  const endRow = Math.min(maxRow, startRow + visibleRowCount);
+  const renderedRowCount = Math.max(0, endRow - startRow + 1);
   return (
     <div className="spreadsheet-workbook" onMouseDown={(event) => event.stopPropagation()}>
       {workbook.sheets.length > 1 && (
@@ -308,11 +317,12 @@ function renderSpreadsheetPreview(
           ))}
         </div>
       )}
-      <div className="spreadsheet-scroll">
+      <div className="spreadsheet-scroll" onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}>
         <table className="spreadsheet-grid">
           <tbody>
-            {Array.from({ length: maxRow }, (_, rowOffset) => {
-              const rowNumber = rowOffset + 1;
+            {startRow > 1 && <tr aria-hidden="true"><td colSpan={maxCol} style={{ height: (startRow - 1) * rowHeight, padding: 0, border: 0 }} /></tr>}
+            {Array.from({ length: renderedRowCount }, (_, rowOffset) => {
+              const rowNumber = startRow + rowOffset;
               return (
                 <tr key={rowNumber}>
                   {Array.from({ length: maxCol }, (_, colOffset) => {
@@ -334,12 +344,13 @@ function renderSpreadsheetPreview(
                 </tr>
               );
             })}
+            {endRow < maxRow && <tr aria-hidden="true"><td colSpan={maxCol} style={{ height: (maxRow - endRow) * rowHeight, padding: 0, border: 0 }} /></tr>}
           </tbody>
         </table>
       </div>
     </div>
   );
-}
+});
 
 function renderTextPreview(
   node: CanvasNode,
@@ -350,7 +361,7 @@ function renderTextPreview(
     return renderRichDocument(node);
   }
   if (node.type === 'table' && node.spreadsheetData) {
-    return renderSpreadsheetPreview(node, activeSheetIndex, onSheetChange);
+    return <SpreadsheetPreview node={node} activeSheetIndex={activeSheetIndex} onSheetChange={onSheetChange} />;
   }
   if (!node.text?.trim()) return <span className="note-placeholder">{FREE_TEXT_PLACEHOLDER}</span>;
   if (node.type === 'table') {
@@ -483,7 +494,7 @@ function cloneWorkbook(workbook: SpreadsheetWorkbook): SpreadsheetWorkbook {
   return JSON.parse(JSON.stringify(workbook)) as SpreadsheetWorkbook;
 }
 
-const CanvasImage = memo(function CanvasImage({ asset, projectCacheId, cacheDirectory, cacheEpoch, lowZoom, displaySize, visible, allowFullResolution, alt, selected, title }: {
+const CanvasImage = memo(function CanvasImage({ asset, projectCacheId, cacheDirectory, cacheEpoch, lowZoom, displaySize, visible, loadPriority, loadEnabled, allowFullResolution, alt, selected, title }: {
   asset: AssetRecord;
   projectCacheId: string;
   cacheDirectory?: string;
@@ -491,6 +502,8 @@ const CanvasImage = memo(function CanvasImage({ asset, projectCacheId, cacheDire
   lowZoom: boolean;
   displaySize: number;
   visible: boolean;
+  loadPriority: 0 | 1 | 2;
+  loadEnabled: boolean;
   allowFullResolution: boolean;
   alt?: string;
   selected: boolean;
@@ -498,11 +511,20 @@ const CanvasImage = memo(function CanvasImage({ asset, projectCacheId, cacheDire
 }) {
   const cacheKey = `${projectCacheId}:${cacheDirectory || 'default'}:${asset.id}`;
   const [cached, setCached] = useState<PreparedImageCache | null>(() => preparedImageCache.get(cacheKey)?.value || null);
+  const [previewTier, setPreviewTier] = useState(() => nextImagePreviewTier(undefined, displaySize, lowZoom, allowFullResolution));
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setPreviewTier((current) => nextImagePreviewTier(current, displaySize, lowZoom, allowFullResolution));
+    }, 120);
+    return () => window.clearTimeout(timer);
+  }, [allowFullResolution, displaySize, lowZoom]);
 
   useEffect(() => {
     let cancelled = false;
     let preloadTimer: number | null = null;
     let scheduled = false;
+    if (!loadEnabled) return;
     const existing = preparedImageCache.get(cacheKey);
     setCached((current) => current === existing?.value ? current : existing?.value || null);
     if (existing && Date.now() - existing.checkedAt < 30_000) {
@@ -515,8 +537,9 @@ const CanvasImage = memo(function CanvasImage({ asset, projectCacheId, cacheDire
         return;
       }
       scheduled = true;
-      const pending = imageLoadScheduler.schedule(cacheKey, visible ? 0 : 2, () => prepareImageCache(projectCacheId, cacheDirectory, asset));
+      const pending = imageLoadScheduler.schedule(cacheKey, loadPriority, () => prepareImageCache(projectCacheId, cacheDirectory, asset));
       void pending.then((value) => {
+        recordImageCacheResult(value.cacheHit);
         preparedImageCache.set(cacheKey, { value, checkedAt: Date.now() });
         if (!cancelled) setCached(value);
       }).catch((error) => {
@@ -524,22 +547,19 @@ const CanvasImage = memo(function CanvasImage({ asset, projectCacheId, cacheDire
         window.dispatchEvent(new CustomEvent('refmind3d-image-cache-error', { detail: String(error) }));
       });
     };
-    if (visible) prepare();
-    else preloadTimer = window.setTimeout(prepare, 350);
+    if (loadPriority === 0) prepare();
+    else preloadTimer = window.setTimeout(prepare, loadPriority === 1 ? 80 : 350);
     return () => {
       cancelled = true;
       if (preloadTimer !== null) window.clearTimeout(preloadTimer);
       if (scheduled) imageLoadScheduler.release(cacheKey);
     };
-  }, [asset, cacheDirectory, cacheEpoch, cacheKey, projectCacheId, visible]);
+  }, [asset, cacheDirectory, cacheEpoch, cacheKey, loadEnabled, loadPriority, projectCacheId]);
 
-  const useThumbnail = lowZoom || displaySize <= 520;
-  const useMediumPreview = displaySize <= 1400;
-  const useFullResolution = allowFullResolution && !lowZoom && displaySize > 2400;
   const src = cached
-    ? (useThumbnail
-      ? cached.thumbnailUrl
-      : (useFullResolution ? fullResolutionAssetUrl(asset) : (useMediumPreview ? cached.mediumUrl : cached.previewUrl)))
+    ? (previewTier === 'thumbnail' ? cached.thumbnailUrl
+      : previewTier === 'medium' ? cached.mediumUrl
+        : previewTier === 'full' ? fullResolutionAssetUrl(asset) : cached.previewUrl)
     : assetUrl(asset, true);
 
   return (
@@ -567,6 +587,67 @@ const CanvasImage = memo(function CanvasImage({ asset, projectCacheId, cacheDire
     </>
   );
 });
+
+const CanvasModelPreview = memo(function CanvasModelPreview({ asset, projectCacheId, cacheDirectory, active, interactive }: {
+  asset: ImportedModel;
+  projectCacheId: string;
+  cacheDirectory?: string;
+  active: boolean;
+  interactive: boolean;
+}) {
+  const key = modelCoverKey(projectCacheId, asset);
+  const [cover, setCover] = useState<string>();
+  useEffect(() => {
+    let cancelled = false;
+    void getModelCover(projectCacheId, cacheDirectory, key).then((value) => { if (!cancelled && value) setCover(value); });
+    return () => { cancelled = true; };
+  }, [cacheDirectory, key, projectCacheId]);
+  const capture = useCallback((dataUrl: string) => {
+    setCover(dataUrl);
+    void setModelCover(projectCacheId, cacheDirectory, key, dataUrl);
+  }, [cacheDirectory, key, projectCacheId]);
+  const showViewer = active && (interactive || !cover);
+  return (
+    <>
+      {cover && !interactive && <img className="model-cover-image" src={cover} draggable={false} alt={asset.name} />}
+      {!cover && !showViewer && <div className="model-static-placeholder">3D 模型<br /><small>进入视口后生成封面</small></div>}
+      {showViewer && (
+        <Suspense fallback={<div className="node-low-zoom-placeholder">正在加载 3D 预览…</div>}>
+          <LazyModelViewer modelPath={assetModelSource(asset)} modelFormat={asset.format} compact onPreviewReady={capture} />
+        </Suspense>
+      )}
+    </>
+  );
+});
+
+const CanvasVideo = memo(function CanvasVideo({ asset, active }: { asset: AssetRecord; active: boolean }) {
+  if (!active) return null;
+  return (
+    <video
+      className="video-node-player"
+      src={assetUrl(asset)}
+      controls
+      playsInline
+      preload="metadata"
+      onMouseDown={(event) => event.stopPropagation()}
+      onDoubleClick={(event) => event.stopPropagation()}
+      onError={(event) => { event.currentTarget.dataset.error = '1'; }}
+    />
+  );
+});
+
+const CanvasTextPreview = memo(function CanvasTextPreview({ node, activeSheetIndex, onSheetChange }: {
+  node: CanvasNode;
+  activeSheetIndex: number;
+  onSheetChange: (sheetIndex: number) => void;
+}) {
+  return (
+    <div className="note-node-display">
+      {documentLabel(node) && <span className="document-node-badge">{documentLabel(node)}</span>}
+      {renderTextPreview(node, activeSheetIndex, onSheetChange)}
+    </div>
+  );
+}, (previous, next) => previous.node === next.node && previous.activeSheetIndex === next.activeSheetIndex);
 
 export function CanvasView({
   focusContentKey,
@@ -688,6 +769,8 @@ export function CanvasView({
   const resizePreviewRef = useRef<Array<{ id: string; patch: Partial<CanvasNode> }> | null>(null);
   const doodleCanvasRef = useRef<DoodleCanvasHandle | null>(null);
   const nodeSpatialIndexRef = useRef<SpatialGridIndex<CanvasNode> | null>(null);
+  const panDirectionRef = useRef({ x: 0, y: 0 });
+  const performanceCountsRef = useRef({ totalNodes: 0, renderedNodes: 0, visibleNodes: 0, activeModels: 0, activeVideos: 0 });
 
   const flushZoom = () => {
     if (wheelTimeoutRef.current !== null) {
@@ -806,6 +889,19 @@ export function CanvasView({
       height: (viewportSize.height + overscanY * 2) / view.scale
     };
     const result = nodeSpatialIndex.query(worldRect);
+    const direction = panDirectionRef.current;
+    if (direction.x !== 0 || direction.y !== 0) {
+      const ahead = nodeSpatialIndex.query({
+        x: -view.x / view.scale + direction.x * viewportSize.width / view.scale * 0.65,
+        y: -view.y / view.scale + direction.y * viewportSize.height / view.scale * 0.65,
+        width: viewportSize.width / view.scale,
+        height: viewportSize.height / view.scale
+      });
+      const included = new Set(result.map((node) => node.id));
+      for (const node of ahead) {
+        if (!included.has(node.id)) result.push(node);
+      }
+    }
     for (const id of [editingNodeId, activeGroupId]) {
       if (!id || result.some((node) => node.id === id)) continue;
       const node = nodesById.get(id);
@@ -814,12 +910,70 @@ export function CanvasView({
     return result;
   }, [nodeSpatialIndex, project.nodes, nodesById, view, viewportSize, editingNodeId, activeGroupId]);
 
-  const visibleNodeIds = useMemo(() => new Set(nodeSpatialIndex.query({
+  const visibleNodes = useMemo(() => nodeSpatialIndex.query({
     x: -view.x / view.scale,
     y: -view.y / view.scale,
     width: viewportSize.width / view.scale,
     height: viewportSize.height / view.scale
-  }).map((node) => node.id)), [nodeSpatialIndex, project.nodes, view, viewportSize]);
+  }), [nodeSpatialIndex, project.nodes, view, viewportSize]);
+  const visibleNodeIds = useMemo(() => new Set(visibleNodes.map((node) => node.id)), [visibleNodes]);
+
+  const viewportWorldCenter = useMemo(() => ({
+    x: (-view.x + viewportSize.width / 2) / view.scale,
+    y: (-view.y + viewportSize.height / 2) / view.scale
+  }), [view, viewportSize]);
+  const liveModelIds = useMemo(() => closestNodeIds(visibleNodes.filter((node) => node.type === 'model'), viewportWorldCenter, 4), [viewportWorldCenter, visibleNodes]);
+  const liveVideoIds = useMemo(() => closestNodeIds(visibleNodes.filter((node) => node.type === 'video'), viewportWorldCenter, 8), [viewportWorldCenter, visibleNodes]);
+  const fullResolutionImageIds = useMemo(() => closestNodeIds(visibleNodes.filter((node) => node.type === 'image'), viewportWorldCenter, 12), [viewportWorldCenter, visibleNodes]);
+  const predictedPrefetchIds = useMemo(() => {
+    const direction = panDirectionRef.current;
+    if (direction.x === 0 && direction.y === 0) return new Set<string>();
+    const width = viewportSize.width / view.scale;
+    const height = viewportSize.height / view.scale;
+    return new Set(nodeSpatialIndex.query({
+      x: -view.x / view.scale + direction.x * width * 0.65,
+      y: -view.y / view.scale + direction.y * height * 0.65,
+      width,
+      height
+    }).map((node) => node.id));
+  }, [nodeSpatialIndex, project.nodes, view, viewportSize]);
+  performanceCountsRef.current = {
+    totalNodes: project.nodes.length,
+    renderedNodes: renderedNodes.length,
+    visibleNodes: visibleNodes.length,
+    activeModels: liveModelIds.size,
+    activeVideos: liveVideoIds.size
+  };
+
+  useEffect(() => {
+    let animationFrame = 0;
+    let windowStarted = performance.now();
+    let previousFrame = windowStarted;
+    let frames = 0;
+    let slowFrames = 0;
+    const sample = (now: number) => {
+      const frameTime = now - previousFrame;
+      previousFrame = now;
+      frames += 1;
+      if (frameTime > 34) slowFrames += 1;
+      if (now - windowStarted >= 1000) {
+        updatePerformanceMetrics({
+          ...performanceCountsRef.current,
+          fps: Math.round(frames * 1000 / (now - windowStarted)),
+          slowFrames,
+          imageMemoryEntries: preparedImageCache.size,
+          imageLoadsActive: imageLoadScheduler.activeCount,
+          imageLoadsQueued: imageLoadScheduler.queuedCount
+        });
+        windowStarted = now;
+        frames = 0;
+        slowFrames = 0;
+      }
+      animationFrame = requestAnimationFrame(sample);
+    };
+    animationFrame = requestAnimationFrame(sample);
+    return () => cancelAnimationFrame(animationFrame);
+  }, []);
 
   const renderedNodesInZOrder = useMemo(() => renderedNodes.slice().sort((a, b) => (
     (groupVisualZIndexes.get(a.id) ?? a.zIndex ?? 0) - (groupVisualZIndexes.get(b.id) ?? b.zIndex ?? 0)
@@ -1131,6 +1285,10 @@ export function CanvasView({
         applyPanPreview(clientX, clientY);
       }
       const offset = panPreviewRef.current;
+      panDirectionRef.current = {
+        x: -Math.sign(offset.x),
+        y: -Math.sign(offset.y)
+      };
       panGestureRef.current = null;
       worldRef.current?.style.setProperty('transform', 'none', 'important');
       worldRef.current?.style.removeProperty('will-change');
@@ -1633,6 +1791,7 @@ export function CanvasView({
   const selectionRect = selection ? normalizeRect(selection.startX, selection.startY, selection.endX, selection.endY) : null;
   const activeDrawRect = drawRect ? normalizeRect(drawRect.startX, drawRect.startY, drawRect.endX, drawRect.endY) : null;
   const lowZoom = view.scale < 0.35;
+  const largeCanvasMode = project.nodes.length >= 5000 || renderedNodes.length >= 1200;
   const selectedTextNode = selectedNodeIds.length === 1
     ? project.nodes.find((node) => selectedNodeIds[0] === node.id && isTextNode(node))
     : undefined;
@@ -1991,7 +2150,7 @@ export function CanvasView({
   return (
     <div
       ref={viewportRef}
-      className={`canvas-viewport ${drawMode ? 'draw-mode' : ''} ${doodleMode ? 'doodle-mode' : ''} ${activeGroupId ? 'group-edit-mode' : ''} ${lowZoom ? 'low-zoom' : ''} ${(drag || resize) ? 'is-interacting' : ''} ${drag?.pan ? 'is-panning' : ''}`}
+      className={`canvas-viewport ${drawMode ? 'draw-mode' : ''} ${doodleMode ? 'doodle-mode' : ''} ${activeGroupId ? 'group-edit-mode' : ''} ${lowZoom ? 'low-zoom' : ''} ${largeCanvasMode ? 'large-canvas-mode' : ''} ${(drag || resize) ? 'is-interacting' : ''} ${drag?.pan ? 'is-panning' : ''}`}
       onWheel={onWheel}
       onPointerDownCapture={beginDoodleStroke}
       onPointerMoveCapture={continueDoodleStroke}
@@ -2121,7 +2280,9 @@ export function CanvasView({
                     lowZoom={lowZoom}
                     displaySize={Math.max(screenRect.width, screenRect.height)}
                     visible={resourceVisible}
-                    allowFullResolution={pageVisible}
+                    loadPriority={resourceVisible ? 0 : (predictedPrefetchIds.has(node.id) ? 1 : 2)}
+                    loadEnabled={pageVisible}
+                    allowFullResolution={pageVisible && (selected || fullResolutionImageIds.has(node.id))}
                     alt={node.title}
                     selected={selected}
                     title={node.title}
@@ -2136,19 +2297,7 @@ export function CanvasView({
                     <div className="video-move-edge edge-bottom" onMouseDown={(event) => onNodeMouseDown(event, node)} title="拖动边缘移动视频窗口" />
                     <div className="video-move-edge edge-left" onMouseDown={(event) => onNodeMouseDown(event, node)} title="拖动边缘移动视频窗口" />
                     <div className="video-move-edge edge-right" onMouseDown={(event) => onNodeMouseDown(event, node)} title="拖动边缘移动视频窗口" />
-                    {resourceVisible && <video
-                      className="video-node-player"
-                      src={assetUrl(asset)}
-                      controls
-                      playsInline
-                      preload="metadata"
-                      onMouseDown={(event) => event.stopPropagation()}
-                      onDoubleClick={(event) => event.stopPropagation()}
-                      onError={(event) => {
-                        const video = event.currentTarget;
-                        video.dataset.error = '1';
-                      }}
-                    />}
+                    <CanvasVideo asset={asset} active={resourceVisible && !lowZoom && (selected || liveVideoIds.has(node.id))} />
                     <div className="video-format-hint">视频 · MP4/WebM 可直接播放，AVI 等取决于系统/WebView 编码支持</div>
                     <div className="node-title">{node.title}</div>
                   </div>
@@ -2177,11 +2326,13 @@ export function CanvasView({
                     <div className="model-move-edge edge-left" onMouseDown={(event) => onNodeMouseDown(event, node)} title="拖动边缘移动 3D 窗口" />
                     <div className="model-move-edge edge-right" onMouseDown={(event) => onNodeMouseDown(event, node)} title="拖动边缘移动 3D 窗口" />
                     <Suspense fallback={<div className="node-low-zoom-placeholder">正在载入 3D 预览…</div>}>
-                      {resourceVisible && <LazyModelViewer
-                        modelPath={assetModelSource(asset)}
-                        modelFormat={asset.format}
-                        compact
-                      />}
+                      <CanvasModelPreview
+                        asset={asset as ImportedModel}
+                        projectCacheId={projectCacheId}
+                        cacheDirectory={cacheDirectory}
+                        active={resourceVisible && !lowZoom && (!largeCanvasMode || selected) && (selected || liveModelIds.has(node.id))}
+                        interactive={selected}
+                      />
                     </Suspense>
                     <div className="node-low-zoom-placeholder">
                       3D 模型<br />
@@ -2192,10 +2343,11 @@ export function CanvasView({
                   </div>
                 )}
                 {isTextNode(node) && !editing && (
-                  <div className="note-node-display">
-                    {documentLabel(node) && <span className="document-node-badge">{documentLabel(node)}</span>}
-                    {renderTextPreview(node, activeSheetByNode[node.id] || 0, (sheetIndex) => setActiveSheetByNode((current) => ({ ...current, [node.id]: sheetIndex })))}
-                  </div>
+                  <CanvasTextPreview
+                    node={node}
+                    activeSheetIndex={activeSheetByNode[node.id] || 0}
+                    onSheetChange={(sheetIndex) => setActiveSheetByNode((current) => ({ ...current, [node.id]: sheetIndex }))}
+                  />
                 )}
                 {isTextNode(node) && editing && (
                   node.type === 'table' ? renderTableEditor(node) : (

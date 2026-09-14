@@ -226,15 +226,7 @@ pub fn load_project_data_url(data_url: String, name_hint: Option<String>) -> Res
 }
 
 fn save_packed_project(path: String, mut project: Value) -> Result<(), String> {
-    let mut sources = collect_packed_resources(&mut project)?;
-    for item in &mut sources {
-        if let ResourceSource::Runtime { asset_id, field } = &item.source {
-            let (bytes, _, _) = runtime_assets::read_resource(asset_id, field).map_err(|e| {
-                format!("Read runtime resource failed {}: {e}", item.meta.file_name)
-            })?;
-            item.source = ResourceSource::Bytes(bytes);
-        }
-    }
+    let sources = collect_packed_resources(&mut project)?;
     let resources = sources
         .iter()
         .map(|item| item.meta.clone())
@@ -288,12 +280,8 @@ fn save_packed_project(path: String, mut project: Value) -> Result<(), String> {
                 })?;
             }
             ResourceSource::Runtime { asset_id, field } => {
-                let (bytes, _, _) =
-                    runtime_assets::read_resource(&asset_id, &field).map_err(|e| {
-                        format!("Read runtime resource failed {}: {e}", item.meta.file_name)
-                    })?;
-                zip.write_all(&bytes).map_err(|e| {
-                    format!("Write runtime resource failed {}: {e}", item.meta.file_name)
+                runtime_assets::copy_resource_to(&asset_id, &field, &mut zip).map_err(|e| {
+                    format!("Stream runtime resource failed {}: {e}", item.meta.file_name)
                 })?;
             }
         }

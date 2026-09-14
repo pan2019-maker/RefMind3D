@@ -6,15 +6,18 @@ import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { AssetPanel } from '../components/AssetPanel';
 import { InspectorPanel } from '../components/InspectorPanel';
+import { PerformanceDiagnostics } from '../components/PerformanceDiagnostics';
+import { ProjectHealthPanel } from '../components/ProjectHealthPanel';
 import { CanvasView } from '../features/canvas/CanvasView';
 import { documentExtensions, imageExtensions, importFileDataCandidatesToProject, importImageCandidatesToProject, importPathsToProject, modelExtensions, videoExtensions, type FileDataImportCandidate, type ImageImportCandidate, type ImportLayoutDirection } from '../features/assets/importController';
 import { exportEditableDocumentAsset, importClipboardImageDataUrl } from '../features/assets/assetImport';
 import { AI_VISION_MODELS, type AiModelManifest } from '../features/ai/modelManifest';
 import { clearRecoveryProject, createLightweightRecoverySnapshot, loadNewerRecoveryProject, loadProjectDataUrl, loadProjectFile, mergeRecoveryResources, projectAssetIds, saveProjectFile, saveRecoveryProject } from '../features/project/projectIO';
 import { useProjectStore } from '../stores/projectStore';
-import type { AssetRecord, CanvasNode, DoodleTool, ImportedModel, RefMindProject, RefMindProjectFile, RefMindWorkspaceFile } from '../shared/types';
+import type { AssetRecord, CanvasNode, CanvasWorkspaceRecord, DoodleTool, ImportedModel, RefMindProject, RefMindProjectFile, RefMindWorkspaceFile } from '../shared/types';
 import { exportProjectToPng, exportSelectedNodesToPng } from '../features/export/exportCanvas';
-import { clearImageCache, confirmDefaultImageCacheDirectory, getImageCacheStatus, setImageCacheDirectory, type ImageCacheStatus } from '../features/assets/imageCache';
+import { clearImageCache, confirmDefaultImageCacheDirectory, getImageCacheStatus, migrateImageCache, setImageCacheDirectory, type ImageCacheStatus } from '../features/assets/imageCache';
+import { recordProjectSave } from '../features/performance/performanceMetrics';
 
 const LazyModelViewer = lazy(() => import('../features/model-viewer/ModelViewer').then((module) => ({ default: module.ModelViewer })));
 
@@ -117,8 +120,24 @@ type ShortcutKey = keyof ShortcutSettings;
 type CanvasWorkspace = {
   id: string;
   name: string;
-  project: RefMindProject;
+  project?: RefMindProject;
+  serializedProject?: string;
+  revision?: string;
 };
+
+function canvasProject(canvas: CanvasWorkspace): RefMindProject {
+  if (canvas.project) return canvas.project;
+  if (canvas.serializedProject) return JSON.parse(canvas.serializedProject) as RefMindProject;
+  return createEmptyCanvasProject(canvas.name);
+}
+
+function parkCanvas(id: string, name: string, project: RefMindProject): CanvasWorkspace {
+  return { id, name, serializedProject: JSON.stringify(project), revision: project.updatedAt };
+}
+
+function liveCanvas(id: string, name: string, project: RefMindProject): CanvasWorkspace {
+  return { id, name, project, revision: project.updatedAt };
+}
 
 function cloneProjectSnapshot(project: RefMindProject): RefMindProject {
   return JSON.parse(JSON.stringify(project)) as RefMindProject;
@@ -167,11 +186,11 @@ function workspaceSnapshot(
   canvases: CanvasWorkspace[],
   activeCanvasId: string,
   activeProject: RefMindProject
-): CanvasWorkspace[] {
+): CanvasWorkspaceRecord[] {
   return canvases.map((canvas) => (
     canvas.id === activeCanvasId
       ? { ...canvas, name: activeProject.name || canvas.name, project: cloneProjectSnapshot(activeProject) }
-      : { ...canvas, project: cloneProjectSnapshot(canvas.project) }
+      : { id: canvas.id, name: canvas.name, project: cloneProjectSnapshot(canvasProject(canvas)) }
   ));
 }
 
@@ -185,7 +204,8 @@ function workspaceContentSignature(
   // project mutations refresh updatedAt, so a compact revision signature is
   // sufficient for dirty-state tracking.
   return [activeCanvasId, ...canvases.map((canvas) => {
-    const value = canvas.id === activeCanvasId ? activeProject : canvas.project;
+    if (canvas.id !== activeCanvasId && !canvas.project) return `${canvas.id}:${canvas.name}:${canvas.revision}`;
+    const value = canvas.id === activeCanvasId ? activeProject : canvasProject(canvas);
     return `${canvas.id}:${canvas.name}:${value.updatedAt}:${value.nodes.length}:${value.assets.length}:${value.links.length}:${value.doodles?.length || 0}`;
   })].join('|');
 }
@@ -1077,7 +1097,13 @@ export function App() {
     if (!selected || Array.isArray(selected)) return;
     setCacheBusy(true);
     try {
+      const previousDirectory = imageCacheStatus?.directory || workspaceCacheDirectory;
       const next = await setImageCacheDirectory(workspaceCacheId, selected);
+      if (previousDirectory && previousDirectory.toLowerCase() !== next.directory.toLowerCase()) {
+        void migrateImageCache(workspaceCacheId, previousDirectory, next.directory)
+          .then(() => setStatus('图片缓存目录已更新，旧缓存正在后台迁移'))
+          .catch((error) => console.warn('后台迁移缓存失败', error));
+      }
       setWorkspaceCacheDirectory(next.directory);
       setCachePathDirty(true);
       setImageCacheStatus(next);
@@ -1269,10 +1295,10 @@ export function App() {
     closeMenu();
     setCanvasSwitching(true);
     setCanvases((current) => current.map((canvas) => (
-      canvas.id === activeCanvasId ? { ...canvas, project: cloneProjectSnapshot(project) } : canvas
+      canvas.id === activeCanvasId ? parkCanvas(canvas.id, canvas.name, project) : canvas
     )));
     setActiveCanvasId(canvasId);
-    setProject(cloneProjectSnapshot(target.project));
+    setProject(cloneProjectSnapshot(canvasProject(target)));
     setStatus(`已切换到画布：${target.name}`);
     if (canvasSwitchTimerRef.current) window.clearTimeout(canvasSwitchTimerRef.current);
     canvasSwitchTimerRef.current = window.setTimeout(() => setCanvasSwitching(false), 320);
@@ -1284,8 +1310,8 @@ export function App() {
     const id = crypto.randomUUID();
     const nextProject = createEmptyCanvasProject(name);
     setCanvases((current) => [
-      ...current.map((canvas) => canvas.id === activeCanvasId ? { ...canvas, project: cloneProjectSnapshot(project) } : canvas),
-      { id, name, project: nextProject }
+      ...current.map((canvas) => canvas.id === activeCanvasId ? parkCanvas(canvas.id, canvas.name, project) : canvas),
+      liveCanvas(id, name, nextProject)
     ]);
     setCanvasSwitching(true);
     setActiveCanvasId(id);
@@ -1312,7 +1338,9 @@ export function App() {
       return;
     }
     const name = nextName.trim() || canvas.name;
-    setCanvases((current) => current.map((item) => item.id === canvasId ? { ...item, name, project: { ...item.project, name } } : item));
+    setCanvases((current) => current.map((item) => item.id === canvasId
+      ? (item.project ? liveCanvas(item.id, name, { ...item.project, name }) : parkCanvas(item.id, name, { ...canvasProject(item), name }))
+      : item));
     if (canvasId === activeCanvasId) {
       setProject({ ...project, name });
     }
@@ -1344,7 +1372,7 @@ export function App() {
     if (canvasId === activeCanvasId) {
       const next = remaining[0];
       setActiveCanvasId(next.id);
-      setProject(cloneProjectSnapshot(next.project));
+      setProject(cloneProjectSnapshot(canvasProject(next)));
       setStatus(`已删除画布并切换到：${next.name}`);
     } else {
       setStatus(`已删除画布：${canvas.name}`);
@@ -1381,11 +1409,15 @@ export function App() {
   };
 
   const saveWorkspaceToPath = async (path: string) => {
+    const saveStarted = performance.now();
     const workspaceFile = createWorkspaceFile(canvases, activeCanvasId, project, workspaceCacheId, workspaceCacheDirectory);
     await saveProjectFile(path, workspaceFile);
+    recordProjectSave(performance.now() - saveStarted);
     persistedAssetIdsRef.current = projectAssetIds(workspaceFile);
     const savedCanvases = workspaceSnapshot(canvases, activeCanvasId, project);
-    setCanvases(savedCanvases);
+    setCanvases(savedCanvases.map((canvas) => canvas.id === activeCanvasId
+      ? liveCanvas(canvas.id, canvas.name, canvas.project)
+      : parkCanvas(canvas.id, canvas.name, canvas.project)));
     setSavedWorkspaceSignature(workspaceContentSignature(savedCanvases, activeCanvasId, project));
     setCachePathDirty(false);
     void clearRecoveryProject(workspaceCacheId).catch(() => undefined);
@@ -1453,7 +1485,9 @@ export function App() {
         ? loaded.activeCanvasId
         : loadedCanvases[0].id;
       const active = loadedCanvases.find((canvas) => canvas.id === nextActiveId) || loadedCanvases[0];
-      setCanvases(loadedCanvases.map((canvas) => ({ ...canvas, project: cloneProjectSnapshot(canvas.project) })));
+      setCanvases(loadedCanvases.map((canvas) => canvas.id === nextActiveId
+        ? liveCanvas(canvas.id, canvas.name, cloneProjectSnapshot(canvas.project))
+        : parkCanvas(canvas.id, canvas.name, canvas.project)));
       setActiveCanvasId(nextActiveId);
       setProject(cloneProjectSnapshot(active.project));
       setSavedWorkspaceSignature(restoredRecovery ? '__recovered__' : workspaceContentSignature(loadedCanvases, nextActiveId, useProjectStore.getState().project));
@@ -1486,7 +1520,9 @@ export function App() {
         ? loaded.activeCanvasId
         : loadedCanvases[0].id;
       const active = loadedCanvases.find((canvas) => canvas.id === nextActiveId) || loadedCanvases[0];
-      setCanvases(loadedCanvases.map((canvas) => ({ ...canvas, project: cloneProjectSnapshot(canvas.project) })));
+      setCanvases(loadedCanvases.map((canvas) => canvas.id === nextActiveId
+        ? liveCanvas(canvas.id, canvas.name, cloneProjectSnapshot(canvas.project))
+        : parkCanvas(canvas.id, canvas.name, canvas.project)));
       setActiveCanvasId(nextActiveId);
       setProject(cloneProjectSnapshot(active.project));
       setSavedWorkspaceSignature(workspaceContentSignature(loadedCanvases, nextActiveId, useProjectStore.getState().project));
@@ -2399,7 +2435,7 @@ export function App() {
     closeMenu();
     if (confirm('确定新建场景吗？当前未保存内容可能丢失。')) {
       const blank = createEmptyCanvasProject('主画布');
-      setCanvases([{ id: 'main-canvas', name: '主画布', project: blank }]);
+      setCanvases([liveCanvas('main-canvas', '主画布', blank)]);
       setActiveCanvasId('main-canvas');
       setProject(blank);
       setWorkspaceCacheId(crypto.randomUUID());
@@ -3412,6 +3448,8 @@ export function App() {
               </label>
               <p className="muted">每个工程独立保存自己的缓存地址，工程内所有画布共享该目录。画布优先显示缩略图，再按屏幕显示尺寸加载解码预览；原文件大小或修改时间变化后自动重建。当前工程缓存上限为 10 GB，卸载默认保留。</p>
             </section>
+            <PerformanceDiagnostics />
+            <ProjectHealthPanel project={project} />
             <section className="ai-settings-section">
               {!API_ONLY_EDITION && <section className="ai-local-model-manager">
                 <div className="settings-section-title ai-subsection-title">

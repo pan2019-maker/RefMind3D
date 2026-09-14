@@ -169,6 +169,13 @@ function unique<T>(items: T[]) {
   return Array.from(new Set(items));
 }
 
+function assetFingerprint(asset: AssetRecord) {
+  if (asset.contentHash) return `${asset.kind}:hash:${asset.contentHash}`;
+  const source = (asset.originalPath || asset.projectAssetPath || '').trim().replace(/\\/g, '/').toLowerCase();
+  if (!source || source.startsWith('refmind3d://')) return undefined;
+  return `${asset.kind}:path:${source}:${asset.fileSize}`;
+}
+
 function nodeCenter(node: CanvasNode) {
   return { x: node.x + node.width / 2, y: node.y + node.height / 2 };
 }
@@ -263,7 +270,27 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 
   addAssetsAndNodes: (assets, nodes, nextSelectedNodeIds) => set((state) => {
     if (assets.length === 0 && nodes.length === 0) return state;
-    const patchedNodes = nodes.map(defaultTextPatch);
+    const knownAssets = new Map<string, string>();
+    state.project.assets.forEach((asset) => {
+      const fingerprint = assetFingerprint(asset);
+      if (fingerprint) knownAssets.set(fingerprint, asset.id);
+    });
+    const assetIdMap = new Map<string, string>();
+    const uniqueAssets: AssetRecord[] = [];
+    assets.forEach((asset) => {
+      const fingerprint = assetFingerprint(asset);
+      const existingId = fingerprint ? knownAssets.get(fingerprint) : undefined;
+      if (existingId) {
+        assetIdMap.set(asset.id, existingId);
+        return;
+      }
+      uniqueAssets.push(asset);
+      if (fingerprint) knownAssets.set(fingerprint, asset.id);
+    });
+    const patchedNodes = nodes.map((node) => defaultTextPatch({
+      ...node,
+      assetId: node.assetId ? (assetIdMap.get(node.assetId) || node.assetId) : undefined
+    }));
     const combinedNodes = attachNodesToContainingGroups(
       [...state.project.nodes, ...patchedNodes],
       patchedNodes.map((node) => node.id)
@@ -272,7 +299,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
       ...withHistory(state),
       project: {
         ...state.project,
-        assets: [...state.project.assets, ...assets],
+        assets: [...state.project.assets, ...uniqueAssets],
         nodes: applyGroupRules(combinedNodes),
         updatedAt: now()
       },

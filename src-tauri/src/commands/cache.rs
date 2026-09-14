@@ -1,8 +1,9 @@
 use anyhow::{anyhow, Context};
+use base64::Engine;
 use image::{DynamicImage, GenericImageView, ImageFormat};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{HashMap, hash_map::DefaultHasher};
+use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
 use std::env;
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -101,6 +102,7 @@ fn dir_size(path: &Path) -> u64 {
 fn status(project_id: &str, directory: Option<&str>, calculate_size: bool) -> CacheStatus {
     let path = project_cache_dir(project_id, directory);
     let result = initialize_dir(&path);
+    if result.is_ok() { repair_cache_once(&path); }
     CacheStatus { directory: path.to_string_lossy().to_string(), size_bytes: if result.is_ok() && calculate_size { dir_size(&path) } else { 0 }, size_calculated: calculate_size && result.is_ok(), max_bytes: DEFAULT_LIMIT_BYTES, initialized: directory.is_some_and(|value| !value.trim().is_empty()), available: result.is_ok(), error: result.err().map(|e| e.to_string()) }
 }
 
@@ -175,6 +177,7 @@ fn prepare_sync(project_id: &str, cache_directory: Option<&str>, asset: &Value) 
         }
         Err(error) => return Err(error),
     };
+    repair_cache_once(&root);
     let asset_id = safe(asset.get("id").and_then(Value::as_str).unwrap_or("image"));
     let dir = root.join(&asset_id);
     fs::create_dir_all(&dir)?;
@@ -289,6 +292,81 @@ fn enforce_limit(root: &Path, limit: u64) {
         if removed.is_ok() { total = total.saturating_sub(size); }
     }
 }
+
+#[tauri::command]
+pub fn migrate_image_cache(project_cache_id: String, from_directory: String, to_directory: String) -> Result<bool, String> {
+    let from = project_cache_dir(&project_cache_id, Some(&from_directory));
+    let to = project_cache_dir(&project_cache_id, Some(&to_directory));
+    if from == to || !from.is_dir() { return Ok(false); }
+    initialize_dir(&to).map_err(|e| e.to_string())?;
+    std::thread::spawn(move || {
+        for entry in WalkDir::new(&from).into_iter().filter_map(Result::ok) {
+            let Ok(relative) = entry.path().strip_prefix(&from) else { continue; };
+            if relative.as_os_str().is_empty() { continue; }
+            let destination = to.join(relative);
+            if entry.file_type().is_dir() {
+                let _ = fs::create_dir_all(&destination);
+            } else if !destination.exists() {
+                if let Some(parent) = destination.parent() { let _ = fs::create_dir_all(parent); }
+                let _ = fs::copy(entry.path(), destination);
+            }
+        }
+    });
+    Ok(true)
+}
+
+#[tauri::command]
+pub async fn load_model_cover(project_cache_id: String, cache_directory: Option<String>, key: String) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = project_cache_dir(&project_cache_id, cache_directory.as_deref());
+        ensure_dir(&root).map_err(|e| e.to_string())?;
+        let path = root.join("model-covers").join(format!("{}.webp", safe(&key)));
+        if !path.is_file() { return Ok(None); }
+        Ok(Some(runtime_assets::register_file_resource(&format!("model-cover-{}", safe(&key)), "preview", "cover.webp".into(), "image/webp".into(), path)))
+    }).await.map_err(|e| format!("读取模型封面失败：{e}"))?
+}
+
+#[tauri::command]
+pub async fn save_model_cover(project_cache_id: String, cache_directory: Option<String>, key: String, data_url: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = project_cache_dir(&project_cache_id, cache_directory.as_deref());
+        ensure_dir(&root).map_err(|e| e.to_string())?;
+        let directory = root.join("model-covers");
+        fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+        let encoded = data_url.split_once(',').map(|(_, data)| data).ok_or_else(|| "模型封面数据无效".to_string())?;
+        let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).map_err(|e| format!("模型封面解码失败：{e}"))?;
+        let path = directory.join(format!("{}.webp", safe(&key)));
+        let temporary = path.with_extension("webp.tmp");
+        fs::write(&temporary, bytes).map_err(|e| e.to_string())?;
+        if path.exists() { fs::remove_file(&path).map_err(|e| e.to_string())?; }
+        fs::rename(&temporary, &path).map_err(|e| e.to_string())?;
+        Ok(runtime_assets::register_file_resource(&format!("model-cover-{}", safe(&key)), "preview", "cover.webp".into(), "image/webp".into(), path))
+    }).await.map_err(|e| format!("保存模型封面失败：{e}"))?
+}
+
+fn repair_cache_once(root: &Path) {
+    static REPAIRED_ROOTS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    let roots = REPAIRED_ROOTS.get_or_init(|| Mutex::new(HashSet::new()));
+    if !roots.lock().unwrap().insert(root.to_path_buf()) { return; }
+    let _ = repair_cache_units(root, 64);
+}
+
+fn repair_cache_units(root: &Path, limit: usize) -> usize {
+    let Ok(entries) = fs::read_dir(root) else { return 0; };
+    let mut removed = 0;
+    for path in entries.filter_map(Result::ok).map(|entry| entry.path()).filter(|path| path.is_dir()).take(limit) {
+        let manifest_path = path.join("manifest.json");
+        if !manifest_path.is_file() { continue; }
+        let manifest = fs::read(&manifest_path).ok().and_then(|raw| serde_json::from_slice::<CacheManifest>(&raw).ok());
+        let valid = manifest.is_some_and(|manifest| {
+            path.join(manifest.preview_file).is_file()
+                && path.join(manifest.thumbnail_file).is_file()
+                && manifest.medium_file.is_none_or(|file| path.join(file).is_file())
+        });
+        if !valid && fs::remove_dir_all(&path).is_ok() { removed += 1; }
+    }
+    removed
+}
 fn safe(value: &str) -> String { let v: String=value.chars().filter(|c| c.is_ascii_alphanumeric()||*c=='-'||*c=='_').take(96).collect(); if v.is_empty(){"default".into()}else{v} }
 fn bytes_hash(bytes: &[u8]) -> u64 { let mut h=DefaultHasher::new(); bytes.hash(&mut h); h.finish() }
 fn now_ms() -> u64 { time_ms(SystemTime::now()).unwrap_or(0) }
@@ -364,6 +442,21 @@ mod tests {
         assert!(!root.join("old").exists());
         assert!(root.join("new").is_dir());
         assert!(root.join("new").join("payload.bin").is_file());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cache_repair_removes_only_broken_managed_units() {
+        let root = env::temp_dir().join(format!("refmind3d-cache-repair-test-{}", uuid::Uuid::new_v4()));
+        let broken = root.join("broken-asset");
+        let unrelated = root.join("user-folder");
+        fs::create_dir_all(&broken).unwrap();
+        fs::create_dir_all(&unrelated).unwrap();
+        fs::write(broken.join("manifest.json"), b"not-json").unwrap();
+        fs::write(unrelated.join("keep.txt"), b"keep").unwrap();
+        assert_eq!(repair_cache_units(&root, 64), 1);
+        assert!(!broken.exists());
+        assert!(unrelated.join("keep.txt").is_file());
         let _ = fs::remove_dir_all(root);
     }
 }

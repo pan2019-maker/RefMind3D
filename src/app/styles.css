@@ -92,6 +92,9 @@ h3 { font-size: 13px; color: #c8c8c8; margin-top: 16px; }
 .canvas-node.selected { outline: 2px solid #8ab4ff; outline-offset: 0; }
 .image-node { width: 100%; height: 100%; object-fit: contain; display: block; background: #2e2e2e; }
 .model-node { width: 100%; height: 100%; position: relative; }
+.model-cover-image { width: 100%; height: 100%; display: block; object-fit: contain; background: #17191e; }
+.model-static-placeholder { width: 100%; height: 100%; display: grid; place-items: center; text-align: center; color: #adb3bf; background: #17191e; }
+.rich-document-preview > * { content-visibility: auto; contain-intrinsic-size: auto 28px; }
 .model-badge { position: absolute; top: 8px; right: 8px; font-size: 12px; background: rgba(0,0,0,0.55); padding: 4px 6px; border-radius: 4px; }
 .node-title { position: absolute; left: 0; right: 0; bottom: 0; padding: 5px 8px; font-size: 12px; background: linear-gradient(transparent, rgba(0,0,0,0.65)); pointer-events: none; color: #fff; }
 .group-canvas-node { overflow: visible; border-style: solid; border-width: 2px; box-shadow: none; backdrop-filter: none; }
@@ -1837,6 +1840,10 @@ h3 { font-size: 13px; color: #c8c8c8; margin-top: 16px; }
   border-top: 1px solid #444;
   border-bottom: 1px solid #444;
 }
+.performance-diagnostics { display: grid; gap: 10px; padding-top: 12px; border-top: 1px solid #414141; }
+.performance-metric-grid { display: grid; grid-template-columns: minmax(90px, 0.7fr) minmax(180px, 1.3fr); gap: 6px 12px; font-size: 12px; }
+.performance-metric-grid span { color: #aaa; }
+.performance-metric-grid code { color: #d8e6ff; overflow-wrap: anywhere; }
 .cache-status-card {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
@@ -2160,3 +2167,16 @@ h3 { font-size: 13px; color: #c8c8c8; margin-top: 16px; }
 .edge-dock-left.ai-dock.ai-dock-open:focus-within {
   transform: translateX(28px) !important;
 }
+.project-health-panel { margin-top: 18px; border-top: 1px solid rgba(255,255,255,.09); padding-top: 16px; }
+.settings-section-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.settings-section-heading h3 { margin: 0 0 4px; }
+.settings-section-heading p { margin: 0; color: #aaa; }
+.project-health-panel ul { margin: 12px 0 0; padding-left: 20px; }
+.project-health-panel li { margin: 6px 0; }
+.project-health-panel li.warning { color: #ff9c8f; }
+.project-health-panel li.info { color: #d4d4d4; }
+.health-ok { color: #72d49b; }
+.canvas-viewport.large-canvas-mode .canvas-node:not(.selected) { box-shadow: none; }
+.canvas-viewport.large-canvas-mode .canvas-node:not(.selected) .node-title,
+.canvas-viewport.large-canvas-mode .canvas-node:not(.selected) .model-badge { display: none; }
+.canvas-viewport.large-canvas-mode .mind-link { filter: none; }

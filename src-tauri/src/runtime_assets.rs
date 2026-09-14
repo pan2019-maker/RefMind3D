@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::time::UNIX_EPOCH;
 use std::sync::{Mutex, OnceLock};
@@ -215,5 +215,49 @@ pub fn protocol_response(request: http::Request<Vec<u8>>) -> http::Response<Vec<
     match read_resource_url(&uri) {
         Ok((bytes, mime, _)) => response(200, &mime, bytes, cacheable),
         Err(message) => response(404, "text/plain; charset=utf-8", message.into_bytes(), false),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_backed_resources_stream_without_materializing_a_second_payload() {
+        let root = std::env::temp_dir().join(format!("refmind3d-stream-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("resource.bin");
+        let expected = vec![7_u8; 128 * 1024];
+        std::fs::write(&path, &expected).unwrap();
+        register_file_resource("stream-test", "source", "resource.bin".into(), "application/octet-stream".into(), path);
+        let mut streamed = Vec::new();
+        assert_eq!(copy_resource_to("stream-test", "source", &mut streamed).unwrap(), expected.len() as u64);
+        assert_eq!(streamed, expected);
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+pub fn copy_resource_to<W: Write>(asset_id: &str, field: &str, writer: &mut W) -> Result<u64, String> {
+    let resource = resources()
+        .lock()
+        .unwrap()
+        .get(&key(asset_id, field))
+        .cloned()
+        .ok_or_else(|| "Resource is no longer available in this session".to_string())?;
+    match resource.backing {
+        ResourceBacking::Memory(bytes) => {
+            writer.write_all(&bytes).map_err(|e| format!("Write memory resource failed: {e}"))?;
+            Ok(bytes.len() as u64)
+        }
+        ResourceBacking::File(path) => {
+            let mut file = File::open(path).map_err(|e| format!("Open cached resource failed: {e}"))?;
+            std::io::copy(&mut file, writer).map_err(|e| format!("Stream cached resource failed: {e}"))
+        }
+        ResourceBacking::Packed { package_path, zip_path } => {
+            let file = File::open(package_path).map_err(|e| format!("Open project package failed: {e}"))?;
+            let mut archive = ZipArchive::new(file).map_err(|e| format!("Read project package failed: {e}"))?;
+            let mut entry = archive.by_name(&zip_path).map_err(|e| format!("Read packaged resource failed: {e}"))?;
+            std::io::copy(&mut entry, writer).map_err(|e| format!("Stream packaged resource failed: {e}"))
+        }
     }
 }

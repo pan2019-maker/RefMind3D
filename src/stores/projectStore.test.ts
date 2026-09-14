@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { useProjectStore } from './projectStore';
-import type { CanvasNode, RefMindProject } from '../shared/types';
+import type { AssetRecord, CanvasNode, RefMindProject } from '../shared/types';
 
 function emptyProject(): RefMindProject {
   return {
@@ -37,5 +37,14 @@ describe('project history', () => {
     useProjectStore.getState().copySelected();
     useProjectStore.getState().updateNode('node-1', { title: 'changed' });
     expect(useProjectStore.getState().clipboardNodes[0].title).toBe('image');
+  });
+
+  it('reuses an existing asset when the same source is imported again', () => {
+    const first: AssetRecord = { id: 'asset-1', kind: 'image', name: 'a.png', originalPath: 'D:\\a.png', projectAssetPath: '', fileSize: 42, format: 'png', importedAt: '' };
+    const duplicate = { ...first, id: 'asset-2' };
+    useProjectStore.getState().addAssetsAndNodes([first], [{ ...node(), assetId: first.id }]);
+    useProjectStore.getState().addAssetsAndNodes([duplicate], [{ ...node(), id: 'node-2', assetId: duplicate.id }]);
+    expect(useProjectStore.getState().project.assets).toHaveLength(1);
+    expect(useProjectStore.getState().project.nodes.find((item) => item.id === 'node-2')?.assetId).toBe(first.id);
   });
 });

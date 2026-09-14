@@ -22,6 +22,8 @@ export interface AssetRecord {
   fileSize: number;
   format: string;
   importedAt: string;
+  /** Stable source/content identity used to avoid embedding the same asset twice. */
+  contentHash?: string;
   extractedText?: string;
   contentHtml?: string;
   documentMedia?: DocumentMedia[];

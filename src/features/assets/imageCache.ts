@@ -22,6 +22,8 @@ export const getImageCacheStatus = (projectCacheId: string, cacheDirectory?: str
   invoke<ImageCacheStatus>('image_cache_status', { projectCacheId, cacheDirectory, calculateSize });
 export const setImageCacheDirectory = (projectCacheId: string, directory: string) =>
   invoke<ImageCacheStatus>('set_image_cache_directory', { projectCacheId, directory });
+export const migrateImageCache = (projectCacheId: string, fromDirectory: string, toDirectory: string) =>
+  invoke<boolean>('migrate_image_cache', { projectCacheId, fromDirectory, toDirectory });
 export const confirmDefaultImageCacheDirectory = (projectCacheId: string) =>
   invoke<ImageCacheStatus>('confirm_default_image_cache_directory', { projectCacheId });
 export const clearImageCache = (projectCacheId: string, cacheDirectory?: string, olderThanDays?: number) =>

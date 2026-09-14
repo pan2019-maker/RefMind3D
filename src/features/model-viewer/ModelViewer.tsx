@@ -10,6 +10,7 @@ interface ModelViewerProps {
   modelPath: string;
   modelFormat?: string;
   compact?: boolean;
+  onPreviewReady?: (dataUrl: string) => void;
 }
 
 type DisplayMode = 'material' | 'gray' | 'white' | 'wireframe';
@@ -77,7 +78,7 @@ function modelFormatFromPath(path: string, explicitFormat?: string) {
   return path.split('?')[0].split('#')[0].split('.').pop()?.toLowerCase();
 }
 
-export const ModelViewer = memo(function ModelViewer({ modelPath, modelFormat, compact = false }: ModelViewerProps) {
+export const ModelViewer = memo(function ModelViewer({ modelPath, modelFormat, compact = false, onPreviewReady }: ModelViewerProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const cleanupRef = useRef<(() => void) | null>(null);
   const [status, setStatus] = useState('准备加载模型');
@@ -99,7 +100,12 @@ export const ModelViewer = memo(function ModelViewer({ modelPath, modelFormat, c
     const camera = new THREE.PerspectiveCamera(45, width / height, 0.1, 100000);
     camera.position.set(0, 1, 5);
 
-    const renderer = new THREE.WebGLRenderer({ antialias: !compact, alpha: compact, powerPreference: 'high-performance' });
+    const renderer = new THREE.WebGLRenderer({
+      antialias: !compact,
+      alpha: compact,
+      powerPreference: 'high-performance',
+      preserveDrawingBuffer: compact && Boolean(onPreviewReady)
+    });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, compact ? 1.5 : 2));
     renderer.setSize(width, height);
     renderer.outputColorSpace = THREE.SRGBColorSpace;
@@ -149,6 +155,7 @@ export const ModelViewer = memo(function ModelViewer({ modelPath, modelFormat, c
     let modelCenter = new THREE.Vector3(0, 0, 0);
     let modelRadius = 1;
     let animationFrame = 0;
+    let previewCaptured = false;
 
     const renderOnce = () => {
       if (disposed || framePending) return;
@@ -263,6 +270,26 @@ export const ModelViewer = memo(function ModelViewer({ modelPath, modelFormat, c
       const fitted = fitCameraToObject(camera, controls, object);
       modelCenter = fitted.center.clone();
       modelRadius = fitted.radius;
+      if (compact && onPreviewReady && !previewCaptured) {
+        previewCaptured = true;
+        requestAnimationFrame(() => {
+          if (disposed) return;
+          controls.update();
+          renderer.render(scene, camera);
+          try {
+            const source = renderer.domElement;
+            const scale = Math.min(1, 640 / Math.max(source.width, source.height, 1));
+            const snapshot = document.createElement('canvas');
+            snapshot.width = Math.max(1, Math.round(source.width * scale));
+            snapshot.height = Math.max(1, Math.round(source.height * scale));
+            snapshot.getContext('2d')?.drawImage(source, 0, 0, snapshot.width, snapshot.height);
+            const dataUrl = snapshot.toDataURL('image/webp', 0.82);
+            if (dataUrl.length > 128) onPreviewReady(dataUrl);
+          } catch {
+            // Keep the live viewer when this WebView cannot capture WebGL output.
+          }
+        });
+      }
       setStatus(compact ? '已加载，可直接 360° 预览，双击放大；拖动标题条移动窗口' : '已加载：左键按模型中心旋转，中键平移，Shift + 右键拖动天光');
       renderOnce();
     };
@@ -303,7 +330,7 @@ export const ModelViewer = memo(function ModelViewer({ modelPath, modelFormat, c
     };
 
     return () => cleanupRef.current?.();
-  }, [modelPath, modelFormat, compact, displayMode]);
+  }, [modelPath, modelFormat, compact, displayMode, onPreviewReady]);
 
   return (
     <div className={`model-viewer ${compact ? 'compact' : ''}`}>

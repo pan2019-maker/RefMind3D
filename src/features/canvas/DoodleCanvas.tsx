@@ -129,11 +129,30 @@ export const DoodleCanvas = memo(forwardRef<DoodleCanvasHandle, {
   const staticCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const activeCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const renderStateRef = useRef({ view, width, height });
+  const workerRef = useRef<Worker | null>(null);
+  const offscreenRef = useRef(false);
   renderStateRef.current = { view, width, height };
 
   useEffect(() => {
     const canvas = staticCanvasRef.current;
     if (!canvas) return;
+    if ('transferControlToOffscreen' in canvas) {
+      try {
+        if (!workerRef.current) workerRef.current = new Worker(new URL('./doodleRender.worker.ts', import.meta.url), { type: 'module' });
+        const message: { canvas?: OffscreenCanvas; strokes: DoodleStroke[]; view: ViewState; width: number; height: number; ratio: number } = {
+          strokes, view, width, height, ratio: Math.min(2, Math.max(1, window.devicePixelRatio || 1))
+        };
+        if (!offscreenRef.current) {
+          message.canvas = canvas.transferControlToOffscreen();
+          offscreenRef.current = true;
+          workerRef.current.postMessage(message, [message.canvas]);
+        } else workerRef.current.postMessage(message);
+        canvas.style.width = `${width}px`; canvas.style.height = `${height}px`;
+        return;
+      } catch {
+        workerRef.current?.terminate(); workerRef.current = null;
+      }
+    }
     const ctx = prepareCanvas(canvas, width, height);
     if (!ctx) return;
     for (const stroke of strokes) {
