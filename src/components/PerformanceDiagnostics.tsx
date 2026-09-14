@@ -1,8 +1,11 @@
 import { useEffect, useState } from 'react';
 import { performanceMetricsSnapshot, subscribePerformanceMetrics } from '../features/performance/performanceMetrics';
+import { runCanvasBenchmark, type BenchmarkResult } from '../features/performance/benchmark';
 
 export function PerformanceDiagnostics() {
   const [metrics, setMetrics] = useState(performanceMetricsSnapshot);
+  const [benchmark, setBenchmark] = useState<BenchmarkResult | null>(null);
+  const [benchmarking, setBenchmarking] = useState(false);
   useEffect(() => {
     const update = () => setMetrics(performanceMetricsSnapshot());
     const unsubscribe = subscribePerformanceMetrics(update);
@@ -22,6 +25,13 @@ export function PerformanceDiagnostics() {
         <span>缓存命中率</span><code>{hitRate}%（{requests} 次）</code>
         <span>卡顿帧</span><code>{metrics.slowFrames}</code>
         <span>最近保存</span><code>{metrics.lastSaveMs === undefined ? '尚未记录' : `${metrics.lastSaveMs} ms`}</code>
+      </div>
+      <div className="performance-benchmark-row">
+        <button disabled={benchmarking} onClick={() => {
+          setBenchmarking(true);
+          void runCanvasBenchmark().then(setBenchmark).finally(() => setBenchmarking(false));
+        }}>{benchmarking ? '正在测试…' : '运行 10,000 节点基准'}</button>
+        {benchmark && <code>索引 {benchmark.buildMs} ms · 200 次视口查询 {benchmark.queryMs} ms · 平均 {benchmark.averageHits} 节点</code>}
       </div>
     </section>
   );

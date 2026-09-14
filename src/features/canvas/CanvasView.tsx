@@ -770,6 +770,7 @@ export function CanvasView({
   const doodleCanvasRef = useRef<DoodleCanvasHandle | null>(null);
   const nodeSpatialIndexRef = useRef<SpatialGridIndex<CanvasNode> | null>(null);
   const panDirectionRef = useRef({ x: 0, y: 0 });
+  const retainedNodeIdsRef = useRef(new Map<string, number>());
   const performanceCountsRef = useRef({ totalNodes: 0, renderedNodes: 0, visibleNodes: 0, activeModels: 0, activeVideos: 0 });
 
   const flushZoom = () => {
@@ -803,6 +804,21 @@ export function CanvasView({
   useEffect(() => () => {
     if (wheelTimeoutRef.current !== null) window.clearTimeout(wheelTimeoutRef.current);
   }, []);
+
+  useEffect(() => {
+    const key = `refmind3d.viewport.${projectCacheId}.${focusContentKey || 'main'}`;
+    try {
+      const saved = JSON.parse(localStorage.getItem(key) || 'null') as ViewState | null;
+      if (saved && Number.isFinite(saved.x) && Number.isFinite(saved.y) && saved.scale >= 0.05 && saved.scale <= 8) setView(saved);
+    } catch { /* Ignore stale viewport metadata. */ }
+    return () => {
+      const latest = zoomRef.current || renderStateView.current;
+      localStorage.setItem(key, JSON.stringify(latest));
+    };
+  }, [focusContentKey, projectCacheId]);
+
+  const renderStateView = useRef(view);
+  renderStateView.current = view;
 
   useEffect(() => {
     const update = () => setPageVisible(document.visibilityState !== 'hidden');
@@ -889,6 +905,15 @@ export function CanvasView({
       height: (viewportSize.height + overscanY * 2) / view.scale
     };
     const result = nodeSpatialIndex.query(worldRect);
+    const retained = retainedNodeIdsRef.current;
+    const now = performance.now();
+    result.forEach((node) => retained.set(node.id, now));
+    for (const [id, touched] of [...retained.entries()]) {
+      if (now - touched > 4_000 || retained.size > 256) { retained.delete(id); continue; }
+      if (result.some((node) => node.id === id)) continue;
+      const node = nodesById.get(id);
+      if (node) result.push(node);
+    }
     const direction = panDirectionRef.current;
     if (direction.x !== 0 || direction.y !== 0) {
       const ahead = nodeSpatialIndex.query({

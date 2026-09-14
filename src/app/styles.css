@@ -2176,6 +2176,7 @@ h3 { font-size: 13px; color: #c8c8c8; margin-top: 16px; }
 .project-health-panel li.warning { color: #ff9c8f; }
 .project-health-panel li.info { color: #d4d4d4; }
 .health-ok { color: #72d49b; }
+.performance-benchmark-row { display: flex; gap: 10px; align-items: center; margin-top: 10px; flex-wrap: wrap; }
 .canvas-viewport.large-canvas-mode .canvas-node:not(.selected) { box-shadow: none; }
 .canvas-viewport.large-canvas-mode .canvas-node:not(.selected) .node-title,
 .canvas-viewport.large-canvas-mode .canvas-node:not(.selected) .model-badge { display: none; }

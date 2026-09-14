@@ -57,8 +57,14 @@ struct PackedProjectFile {
     file_type: String,
     project: Value,
     resources: Vec<PackedResource>,
+    #[serde(default)]
+    canvases: Vec<PackedCanvas>,
     packed_at: String,
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PackedCanvas { id: String, zip_path: String }
 
 enum ResourceSource {
     Path(PathBuf),
@@ -227,6 +233,18 @@ pub fn load_project_data_url(data_url: String, name_hint: Option<String>) -> Res
 
 fn save_packed_project(path: String, mut project: Value) -> Result<(), String> {
     let sources = collect_packed_resources(&mut project)?;
+    let mut canvas_payloads: Vec<(PackedCanvas, Value)> = Vec::new();
+    if project.get("fileType").and_then(Value::as_str) == Some("refmind3d-workspace") {
+        if let Some(canvases) = project.get_mut("canvases").and_then(Value::as_array_mut) {
+            for canvas in canvases {
+                let id = canvas.get("id").and_then(Value::as_str).unwrap_or("canvas").to_string();
+                if let Some(project_value) = canvas.get_mut("project") {
+                    let payload = std::mem::replace(project_value, Value::Null);
+                    canvas_payloads.push((PackedCanvas { id: id.clone(), zip_path: format!("canvases/{}.json", sanitize_file_name(&id)) }, payload));
+                }
+            }
+        }
+    }
     let resources = sources
         .iter()
         .map(|item| item.meta.clone())
@@ -237,10 +255,11 @@ fn save_packed_project(path: String, mut project: Value) -> Result<(), String> {
         .unwrap_or_else(|_| "0".to_string());
 
     let manifest = PackedProjectFile {
-        version: 2,
+        version: 3,
         file_type: "refmind3d-packed-workspace".to_string(),
         project,
         resources,
+        canvases: canvas_payloads.iter().map(|(meta, _)| PackedCanvas { id: meta.id.clone(), zip_path: meta.zip_path.clone() }).collect(),
         packed_at,
     };
 
@@ -258,6 +277,12 @@ fn save_packed_project(path: String, mut project: Value) -> Result<(), String> {
         .map_err(|e| format!("Write project index failed: {e}"))?;
     zip.write_all(&manifest_text)
         .map_err(|e| format!("Write project index failed: {e}"))?;
+
+    for (meta, canvas) in &canvas_payloads {
+        zip.start_file(&meta.zip_path, deflated).map_err(|e| format!("Write canvas index failed: {e}"))?;
+        let bytes = serde_json::to_vec(canvas).map_err(|e| format!("Serialize canvas failed: {e}"))?;
+        zip.write_all(&bytes).map_err(|e| format!("Write canvas failed: {e}"))?;
+    }
 
     for item in sources {
         let options = SimpleFileOptions::default()
@@ -352,6 +377,17 @@ fn load_packed_project(file: File, project_path: &str) -> Result<Value, String> 
     }
 
     let mut project = manifest.project;
+    if let Some(canvases) = project.get_mut("canvases").and_then(Value::as_array_mut) {
+        for canvas_meta in &manifest.canvases {
+            let mut text = String::new();
+            archive.by_name(&canvas_meta.zip_path).map_err(|e| format!("Canvas data missing {}: {e}", canvas_meta.id))?
+                .read_to_string(&mut text).map_err(|e| format!("Read canvas failed: {e}"))?;
+            let canvas_project: Value = serde_json::from_str(&text).map_err(|e| format!("Parse canvas failed: {e}"))?;
+            if let Some(canvas) = canvases.iter_mut().find(|value| value.get("id").and_then(Value::as_str) == Some(&canvas_meta.id)) {
+                canvas["project"] = canvas_project;
+            }
+        }
+    }
     patch_path_resources(&mut project, &path_resources);
     Ok(project)
 }
@@ -1138,6 +1174,29 @@ mod tests {
 
         assert_eq!(loaded.get("name").and_then(Value::as_str), Some("second"));
         assert_eq!(fs::read_dir(&root).unwrap().filter_map(Result::ok).count(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workspace_canvases_are_stored_as_independent_chunks() {
+        let root = env::temp_dir().join(format!("refmind3d-canvas-chunk-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("workspace.refmind3d");
+        let project = json!({
+            "version": 2, "fileType": "refmind3d-workspace", "name": "workspace", "activeCanvasId": "a",
+            "canvases": [
+                { "id": "a", "name": "A", "project": { "version": 1, "name": "A", "assets": [], "nodes": [], "links": [], "doodles": [], "createdAt": "", "updatedAt": "" } },
+                { "id": "b", "name": "B", "project": { "version": 1, "name": "B", "assets": [], "nodes": [], "links": [], "doodles": [], "createdAt": "", "updatedAt": "" } }
+            ], "createdAt": "", "updatedAt": ""
+        });
+        save_packed_project(path.to_string_lossy().to_string(), project).unwrap();
+        let file = File::open(&path).unwrap();
+        let mut archive = ZipArchive::new(file).unwrap();
+        assert!(archive.by_name("canvases/a.json").is_ok());
+        assert!(archive.by_name("canvases/b.json").is_ok());
+        drop(archive);
+        let loaded = load_project(path.to_string_lossy().to_string(), None).unwrap();
+        assert_eq!(loaded["canvases"][1]["project"]["name"], "B");
         let _ = fs::remove_dir_all(root);
     }
 }

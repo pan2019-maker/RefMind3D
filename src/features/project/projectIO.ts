@@ -56,13 +56,16 @@ function stripPersistedResources(project: RefMindProject, persistedAssetIds: Rea
 /** Keeps unsaved new assets recoverable without duplicating resources already stored in the project package. */
 export function createLightweightRecoverySnapshot(
   file: RefMindProjectFile,
-  persistedAssetIds: ReadonlySet<string>
+  persistedAssetIds: ReadonlySet<string>,
+  baselineCanvasRevisions?: ReadonlyMap<string, string>
 ): RefMindProjectFile {
   const workspace = file as import('../../shared/types').RefMindWorkspaceFile;
   if (workspace.fileType === 'refmind3d-workspace') {
     return {
       ...workspace,
-      canvases: workspace.canvases.map((canvas) => ({
+      canvases: workspace.canvases
+        .filter((canvas) => !baselineCanvasRevisions || baselineCanvasRevisions.get(canvas.id) !== canvas.project.updatedAt)
+        .map((canvas) => ({
         ...canvas,
         project: stripPersistedResources(canvas.project, persistedAssetIds)
       }))
@@ -94,13 +97,14 @@ export function mergeRecoveryResources(base: RefMindProjectFile, recovered: RefM
   const baseWorkspace = base as import('../../shared/types').RefMindWorkspaceFile;
   const recoveredWorkspace = recovered as import('../../shared/types').RefMindWorkspaceFile;
   if (baseWorkspace.fileType === 'refmind3d-workspace' && recoveredWorkspace.fileType === 'refmind3d-workspace') {
-    const baseCanvases = new Map(baseWorkspace.canvases.map((canvas) => [canvas.id, canvas.project]));
+    const baseCanvases = new Map(baseWorkspace.canvases.map((canvas) => [canvas.id, canvas]));
+    const recoveredCanvases = new Map(recoveredWorkspace.canvases.map((canvas) => [canvas.id, canvas]));
     return {
       ...recoveredWorkspace,
-      canvases: recoveredWorkspace.canvases.map((canvas) => {
-        const baseProject = baseCanvases.get(canvas.id);
-        return baseProject ? { ...canvas, project: mergeProjectResources(baseProject, canvas.project) } : canvas;
-      })
+      canvases: baseWorkspace.canvases.map((canvas) => {
+        const recoveredCanvas = recoveredCanvases.get(canvas.id);
+        return recoveredCanvas ? { ...recoveredCanvas, project: mergeProjectResources(canvas.project, recoveredCanvas.project) } : canvas;
+      }).concat(recoveredWorkspace.canvases.filter((canvas) => !baseCanvases.has(canvas.id)))
     };
   }
   if (baseWorkspace.fileType !== 'refmind3d-workspace' && recoveredWorkspace.fileType !== 'refmind3d-workspace') {

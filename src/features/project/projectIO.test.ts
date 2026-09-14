@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { createLightweightRecoverySnapshot, mergeRecoveryResources, projectAssetIds } from './projectIO';
-import type { RefMindProject } from '../../shared/types';
+import type { RefMindProject, RefMindWorkspaceFile } from '../../shared/types';
 
 function project(path: string, x: number): RefMindProject {
   return {
@@ -47,5 +47,15 @@ describe('mergeRecoveryResources', () => {
     });
     const recovery = createLightweightRecoverySnapshot(current, new Set(['asset-1'])) as RefMindProject;
     expect(recovery.assets.find((asset) => asset.id === 'new')?.embeddedDataUrl).toBe('data:image/png;base64,new');
+  });
+
+  it('journals only canvases changed since the manual-save baseline', () => {
+    const first = project('a.png', 0); first.updatedAt = 'old';
+    const second = project('b.png', 0); second.updatedAt = 'new';
+    const workspace: RefMindWorkspaceFile = { version: 2, fileType: 'refmind3d-workspace', name: 'w', activeCanvasId: 'b', canvases: [{ id: 'a', name: 'a', project: first }, { id: 'b', name: 'b', project: second }], createdAt: '', updatedAt: '' };
+    const recovery = createLightweightRecoverySnapshot(workspace, new Set(), new Map([['a', 'old'], ['b', 'old']])) as RefMindWorkspaceFile;
+    expect(recovery.canvases.map((canvas) => canvas.id)).toEqual(['b']);
+    const merged = mergeRecoveryResources(workspace, recovery) as RefMindWorkspaceFile;
+    expect(merged.canvases.map((canvas) => canvas.id)).toEqual(['a', 'b']);
   });
 });

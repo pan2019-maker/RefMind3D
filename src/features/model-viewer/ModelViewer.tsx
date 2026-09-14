@@ -324,6 +324,8 @@ export const ModelViewer = memo(function ModelViewer({ modelPath, modelFormat, c
       controls.dispose();
       if (loaded) disposeObject(loaded);
       scene.remove(...scene.children);
+      renderer.setAnimationLoop(null);
+      renderer.renderLists.dispose();
       renderer.dispose();
       renderer.forceContextLoss();
       if (renderer.domElement.parentElement) renderer.domElement.parentElement.removeChild(renderer.domElement);

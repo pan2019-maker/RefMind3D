@@ -957,6 +957,7 @@ export function App() {
   const saveNoticeTimerRef = useRef<number | null>(null);
   const recoverySaveBusyRef = useRef(false);
   const persistedAssetIdsRef = useRef<Set<string>>(new Set());
+  const recoveryBaselineRef = useRef<Map<string, string>>(new Map());
   const [savedWorkspaceSignature, setSavedWorkspaceSignature] = useState<string | null>(null);
   const currentWorkspaceSignature = workspaceContentSignature(canvases, activeCanvasId, project);
   const hasUnsavedChanges = cachePathDirty || (savedWorkspaceSignature !== null && savedWorkspaceSignature !== currentWorkspaceSignature);
@@ -1414,6 +1415,7 @@ export function App() {
     await saveProjectFile(path, workspaceFile);
     recordProjectSave(performance.now() - saveStarted);
     persistedAssetIdsRef.current = projectAssetIds(workspaceFile);
+    recoveryBaselineRef.current = new Map(workspaceFile.canvases.map((canvas) => [canvas.id, canvas.project.updatedAt]));
     const savedCanvases = workspaceSnapshot(canvases, activeCanvasId, project);
     setCanvases(savedCanvases.map((canvas) => canvas.id === activeCanvasId
       ? liveCanvas(canvas.id, canvas.name, canvas.project)
@@ -1448,7 +1450,8 @@ export function App() {
       recoverySaveBusyRef.current = true;
       const recovery = createLightweightRecoverySnapshot(
         createWorkspaceFile(canvases, activeCanvasId, project, workspaceCacheId, workspaceCacheDirectory),
-        persistedAssetIdsRef.current
+        persistedAssetIdsRef.current,
+        recoveryBaselineRef.current
       );
       void saveRecoveryProject(workspaceCacheId, recovery)
         .catch((error) => console.warn('写入自动恢复副本失败', error))
@@ -1460,6 +1463,9 @@ export function App() {
   const loadProjectFromPath = async (path: string) => {
     const original = await loadProjectFile(path);
     persistedAssetIdsRef.current = projectAssetIds(original);
+    recoveryBaselineRef.current = isWorkspaceFile(original)
+      ? new Map(original.canvases.map((canvas) => [canvas.id, canvas.project.updatedAt]))
+      : new Map([['main-canvas', original.updatedAt]]);
     const originalCacheId = original.cacheId || crypto.randomUUID();
     let loaded = original;
     let restoredRecovery = false;
@@ -1511,6 +1517,7 @@ export function App() {
   const loadProjectFromDataUrl = async (dataUrl: string, name: string) => {
     const loaded = await loadProjectDataUrl(dataUrl, name);
     persistedAssetIdsRef.current = new Set();
+    recoveryBaselineRef.current = new Map();
     if (isWorkspaceFile(loaded)) {
       setWorkspaceCacheId(loaded.cacheId || crypto.randomUUID());
       setWorkspaceCacheDirectory(loaded.cacheDirectory);
@@ -2442,6 +2449,7 @@ export function App() {
       setWorkspaceCacheDirectory(undefined);
       setCachePathDirty(false);
       persistedAssetIdsRef.current = new Set();
+      recoveryBaselineRef.current = new Map();
       setCurrentProjectPath(null);
       setStatus('已新建场景');
     }

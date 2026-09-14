@@ -6,8 +6,8 @@ interface ProjectState {
   project: RefMindProject;
   selectedNodeIds: string[];
   clipboardNodes: CanvasNode[];
-  history: RefMindProject[];
-  future: RefMindProject[];
+  history: ProjectPatch[];
+  future: ProjectPatch[];
   addAsset: (asset: AssetRecord) => void;
   addNode: (node: CanvasNode) => void;
   addAssetsAndNodes: (assets: AssetRecord[], nodes: CanvasNode[], selectedNodeIds?: string[]) => void;
@@ -80,8 +80,18 @@ function cloneNodes(nodes: CanvasNode[]): CanvasNode[] {
 // the immutable project root directly and share unchanged assets, document
 // payloads and doodle points instead of serializing the entire project on every
 // edit. Clipboard data still uses cloneProject because it is detached data.
-function historySnapshot(project: RefMindProject): RefMindProject {
-  return project;
+type PatchField = 'name' | 'rootPath' | 'assets' | 'nodes' | 'links' | 'doodles';
+type ProjectPatch = { fields: PatchField[]; values: Partial<RefMindProject>; updatedAt: string };
+const ALL_PATCH_FIELDS: PatchField[] = ['name', 'rootPath', 'assets', 'nodes', 'links', 'doodles'];
+
+function historySnapshot(project: RefMindProject, fields: PatchField[] = ALL_PATCH_FIELDS): ProjectPatch {
+  const values: Partial<RefMindProject> = {};
+  for (const field of fields) (values as Record<string, unknown>)[field] = project[field];
+  return { fields, values, updatedAt: project.updatedAt };
+}
+
+function applyHistoryPatch(project: RefMindProject, patch: ProjectPatch): RefMindProject {
+  return { ...project, ...patch.values, updatedAt: patch.updatedAt };
 }
 
 function defaultTextPatch(node: CanvasNode): CanvasNode {
@@ -149,9 +159,9 @@ function normalizeProject(project: RefMindProject): RefMindProject {
   return { ...normalized, nodes: applyGroupRules(normalized.nodes) };
 }
 
-function withHistory(state: ProjectState) {
+function withHistory(state: ProjectState, fields: PatchField[] = ALL_PATCH_FIELDS) {
   return {
-    history: [...state.history.slice(-(HISTORY_LIMIT - 1)), historySnapshot(state.project)],
+    history: [...state.history.slice(-(HISTORY_LIMIT - 1)), historySnapshot(state.project, fields)],
     future: []
   };
 }
@@ -258,12 +268,12 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
   // Standalone assets are rare, but they are still an editable project change.
   // Image imports use addAssetsAndNodes below so one Ctrl+Z removes both records.
   addAsset: (asset) => set((state) => ({
-    ...withHistory(state),
+    ...withHistory(state, ['assets']),
     project: { ...state.project, assets: [...state.project.assets, asset], updatedAt: now() }
   })),
 
   addNode: (node) => set((state) => ({
-    ...withHistory(state),
+    ...withHistory(state, ['nodes']),
     project: { ...state.project, nodes: applyGroupRules(attachNodesToContainingGroups([...state.project.nodes, defaultTextPatch(node)], [node.id])), updatedAt: now() },
     selectedNodeIds: [node.id]
   })),
@@ -296,7 +306,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
       patchedNodes.map((node) => node.id)
     );
     return {
-      ...withHistory(state),
+      ...withHistory(state, ['assets', 'nodes']),
       project: {
         ...state.project,
         assets: [...state.project.assets, ...uniqueAssets],
@@ -307,10 +317,10 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     };
   }),
 
-  beginHistory: () => set((state) => withHistory(state)),
+  beginHistory: () => set((state) => withHistory(state, ['nodes'])),
 
   updateNode: (id, patch, recordHistory = true, applyGroups = true) => set((state) => ({
-    ...(recordHistory ? withHistory(state) : {}),
+    ...(recordHistory ? withHistory(state, ['nodes']) : {}),
     project: {
       ...state.project,
       nodes: (applyGroups ? applyGroupRules : (nodes: CanvasNode[]) => nodes)(
@@ -323,7 +333,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
   updateNodes: (updates, recordHistory = true, applyGroups = true) => set((state) => {
     const updateMap = new Map(updates.map((item) => [item.id, item.patch]));
     return {
-      ...(recordHistory ? withHistory(state) : {}),
+      ...(recordHistory ? withHistory(state, ['nodes']) : {}),
       project: {
         ...state.project,
         nodes: (applyGroups ? applyGroupRules : (nodes: CanvasNode[]) => nodes)(
@@ -341,7 +351,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
       .filter((node) => !selected.has(node.id))
       .map((node) => node.groupId && deletedGroups.has(node.groupId) ? { ...node, groupId: undefined } : node);
     return {
-      ...withHistory(state),
+      ...withHistory(state, ['nodes', 'links']),
       project: {
         ...state.project,
         nodes: applyGroupRules(nodes),
@@ -391,10 +401,10 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     const previous = state.history[state.history.length - 1];
     if (!previous) return state;
     return {
-      project: normalizeProject(previous),
+      project: normalizeProject(applyHistoryPatch(state.project, previous)),
       selectedNodeIds: [],
       history: state.history.slice(0, -1),
-      future: [historySnapshot(state.project), ...state.future].slice(0, HISTORY_LIMIT)
+      future: [historySnapshot(state.project, previous.fields), ...state.future].slice(0, HISTORY_LIMIT)
     };
   }),
 
@@ -402,9 +412,9 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     const next = state.future[0];
     if (!next) return state;
     return {
-      project: normalizeProject(next),
+      project: normalizeProject(applyHistoryPatch(state.project, next)),
       selectedNodeIds: [],
-      history: [...state.history, historySnapshot(state.project)].slice(-HISTORY_LIMIT),
+      history: [...state.history, historySnapshot(state.project, next.fields)].slice(-HISTORY_LIMIT),
       future: state.future.slice(1)
     };
   }),
