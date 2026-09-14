@@ -37,4 +37,15 @@ describe('SpatialGridIndex', () => {
     expect(visible.length).toBeGreaterThan(0);
     expect(visible.length).toBeLessThan(40);
   });
+
+  it('incrementally moves, updates and removes nodes', () => {
+    const index = new SpatialGridIndex(items, 512);
+    const moved = { ...items[0], x: 4_000 };
+    const renamed = { ...items[1], title: 'updated without geometry changes' };
+    index.sync([moved, renamed]);
+    expect(index.query({ x: -10, y: -10, width: 130, height: 130 })).toEqual([]);
+    expect(index.query({ x: 3_990, y: -10, width: 130, height: 130 })).toEqual([moved]);
+    expect(index.query({ x: 850, y: 850, width: 500, height: 500 })).toEqual([renamed]);
+    expect(index.query({ x: 49_000, y: 49_000, width: 2_000, height: 2_000 })).toEqual([]);
+  });
 });

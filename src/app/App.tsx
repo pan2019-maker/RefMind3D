@@ -10,7 +10,7 @@ import { CanvasView } from '../features/canvas/CanvasView';
 import { documentExtensions, imageExtensions, importFileDataCandidatesToProject, importImageCandidatesToProject, importPathsToProject, modelExtensions, videoExtensions, type FileDataImportCandidate, type ImageImportCandidate, type ImportLayoutDirection } from '../features/assets/importController';
 import { exportEditableDocumentAsset, importClipboardImageDataUrl } from '../features/assets/assetImport';
 import { AI_VISION_MODELS, type AiModelManifest } from '../features/ai/modelManifest';
-import { clearRecoveryProject, loadNewerRecoveryProject, loadProjectDataUrl, loadProjectFile, saveProjectFile, saveRecoveryProject } from '../features/project/projectIO';
+import { clearRecoveryProject, createLightweightRecoverySnapshot, loadNewerRecoveryProject, loadProjectDataUrl, loadProjectFile, mergeRecoveryResources, projectAssetIds, saveProjectFile, saveRecoveryProject } from '../features/project/projectIO';
 import { useProjectStore } from '../stores/projectStore';
 import type { AssetRecord, CanvasNode, DoodleTool, ImportedModel, RefMindProject, RefMindProjectFile, RefMindWorkspaceFile } from '../shared/types';
 import { exportProjectToPng, exportSelectedNodesToPng } from '../features/export/exportCanvas';
@@ -936,6 +936,7 @@ export function App() {
   const lastDropKeyRef = useRef<{ key: string; time: number } | null>(null);
   const saveNoticeTimerRef = useRef<number | null>(null);
   const recoverySaveBusyRef = useRef(false);
+  const persistedAssetIdsRef = useRef<Set<string>>(new Set());
   const [savedWorkspaceSignature, setSavedWorkspaceSignature] = useState<string | null>(null);
   const currentWorkspaceSignature = workspaceContentSignature(canvases, activeCanvasId, project);
   const hasUnsavedChanges = cachePathDirty || (savedWorkspaceSignature !== null && savedWorkspaceSignature !== currentWorkspaceSignature);
@@ -1382,6 +1383,7 @@ export function App() {
   const saveWorkspaceToPath = async (path: string) => {
     const workspaceFile = createWorkspaceFile(canvases, activeCanvasId, project, workspaceCacheId, workspaceCacheDirectory);
     await saveProjectFile(path, workspaceFile);
+    persistedAssetIdsRef.current = projectAssetIds(workspaceFile);
     const savedCanvases = workspaceSnapshot(canvases, activeCanvasId, project);
     setCanvases(savedCanvases);
     setSavedWorkspaceSignature(workspaceContentSignature(savedCanvases, activeCanvasId, project));
@@ -1412,7 +1414,10 @@ export function App() {
     const timer = window.setTimeout(() => {
       if (recoverySaveBusyRef.current) return;
       recoverySaveBusyRef.current = true;
-      const recovery = createWorkspaceFile(canvases, activeCanvasId, project, workspaceCacheId, workspaceCacheDirectory);
+      const recovery = createLightweightRecoverySnapshot(
+        createWorkspaceFile(canvases, activeCanvasId, project, workspaceCacheId, workspaceCacheDirectory),
+        persistedAssetIdsRef.current
+      );
       void saveRecoveryProject(workspaceCacheId, recovery)
         .catch((error) => console.warn('写入自动恢复副本失败', error))
         .finally(() => { recoverySaveBusyRef.current = false; });
@@ -1422,6 +1427,7 @@ export function App() {
 
   const loadProjectFromPath = async (path: string) => {
     const original = await loadProjectFile(path);
+    persistedAssetIdsRef.current = projectAssetIds(original);
     const originalCacheId = original.cacheId || crypto.randomUUID();
     let loaded = original;
     let restoredRecovery = false;
@@ -1429,7 +1435,7 @@ export function App() {
       const recovery = await loadNewerRecoveryProject(originalCacheId, path);
       if (recovery) {
         if (confirm('检测到比工程文件更新的自动恢复副本。是否恢复未保存的修改？')) {
-          loaded = recovery;
+          loaded = mergeRecoveryResources(original, recovery);
           restoredRecovery = true;
         } else {
           void clearRecoveryProject(originalCacheId);
@@ -1470,6 +1476,7 @@ export function App() {
 
   const loadProjectFromDataUrl = async (dataUrl: string, name: string) => {
     const loaded = await loadProjectDataUrl(dataUrl, name);
+    persistedAssetIdsRef.current = new Set();
     if (isWorkspaceFile(loaded)) {
       setWorkspaceCacheId(loaded.cacheId || crypto.randomUUID());
       setWorkspaceCacheDirectory(loaded.cacheDirectory);
@@ -2398,6 +2405,7 @@ export function App() {
       setWorkspaceCacheId(crypto.randomUUID());
       setWorkspaceCacheDirectory(undefined);
       setCachePathDirty(false);
+      persistedAssetIdsRef.current = new Set();
       setCurrentProjectPath(null);
       setStatus('已新建场景');
     }

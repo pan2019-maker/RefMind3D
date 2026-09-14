@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { memo, useEffect, useRef, useState } from 'react';
 import { convertFileSrc } from '@tauri-apps/api/core';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
@@ -77,7 +77,7 @@ function modelFormatFromPath(path: string, explicitFormat?: string) {
   return path.split('?')[0].split('#')[0].split('.').pop()?.toLowerCase();
 }
 
-export function ModelViewer({ modelPath, modelFormat, compact = false }: ModelViewerProps) {
+export const ModelViewer = memo(function ModelViewer({ modelPath, modelFormat, compact = false }: ModelViewerProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const cleanupRef = useRef<(() => void) | null>(null);
   const [status, setStatus] = useState('准备加载模型');
@@ -320,4 +320,4 @@ export function ModelViewer({ modelPath, modelFormat, compact = false }: ModelVi
       {compact && <span className="compact-status">{status}</span>}
     </div>
   );
-}
+});

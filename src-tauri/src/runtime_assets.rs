@@ -137,6 +137,11 @@ pub fn register_file_resource(
     resource_url(asset_id, field)
 }
 
+pub fn remove_resource_fields(asset_id: &str, field_prefix: &str) {
+    let key_prefix = format!("{asset_id}::{field_prefix}");
+    resources().lock().unwrap().retain(|key, _| !key.starts_with(&key_prefix));
+}
+
 pub fn resource_source_signature(value: &str) -> Option<(u64, u64)> {
     let (asset_id, field) = parse_resource_url(value)?;
     let resource = resources().lock().ok()?.get(&key(&asset_id, &field)).cloned()?;

@@ -24,3 +24,87 @@ export async function loadNewerRecoveryProject(cacheId: string, projectPath: str
 export async function clearRecoveryProject(cacheId: string): Promise<void> {
   await invoke('clear_recovery_project', { cacheId });
 }
+
+const resourceFields = [
+  'originalPath', 'projectAssetPath', 'previewPath', 'thumbnailPath',
+  'embeddedDataUrl', 'embeddedPreviewDataUrl', 'embeddedThumbnailDataUrl', 'documentMedia'
+] as const;
+
+function projectsInFile(file: RefMindProjectFile): RefMindProject[] {
+  const workspace = file as import('../../shared/types').RefMindWorkspaceFile;
+  return workspace.fileType === 'refmind3d-workspace'
+    ? workspace.canvases.map((canvas) => canvas.project)
+    : [file as RefMindProject];
+}
+
+export function projectAssetIds(file: RefMindProjectFile): Set<string> {
+  return new Set(projectsInFile(file).flatMap((project) => project.assets.map((asset) => asset.id)));
+}
+
+function stripPersistedResources(project: RefMindProject, persistedAssetIds: ReadonlySet<string>): RefMindProject {
+  return {
+    ...project,
+    assets: project.assets.map((asset) => {
+      if (!persistedAssetIds.has(asset.id)) return asset;
+      const lightweight = { ...asset } as Record<string, unknown>;
+      for (const field of resourceFields) delete lightweight[field];
+      return lightweight as unknown as typeof asset;
+    })
+  };
+}
+
+/** Keeps unsaved new assets recoverable without duplicating resources already stored in the project package. */
+export function createLightweightRecoverySnapshot(
+  file: RefMindProjectFile,
+  persistedAssetIds: ReadonlySet<string>
+): RefMindProjectFile {
+  const workspace = file as import('../../shared/types').RefMindWorkspaceFile;
+  if (workspace.fileType === 'refmind3d-workspace') {
+    return {
+      ...workspace,
+      canvases: workspace.canvases.map((canvas) => ({
+        ...canvas,
+        project: stripPersistedResources(canvas.project, persistedAssetIds)
+      }))
+    };
+  }
+  return stripPersistedResources(file as RefMindProject, persistedAssetIds);
+}
+
+function mergeProjectResources(base: RefMindProject, recovered: RefMindProject): RefMindProject {
+  const baseAssets = new Map(base.assets.map((asset) => [asset.id, asset]));
+  return {
+    ...recovered,
+    assets: recovered.assets.map((asset) => {
+      const original = baseAssets.get(asset.id);
+      if (!original) return asset;
+      const merged = { ...asset } as Record<string, unknown>;
+      for (const field of resourceFields) {
+        const value = original[field];
+        if (value !== undefined) merged[field] = value;
+        else delete merged[field];
+      }
+      return merged as unknown as typeof asset;
+    })
+  };
+}
+
+/** Rebinds a lightweight recovery snapshot to resources registered from the saved project. */
+export function mergeRecoveryResources(base: RefMindProjectFile, recovered: RefMindProjectFile): RefMindProjectFile {
+  const baseWorkspace = base as import('../../shared/types').RefMindWorkspaceFile;
+  const recoveredWorkspace = recovered as import('../../shared/types').RefMindWorkspaceFile;
+  if (baseWorkspace.fileType === 'refmind3d-workspace' && recoveredWorkspace.fileType === 'refmind3d-workspace') {
+    const baseCanvases = new Map(baseWorkspace.canvases.map((canvas) => [canvas.id, canvas.project]));
+    return {
+      ...recoveredWorkspace,
+      canvases: recoveredWorkspace.canvases.map((canvas) => {
+        const baseProject = baseCanvases.get(canvas.id);
+        return baseProject ? { ...canvas, project: mergeProjectResources(baseProject, canvas.project) } : canvas;
+      })
+    };
+  }
+  if (baseWorkspace.fileType !== 'refmind3d-workspace' && recoveredWorkspace.fileType !== 'refmind3d-workspace') {
+    return mergeProjectResources(base as RefMindProject, recovered as RefMindProject);
+  }
+  return recovered;
+}

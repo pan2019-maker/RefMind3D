@@ -13,6 +13,7 @@ export interface ImageCacheStatus {
 
 export interface PreparedImageCache {
   previewUrl: string;
+  mediumUrl: string;
   thumbnailUrl: string;
   cacheHit: boolean;
 }

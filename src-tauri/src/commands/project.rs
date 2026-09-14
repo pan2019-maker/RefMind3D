@@ -131,6 +131,10 @@ fn recovery_directory() -> PathBuf {
 }
 
 fn recovery_path(cache_id: &str) -> PathBuf {
+    recovery_directory().join(format!("{}.recovery.json", sanitize_file_name(cache_id)))
+}
+
+fn legacy_recovery_path(cache_id: &str) -> PathBuf {
     recovery_directory().join(format!("{}.refmind3d", sanitize_file_name(cache_id)))
 }
 
@@ -139,27 +143,43 @@ pub async fn save_recovery_project(cache_id: String, project: Value) -> Result<(
     tauri::async_runtime::spawn_blocking(move || {
         let directory = recovery_directory();
         fs::create_dir_all(&directory).map_err(|e| format!("Create recovery directory failed: {e}"))?;
-        save_packed_project(recovery_path(&cache_id).to_string_lossy().to_string(), project)
+        let destination = recovery_path(&cache_id);
+        let temporary = directory.join(format!(".recovery-{}.tmp", Uuid::new_v4()));
+        let bytes = serde_json::to_vec(&project).map_err(|e| format!("Serialize recovery snapshot failed: {e}"))?;
+        let mut file = File::create(&temporary).map_err(|e| format!("Create recovery snapshot failed: {e}"))?;
+        file.write_all(&bytes).map_err(|e| format!("Write recovery snapshot failed: {e}"))?;
+        file.sync_all().map_err(|e| format!("Flush recovery snapshot failed: {e}"))?;
+        replace_file_atomically(&temporary, &destination)?;
+        let _ = fs::remove_file(legacy_recovery_path(&cache_id));
+        Ok(())
     }).await.map_err(|e| format!("Recovery task failed: {e}"))?
 }
 
 #[tauri::command]
 pub async fn load_newer_recovery_project(cache_id: String, project_path: String) -> Result<Option<Value>, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let recovery = recovery_path(&cache_id);
+        let modern = recovery_path(&cache_id);
+        let legacy = legacy_recovery_path(&cache_id);
+        let recovery = if modern.is_file() { modern } else { legacy };
         if !recovery.is_file() { return Ok(None); }
         let recovery_modified = fs::metadata(&recovery).and_then(|value| value.modified()).unwrap_or(UNIX_EPOCH);
         let project_modified = fs::metadata(&project_path).and_then(|value| value.modified()).unwrap_or(UNIX_EPOCH);
         if recovery_modified <= project_modified { return Ok(None); }
-        load_project(recovery.to_string_lossy().to_string(), None).map(Some)
+        if recovery.extension().and_then(|value| value.to_str()) == Some("json") {
+            let bytes = fs::read(&recovery).map_err(|e| format!("Read recovery snapshot failed: {e}"))?;
+            serde_json::from_slice(&bytes).map(Some).map_err(|e| format!("Parse recovery snapshot failed: {e}"))
+        } else {
+            load_project(recovery.to_string_lossy().to_string(), None).map(Some)
+        }
     }).await.map_err(|e| format!("Read recovery task failed: {e}"))?
 }
 
 #[tauri::command]
 pub fn clear_recovery_project(cache_id: String) -> Result<(), String> {
-    let path = recovery_path(&cache_id);
-    if !path.exists() { return Ok(()); }
-    fs::remove_file(path).map_err(|e| format!("Clear recovery project failed: {e}"))
+    for path in [recovery_path(&cache_id), legacy_recovery_path(&cache_id)] {
+        if path.exists() { fs::remove_file(path).map_err(|e| format!("Clear recovery project failed: {e}"))?; }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -285,18 +305,23 @@ fn save_packed_project(path: String, mut project: Value) -> Result<(), String> {
 
     // Write to the same directory first, then replace the destination. A crash
     // or full disk can no longer leave the user's only project half-written.
+    replace_file_atomically(&temporary, &destination)
+}
+
+fn replace_file_atomically(temporary: &Path, destination: &Path) -> Result<(), String> {
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
     let backup = parent.join(format!(".refmind3d-backup-{}.tmp", Uuid::new_v4()));
     let had_destination = destination.exists();
     if had_destination {
-        fs::rename(&destination, &backup).map_err(|e| {
-            let _ = fs::remove_file(&temporary);
-            format!("Prepare existing project for replacement failed: {e}")
+        fs::rename(destination, &backup).map_err(|e| {
+            let _ = fs::remove_file(temporary);
+            format!("Prepare existing file for replacement failed: {e}")
         })?;
     }
-    if let Err(error) = fs::rename(&temporary, &destination) {
-        if had_destination { let _ = fs::rename(&backup, &destination); }
-        let _ = fs::remove_file(&temporary);
-        return Err(format!("Replace project file failed: {error}"));
+    if let Err(error) = fs::rename(temporary, destination) {
+        if had_destination { let _ = fs::rename(&backup, destination); }
+        let _ = fs::remove_file(temporary);
+        return Err(format!("Replace file failed: {error}"));
     }
     if had_destination { let _ = fs::remove_file(backup); }
     Ok(())

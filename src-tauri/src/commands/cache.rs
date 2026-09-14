@@ -35,7 +35,7 @@ pub struct CacheStatus {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct PreparedImageCache { preview_url: String, thumbnail_url: String, cache_hit: bool }
+pub struct PreparedImageCache { preview_url: String, medium_url: String, thumbnail_url: String, cache_hit: bool }
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -44,6 +44,8 @@ struct CacheManifest {
     source_modified_ms: u64,
     source_hash: u64,
     preview_file: String,
+    #[serde(default)]
+    medium_file: Option<String>,
     thumbnail_file: String,
     last_accessed_ms: u64,
 }
@@ -182,13 +184,14 @@ fn prepare_sync(project_id: &str, cache_directory: Option<&str>, asset: &Value) 
     if let Ok(raw) = fs::read(&manifest_path) {
         if let Ok(mut manifest) = serde_json::from_slice::<CacheManifest>(&raw) {
             let preview = dir.join(&manifest.preview_file);
+            let medium = manifest.medium_file.as_ref().map(|file| dir.join(file)).filter(|path| path.is_file());
             let thumb = dir.join(&manifest.thumbnail_file);
             if manifest.source_size == size && manifest.source_modified_ms == modified && manifest.source_hash == hash && preview.is_file() && thumb.is_file() {
                 if now_ms().saturating_sub(manifest.last_accessed_ms) > 3_600_000 {
                     manifest.last_accessed_ms = now_ms();
                     let _ = fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?);
                 }
-                return Ok(register(&asset_id, project_id, &preview, &thumb, &format!("{}-{}-{}", size, modified, hash), true));
+                return Ok(register(&asset_id, project_id, &preview, medium.as_deref(), &thumb, &format!("{}-{}-{}", size, modified, hash), true));
             }
         }
     }
@@ -204,13 +207,15 @@ fn prepare_sync(project_id: &str, cache_directory: Option<&str>, asset: &Value) 
     };
     let image = decode(&bytes, &source.extension)?;
     let preview = dir.join("decoded-preview.png");
+    let medium = dir.join("medium-preview.png");
     let thumb = dir.join("thumbnail.png");
     write_png(&preview, resize(image.clone(), 2400))?;
+    write_png(&medium, resize(image.clone(), 1200))?;
     write_png(&thumb, resize(image, 512))?;
-    let manifest = CacheManifest { source_size: size, source_modified_ms: modified, source_hash: hash, preview_file: "decoded-preview.png".into(), thumbnail_file: "thumbnail.png".into(), last_accessed_ms: now_ms() };
+    let manifest = CacheManifest { source_size: size, source_modified_ms: modified, source_hash: hash, preview_file: "decoded-preview.png".into(), medium_file: Some("medium-preview.png".into()), thumbnail_file: "thumbnail.png".into(), last_accessed_ms: now_ms() };
     fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
     enforce_limit_in_background(&root, DEFAULT_LIMIT_BYTES);
-    Ok(register(&asset_id, project_id, &preview, &thumb, &format!("{}-{}-{}", size, modified, hash), false))
+    Ok(register(&asset_id, project_id, &preview, Some(&medium), &thumb, &format!("{}-{}-{}", size, modified, hash), false))
 }
 
 fn describe_source(asset: &Value) -> anyhow::Result<SourceDescriptor> {
@@ -247,18 +252,42 @@ fn decode(bytes: &[u8], ext: &str) -> anyhow::Result<DynamicImage> {
 }
 fn resize(image: DynamicImage, max: u32) -> DynamicImage { let (w,h) = image.dimensions(); if w.max(h) <= max { image } else { image.thumbnail(max,max) } }
 fn write_png(path: &Path, image: DynamicImage) -> anyhow::Result<()> { let mut out = Cursor::new(Vec::new()); image.write_to(&mut out, ImageFormat::Png)?; fs::write(path, out.into_inner()).with_context(|| format!("写入缓存失败：{}", path.display())) }
-fn register(asset_id: &str, project_id: &str, preview: &Path, thumb: &Path, generation: &str, hit: bool) -> PreparedImageCache {
+fn register(asset_id: &str, project_id: &str, preview: &Path, medium: Option<&Path>, thumb: &Path, generation: &str, hit: bool) -> PreparedImageCache {
     let suffix = safe(project_id);
+    // A regenerated image gets fingerprinted URLs. Drop older registrations for
+    // this project/asset so long sessions do not retain stale cache entries.
+    runtime_assets::remove_resource_fields(asset_id, &format!("cachePreview:{suffix}:"));
+    runtime_assets::remove_resource_fields(asset_id, &format!("cacheMedium:{suffix}:"));
+    runtime_assets::remove_resource_fields(asset_id, &format!("cacheThumbnail:{suffix}:"));
     PreparedImageCache {
         preview_url: runtime_assets::register_file_resource(asset_id, &format!("cachePreview:{suffix}:{generation}"), "decoded-preview.png".into(), "image/png".into(), preview.to_path_buf()),
+        medium_url: runtime_assets::register_file_resource(asset_id, &format!("cacheMedium:{suffix}:{generation}"), "medium-preview.png".into(), "image/png".into(), medium.unwrap_or(preview).to_path_buf()),
         thumbnail_url: runtime_assets::register_file_resource(asset_id, &format!("cacheThumbnail:{suffix}:{generation}"), "thumbnail.png".into(), "image/png".into(), thumb.to_path_buf()), cache_hit: hit
     }
 }
 fn enforce_limit(root: &Path, limit: u64) {
-    let mut files = WalkDir::new(root).into_iter().filter_map(Result::ok).filter(|e| e.file_type().is_file() && e.file_name() != CACHE_MARKER).filter_map(|e| { let m=e.metadata().ok()?; Some((e.path().to_path_buf(),m.len(),m.modified().unwrap_or(UNIX_EPOCH))) }).collect::<Vec<_>>();
-    let mut total: u64 = files.iter().map(|v| v.1).sum();
-    files.sort_by_key(|v| v.2);
-    for (path,size,_) in files { if total <= limit { break; } if fs::remove_file(path).is_ok() { total=total.saturating_sub(size); } }
+    let Ok(entries) = fs::read_dir(root) else { return; };
+    let mut units = entries.filter_map(Result::ok).filter_map(|entry| {
+        let path = entry.path();
+        if path.file_name().and_then(|value| value.to_str()) == Some(CACHE_MARKER) { return None; }
+        let size = if path.is_dir() { dir_size(&path) } else { entry.metadata().ok()?.len() };
+        let last_accessed = if path.is_dir() {
+            fs::read(path.join("manifest.json")).ok()
+                .and_then(|raw| serde_json::from_slice::<CacheManifest>(&raw).ok())
+                .map(|manifest| manifest.last_accessed_ms)
+                .unwrap_or_else(|| newest_modified(&path).and_then(time_ms).unwrap_or(0))
+        } else {
+            entry.metadata().ok()?.modified().ok().and_then(time_ms).unwrap_or(0)
+        };
+        Some((path, size, last_accessed))
+    }).collect::<Vec<_>>();
+    let mut total: u64 = units.iter().map(|unit| unit.1).sum();
+    units.sort_by_key(|unit| unit.2);
+    for (path, size, _) in units {
+        if total <= limit { break; }
+        let removed = if path.is_dir() { fs::remove_dir_all(&path) } else { fs::remove_file(&path) };
+        if removed.is_ok() { total = total.saturating_sub(size); }
+    }
 }
 fn safe(value: &str) -> String { let v: String=value.chars().filter(|c| c.is_ascii_alphanumeric()||*c=='-'||*c=='_').take(96).collect(); if v.is_empty(){"default".into()}else{v} }
 fn bytes_hash(bytes: &[u8]) -> u64 { let mut h=DefaultHasher::new(); bytes.hash(&mut h); h.finish() }
@@ -304,9 +333,37 @@ mod tests {
             "originalPath": source.to_string_lossy()
         });
         assert!(!prepare_sync("project-1", Some(cache.to_string_lossy().as_ref()), &asset).unwrap().cache_hit);
+        assert!(cache.join("asset-1").join("medium-preview.png").is_file());
         assert!(prepare_sync("project-1", Some(cache.to_string_lossy().as_ref()), &asset).unwrap().cache_hit);
         DynamicImage::new_rgba8(96, 80).save(&source).unwrap();
         assert!(!prepare_sync("project-1", Some(cache.to_string_lossy().as_ref()), &asset).unwrap().cache_hit);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cache_limit_removes_complete_oldest_asset_directory() {
+        let root = env::temp_dir().join(format!("refmind3d-cache-limit-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        for (name, accessed) in [("old", 1), ("new", 2)] {
+            let directory = root.join(name);
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join("payload.bin"), vec![0_u8; 100]).unwrap();
+            let manifest = CacheManifest {
+                source_size: 100,
+                source_modified_ms: 1,
+                source_hash: 0,
+                preview_file: "payload.bin".into(),
+                medium_file: None,
+                thumbnail_file: "payload.bin".into(),
+                last_accessed_ms: accessed,
+            };
+            fs::write(directory.join("manifest.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
+        }
+        let newer_size = dir_size(&root.join("new"));
+        enforce_limit(&root, newer_size);
+        assert!(!root.join("old").exists());
+        assert!(root.join("new").is_dir());
+        assert!(root.join("new").join("payload.bin").is_file());
         let _ = fs::remove_dir_all(root);
     }
 }

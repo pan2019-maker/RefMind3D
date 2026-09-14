@@ -1,10 +1,41 @@
-import { useEffect, useRef } from 'react';
+import { forwardRef, memo, useEffect, useImperativeHandle, useRef } from 'react';
 import type { DoodleStroke } from '../../shared/types';
 
 interface ViewState {
   x: number;
   y: number;
   scale: number;
+}
+
+const strokeBoundsCache = new WeakMap<DoodleStroke, { left: number; top: number; right: number; bottom: number }>();
+
+function strokeIsVisible(stroke: DoodleStroke, view: ViewState, width: number, height: number) {
+  let bounds = strokeBoundsCache.get(stroke);
+  if (!bounds) {
+    let minX = Number.POSITIVE_INFINITY;
+    let minY = Number.POSITIVE_INFINITY;
+    let maxX = Number.NEGATIVE_INFINITY;
+    let maxY = Number.NEGATIVE_INFINITY;
+    for (const point of stroke.points) {
+      minX = Math.min(minX, point.x);
+      minY = Math.min(minY, point.y);
+      maxX = Math.max(maxX, point.x);
+      maxY = Math.max(maxY, point.y);
+    }
+    const margin = stroke.width * 4;
+    bounds = {
+      left: minX - margin,
+      top: minY - margin,
+      right: maxX + margin,
+      bottom: maxY + margin
+    };
+    strokeBoundsCache.set(stroke, bounds);
+  }
+  const left = -view.x / view.scale;
+  const top = -view.y / view.scale;
+  const right = left + width / view.scale;
+  const bottom = top + height / view.scale;
+  return bounds.right >= left && bounds.left <= right && bounds.bottom >= top && bounds.top <= bottom;
 }
 
 function drawStroke(ctx: CanvasRenderingContext2D, stroke: DoodleStroke, view: ViewState) {
@@ -84,30 +115,53 @@ function drawStroke(ctx: CanvasRenderingContext2D, stroke: DoodleStroke, view: V
   ctx.stroke();
 }
 
-export function DoodleCanvas({ strokes, activeStroke, view, width, height }: {
+export interface DoodleCanvasHandle {
+  drawActiveStroke: (stroke: DoodleStroke) => void;
+  clearActiveStroke: () => void;
+}
+
+export const DoodleCanvas = memo(forwardRef<DoodleCanvasHandle, {
   strokes: DoodleStroke[];
-  activeStroke: DoodleStroke | null;
   view: ViewState;
   width: number;
   height: number;
-}) {
+}>(function DoodleCanvas({ strokes, view, width, height }, ref) {
   const staticCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const activeCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const renderStateRef = useRef({ view, width, height });
+  renderStateRef.current = { view, width, height };
 
   useEffect(() => {
     const canvas = staticCanvasRef.current;
     if (!canvas) return;
     const ctx = prepareCanvas(canvas, width, height);
     if (!ctx) return;
-    for (const stroke of strokes) drawStroke(ctx, stroke, view);
+    for (const stroke of strokes) {
+      if (strokeIsVisible(stroke, view, width, height)) drawStroke(ctx, stroke, view);
+    }
   }, [height, strokes, view, width]);
 
-  useEffect(() => {
+  const clearActiveCanvas = () => {
     const canvas = activeCanvasRef.current;
     if (!canvas) return;
-    const ctx = prepareCanvas(canvas, width, height);
-    if (ctx && activeStroke) drawStroke(ctx, activeStroke, view);
-  }, [activeStroke, height, view, width]);
+    const state = renderStateRef.current;
+    prepareCanvas(canvas, state.width, state.height);
+  };
+
+  useImperativeHandle(ref, () => ({
+    drawActiveStroke: (stroke) => {
+      const canvas = activeCanvasRef.current;
+      if (!canvas) return;
+      const state = renderStateRef.current;
+      const ctx = prepareCanvas(canvas, state.width, state.height);
+      if (ctx && strokeIsVisible(stroke, state.view, state.width, state.height)) {
+        drawStroke(ctx, stroke, state.view);
+      }
+    },
+    clearActiveStroke: clearActiveCanvas
+  }), []);
+
+  useEffect(clearActiveCanvas, [height, view, width]);
 
   return (
     <>
@@ -115,7 +169,7 @@ export function DoodleCanvas({ strokes, activeStroke, view, width, height }: {
       <canvas ref={activeCanvasRef} className="doodle-layer doodle-layer-active" aria-hidden="true" />
     </>
   );
-}
+}));
 
 function prepareCanvas(canvas: HTMLCanvasElement, width: number, height: number) {
   const ratio = Math.min(2, Math.max(1, window.devicePixelRatio || 1));
