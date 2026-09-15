@@ -78,6 +78,82 @@ struct PackedResourceSource {
     source: ResourceSource,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectVersionInfo {
+    path: String,
+    modified_ms: u64,
+    size_bytes: u64,
+}
+
+#[tauri::command]
+pub fn scan_asset_folder(path: String) -> Result<Vec<String>, String> {
+    let supported: HashSet<&'static str> = [
+        "png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff", "tga", "dds", "hdr", "exr", "avif", "qoi", "psd", "psb",
+        "obj", "fbx", "glb", "gltf", "mp4", "avi", "mov", "mkv", "webm", "m4v", "wmv", "pdf", "txt", "md", "rtf", "doc", "docx", "csv", "tsv", "xls", "xlsx"
+    ].into_iter().collect();
+    let root = PathBuf::from(path);
+    if !root.is_dir() { return Err("监控路径不是可读取的文件夹".to_string()); }
+    let mut paths = walkdir::WalkDir::new(root).follow_links(false).into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .filter_map(|entry| {
+            let ext = entry.path().extension()?.to_str()?.to_ascii_lowercase();
+            supported.contains(ext.as_str()).then(|| entry.path().to_string_lossy().to_string())
+        }).collect::<Vec<_>>();
+    paths.sort_by_key(|path| path.to_lowercase());
+    Ok(paths)
+}
+
+fn version_directory(project_path: &str, cache_id: Option<&str>) -> PathBuf {
+    let identity = cache_id.filter(|value| !value.trim().is_empty()).map(str::to_string).unwrap_or_else(|| {
+        let mut hasher = DefaultHasher::new();
+        project_path.to_lowercase().hash(&mut hasher);
+        format!("{:016x}", hasher.finish())
+    });
+    recovery_directory().join("Versions").join(sanitize_file_name(&identity))
+}
+
+fn snapshot_previous_version(project_path: &str, cache_id: Option<&str>) {
+    let source = Path::new(project_path);
+    if !source.is_file() { return; }
+    let directory = version_directory(project_path, cache_id);
+    if fs::create_dir_all(&directory).is_err() { return; }
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map(|value| value.as_millis()).unwrap_or(0);
+    let target = directory.join(format!("{stamp}.refmind3d"));
+    if fs::copy(source, target).is_err() { return; }
+    let mut versions = fs::read_dir(&directory).ok().into_iter().flatten().filter_map(Result::ok)
+        .filter(|entry| entry.path().is_file()).collect::<Vec<_>>();
+    versions.sort_by_key(|entry| entry.metadata().and_then(|meta| meta.modified()).unwrap_or(UNIX_EPOCH));
+    let remove_count = versions.len().saturating_sub(12);
+    for entry in versions.into_iter().take(remove_count) { let _ = fs::remove_file(entry.path()); }
+}
+
+#[tauri::command]
+pub fn list_project_versions(project_path: String, cache_id: Option<String>) -> Result<Vec<ProjectVersionInfo>, String> {
+    let directory = version_directory(&project_path, cache_id.as_deref());
+    if !directory.exists() { return Ok(Vec::new()); }
+    let mut versions = fs::read_dir(directory).map_err(|e| format!("读取版本历史失败: {e}"))?
+        .filter_map(Result::ok).filter_map(|entry| {
+            let meta = entry.metadata().ok()?;
+            let modified_ms = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_millis() as u64;
+            Some(ProjectVersionInfo { path: entry.path().to_string_lossy().to_string(), modified_ms, size_bytes: meta.len() })
+        }).collect::<Vec<_>>();
+    versions.sort_by_key(|item| std::cmp::Reverse(item.modified_ms));
+    Ok(versions)
+}
+
+#[tauri::command]
+pub fn restore_project_version(project_path: String, version_path: String) -> Result<(), String> {
+    let source = PathBuf::from(version_path);
+    if !source.is_file() { return Err("所选历史版本不存在".to_string()); }
+    let destination = PathBuf::from(project_path);
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    let temporary = parent.join(format!(".refmind3d-restore-{}.tmp", Uuid::new_v4()));
+    fs::copy(&source, &temporary).map_err(|e| format!("复制历史版本失败: {e}"))?;
+    replace_file_atomically(&temporary, &destination)
+}
+
 struct PathResource {
     asset_id: String,
     field: String,
@@ -300,6 +376,7 @@ pub fn load_project_data_url(data_url: String, name_hint: Option<String>) -> Res
 }
 
 fn save_packed_project(path: String, mut project: Value) -> Result<(), String> {
+    let cache_id = project.get("cacheId").and_then(Value::as_str).map(str::to_string);
     let sources = collect_packed_resources(&mut project)?;
     write_index_backup(&path, &project);
     let mut canvas_payloads: Vec<(PackedCanvas, Value)> = Vec::new();
@@ -387,6 +464,7 @@ fn save_packed_project(path: String, mut project: Value) -> Result<(), String> {
 
     // Write to the same directory first, then replace the destination. A crash
     // or full disk can no longer leave the user's only project half-written.
+    snapshot_previous_version(&path, cache_id.as_deref());
     replace_file_atomically(&temporary, &destination)
 }
 

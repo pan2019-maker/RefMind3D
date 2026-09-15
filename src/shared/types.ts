@@ -32,6 +32,8 @@ export interface AssetRecord {
   storageMode?: 'embedded' | 'linked';
   /** Linked files refresh their decoded cache when size or modification time changes. */
   autoRefresh?: boolean;
+  /** User-defined labels shared by every node that references this asset. */
+  tags?: string[];
 }
 
 export interface DocumentMedia {
@@ -166,6 +168,9 @@ export interface CanvasNode {
   grayscale?: boolean;
   flipX?: boolean;
   flipY?: boolean;
+  lockAspectRatio?: boolean;
+  /** Searchable labels local to this node. */
+  tags?: string[];
   /** Non-destructive image framing controls. The node rectangle is the crop frame. */
   cropEnabled?: boolean;
   imageScale?: number;
@@ -201,6 +206,8 @@ export interface RefMindProject {
   version: 1;
   cacheId?: string;
   cacheDirectory?: string;
+  /** Folders watched for newly added supported assets. */
+  sourceFolders?: string[];
   name: string;
   rootPath?: string;
   assets: AssetRecord[];

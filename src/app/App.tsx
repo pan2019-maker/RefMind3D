@@ -10,6 +10,7 @@ import { InspectorPanel } from '../components/InspectorPanel';
 import { HierarchyPanel } from '../components/HierarchyPanel';
 import { PerformanceDiagnostics } from '../components/PerformanceDiagnostics';
 import { ProjectHealthPanel } from '../components/ProjectHealthPanel';
+import { WorkspaceSearch } from '../components/WorkspaceSearch';
 import { CanvasView } from '../features/canvas/CanvasView';
 import { documentExtensions, imageExtensions, importFileDataCandidatesToProject, importImageCandidatesToProject, importPathsToProject, modelExtensions, videoExtensions, type FileDataImportCandidate, type ImageImportCandidate, type ImportLayoutDirection } from '../features/assets/importController';
 import { exportEditableDocumentAsset, importClipboardImageDataUrl } from '../features/assets/assetImport';
@@ -82,6 +83,7 @@ const WINDOW_OPACITY_STORAGE_KEY = 'refmind3d.window-opacity';
 const RECENT_PROJECTS_STORAGE_KEY = 'refmind3d.recent-projects';
 const RECOVERY_HISTORY_STORAGE_KEY = 'refmind3d.recovery-history';
 interface RecoveryHistoryItem { cacheId: string; projectPath: string; name: string; savedAt: string }
+interface ProjectVersionInfo { path: string; modifiedMs: number; sizeBytes: number }
 
 function readRecentProjects(): string[] {
   try { return JSON.parse(localStorage.getItem(RECENT_PROJECTS_STORAGE_KEY) || '[]').filter((item: unknown) => typeof item === 'string').slice(0, 10); }
@@ -141,6 +143,7 @@ interface AppSettings {
   slideshowIntervalSeconds: number;
   slideshowOrder: 'hierarchy' | 'shuffle' | 'random';
   alignmentPadding: number;
+  colorManagement: 'auto' | 'srgb' | 'display-p3';
 }
 
 type MenuAction = () => void | boolean | Promise<void | boolean>;
@@ -350,7 +353,8 @@ const defaultSettings: AppSettings = {
   periodicSaveMinutes: 5,
   slideshowIntervalSeconds: 10,
   slideshowOrder: 'hierarchy',
-  alignmentPadding: 24
+  alignmentPadding: 24,
+  colorManagement: 'auto'
 };
 
 function readSettings(): AppSettings {
@@ -916,6 +920,8 @@ export function App() {
     fitSelectedImagesToNaturalSize,
     undoLastDoodle,
     clearDoodles,
+    updateSourceFolders,
+    mergeDuplicateAssets,
     history,
     future,
     clipboardNodes
@@ -925,6 +931,7 @@ export function App() {
   const [saveNotice, setSaveNotice] = useState<string | null>(null);
   const [alwaysOnTop, setAlwaysOnTop] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
+  const [referenceMode, setReferenceMode] = useState(false);
   const [windowOpacity, setWindowOpacity] = useState(readWindowOpacity);
   const [opacityPanelOpen, setOpacityPanelOpen] = useState(false);
   const [settings, setSettings] = useState<AppSettings>(() => readSettings());
@@ -974,6 +981,9 @@ export function App() {
     }
   }, [contextMenu]);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [workspaceSearchOpen, setWorkspaceSearchOpen] = useState(false);
+  const [projectVersions, setProjectVersions] = useState<ProjectVersionInfo[]>([]);
+  const sourceFolderScanBusyRef = useRef(false);
   const [exportCenterOpen, setExportCenterOpen] = useState(false);
   useEffect(() => {
     if (currentProjectPath) setRecentProjects(persistRecentProject(currentProjectPath));
@@ -1536,6 +1546,13 @@ export function App() {
     showProjectSavedNotice(path);
   };
 
+  const openWorkspaceSearchHit = async ({ canvasId, nodeId }: { canvasId: string; nodeId: string }) => {
+    if (canvasId !== activeCanvasId) await switchCanvas(canvasId);
+    useProjectStore.getState().selectNode(nodeId);
+    dispatchFocusNodeIds([nodeId]);
+    setWorkspaceSearchOpen(false);
+  };
+
   // Manual, periodic and close-triggered saves share one queue. Requests are
   // committed in order, so a slow older write cannot finish after a newer one.
   const saveWorkspaceToPath = (path: string) => {
@@ -1619,6 +1636,44 @@ export function App() {
     }, 45_000);
     return () => window.clearTimeout(timer);
   }, [activeCanvasId, canvases, currentProjectPath, currentWorkspaceSignature, hasUnsavedChanges, project, workspaceCacheDirectory, workspaceCacheId]);
+
+  useEffect(() => {
+    if (!settingsOpen || !currentProjectPath) { setProjectVersions([]); return; }
+    void invoke<ProjectVersionInfo[]>('list_project_versions', { projectPath: currentProjectPath, cacheId: workspaceCacheId })
+      .then(setProjectVersions).catch((error) => console.warn('读取工程版本历史失败', error));
+  }, [settingsOpen, currentProjectPath, workspaceCacheId, savedWorkspaceSignature]);
+
+  useEffect(() => {
+    if (!currentProjectPath || !(project.sourceFolders || []).length) return;
+    let disposed = false;
+    const scan = async () => {
+      if (sourceFolderScanBusyRef.current) return;
+      sourceFolderScanBusyRef.current = true;
+      try {
+        const batches = await Promise.all((project.sourceFolders || []).map((folder) => invoke<string[]>('scan_asset_folder', { path: folder })));
+        if (disposed) return;
+        const known = new Set(useProjectStore.getState().project.assets.flatMap((asset) => [asset.originalPath, asset.projectAssetPath]).filter(Boolean).map((path) => path.toLowerCase()));
+        const added = [...new Set(batches.flat())].filter((path) => !known.has(path.toLowerCase()));
+        if (added.length) {
+          const result = await importPathsToProject(added, lastCanvasPointRef.current, settings.importLayoutDirection);
+          setStatus(`监控文件夹自动导入 ${result.imported} 个新资源`);
+        }
+      } catch (error) {
+        if (!disposed) setStatus(`监控文件夹读取失败：${String(error)}`);
+      } finally { sourceFolderScanBusyRef.current = false; }
+    };
+    void scan();
+    const timer = window.setInterval(() => void scan(), 15_000);
+    return () => { disposed = true; window.clearInterval(timer); };
+  }, [currentProjectPath, project.sourceFolders, settings.importLayoutDirection]);
+
+  const restoreProjectVersion = async (version: ProjectVersionInfo) => {
+    if (!currentProjectPath || !confirm(`恢复 ${new Date(version.modifiedMs).toLocaleString()} 的工程版本？当前文件会先在下一次保存时进入时间线。`)) return;
+    await invoke('restore_project_version', { projectPath: currentProjectPath, versionPath: version.path });
+    await loadProjectFromPath(currentProjectPath);
+    setSettingsOpen(false);
+    setStatus('历史版本已恢复');
+  };
 
   const loadProjectFromPath = async (path: string) => {
     let original = await loadProjectIndex(path);
@@ -3009,6 +3064,11 @@ export function App() {
         void toggleFullscreen();
         return;
       }
+      if ((event.ctrlKey || event.metaKey) && event.shiftKey && !event.altKey && event.key.toLowerCase() === 'f') {
+        prevent();
+        setReferenceMode((value) => !value);
+        return;
+      }
       if (isEditableElement(event.target)) return;
       // Undo and redo are core canvas commands. Keep these standard shortcuts
       // available even if an old settings file contains a custom shortcut map.
@@ -3035,6 +3095,11 @@ export function App() {
           deleteSelected();
           setStatus('已删除选中节点');
         }
+        return;
+      }
+      if ((event.ctrlKey || event.metaKey) && event.shiftKey && !event.altKey && event.key.toLowerCase() === 'p') {
+        prevent();
+        setWorkspaceSearchOpen(true);
         return;
       }
       if (matchesShortcut(event, settings.shortcuts.help)) { prevent(); showHelp(); return; }
@@ -3170,7 +3235,7 @@ export function App() {
 
   return (
     <div
-      className={`app-shell pureref-shell theme-${settings.theme} ${canvasSwitching ? 'canvas-transition-active' : ''} ${fullscreen ? 'fullscreen-canvas' : ''}`}
+      className={`app-shell pureref-shell theme-${settings.theme} color-${settings.colorManagement} ${canvasSwitching ? 'canvas-transition-active' : ''} ${fullscreen ? 'fullscreen-canvas' : ''} ${referenceMode ? 'reference-mode' : ''}`}
       onContextMenu={(event) => {
         event.preventDefault();
         if (event.altKey) return;
@@ -3278,6 +3343,7 @@ export function App() {
             <button className={project.canvasLocked ? 'active' : ''} onClick={() => updateProjectOptions({ canvasLocked: !project.canvasLocked })}>{project.canvasLocked ? '解除画布锁定' : '锁定画布内容'}</button>
             <button className={project.canvasGrayscale ? 'active' : ''} onClick={() => updateProjectOptions({ canvasGrayscale: !project.canvasGrayscale })}>{project.canvasGrayscale ? '恢复画布彩色' : '画布灰度检查'}</button>
             <button onClick={() => { setPresentationSeed(Date.now()); setPresentationMode(true); navigatePresentation(1); setOpacityPanelOpen(false); }}>连续浏览 / 演示</button>
+            <button className={referenceMode ? 'active' : ''} onClick={() => { setReferenceMode((value) => !value); setOpacityPanelOpen(false); }}>{referenceMode ? '退出纯参考模式' : '纯参考模式'}</button>
             <button onClick={() => { setExportCenterOpen(true); setOpacityPanelOpen(false); }}>打开导出中心</button>
             <button disabled={selectedNodeIds.length < 2} onClick={arrangeSelectedByName}>按名称智能排列</button>
             <button disabled={selectedNodeIds.length < 2} onClick={normalizeSelectedArea}>统一视觉面积</button>
@@ -3579,6 +3645,9 @@ export function App() {
               <button onClick={runMenuAction(() => { void toggleFullscreen(); closeMenu(); })}>
                 <span>{fullscreen ? '✓ ' : ''}全屏画布</span><span className="menu-shortcut">Ctrl+F</span>
               </button>
+              <button onClick={runMenuAction(() => { setReferenceMode((value) => !value); closeMenu(); })}>
+                <span>{referenceMode ? '✓ ' : ''}纯参考模式</span><span className="menu-shortcut">Ctrl+Shift+F</span>
+              </button>
               <button onClick={runMenuAction(() => { setOpacityPanelOpen(true); closeMenu(); })}>
                 <span>画布透明度</span><span className="menu-shortcut">{windowOpacity}%</span>
               </button>
@@ -3767,7 +3836,18 @@ export function App() {
                 <label>排列间距<input type="number" min="0" max="200" value={settings.alignmentPadding} onChange={(event) => updateSettings({ alignmentPadding: Math.max(0, Math.min(200, Number(event.currentTarget.value) || 0)) })} /></label>
                 <label>演示间隔（秒）<input type="number" min="1" max="600" value={settings.slideshowIntervalSeconds} onChange={(event) => updateSettings({ slideshowIntervalSeconds: Math.max(1, Math.min(600, Number(event.currentTarget.value) || 10)) })} /></label>
                 <label>演示顺序<select value={settings.slideshowOrder} onChange={(event) => updateSettings({ slideshowOrder: event.currentTarget.value as AppSettings['slideshowOrder'] })}><option value="hierarchy">层级顺序</option><option value="shuffle">随机但不重复</option><option value="random">完全随机</option></select></label>
+                <label>色彩管理<select value={settings.colorManagement} onChange={(event) => updateSettings({ colorManagement: event.currentTarget.value as AppSettings['colorManagement'] })}><option value="auto">自动（跟随显示器）</option><option value="srgb">sRGB 校样</option><option value="display-p3">Display-P3 优先</option></select></label>
               </div>
+            </section>
+            <section className="workflow-settings">
+              <div className="settings-section-title"><strong>检索与资源治理</strong><button onClick={() => { setSettingsOpen(false); setWorkspaceSearchOpen(true); }}>全工程搜索</button></div>
+              <p className="muted">Ctrl+Shift+P 搜索全部画布的标题、正文、文件名、路径与标签。</p>
+              <div className="cache-actions"><button onClick={() => { const count = mergeDuplicateAssets(); setStatus(count ? `已合并 ${count} 个精确重复资源` : '未发现可安全合并的精确重复资源'); }}>合并精确重复资源</button></div>
+              <p className="muted">只合并内容哈希一致或同一路径且大小一致的资源，节点引用会自动迁移，不使用容易误判的文件名相似度。</p>
+            </section>
+            <section className="workflow-settings">
+              <div className="settings-section-title"><strong>工程监控文件夹</strong><button onClick={async () => { const folder = await open({ directory: true, multiple: false, title: '选择当前工程的资源监控文件夹' }); if (typeof folder === 'string') updateSourceFolders([...(project.sourceFolders || []), folder]); }}>添加文件夹</button></div>
+              {(project.sourceFolders || []).length === 0 ? <p className="muted">尚未添加。添加后将定期发现新文件并导入当前画布。</p> : (project.sourceFolders || []).map((folder) => <div className="source-folder-row" key={folder}><code>{folder}</code><button onClick={() => updateSourceFolders((project.sourceFolders || []).filter((item) => item !== folder))}>移除</button></div>)}
             </section>
             <section className="storage-settings">
               <div className="settings-section-title">
@@ -3801,6 +3881,10 @@ export function App() {
               <div className="settings-section-title"><strong>恢复中心</strong><button onClick={() => { localStorage.removeItem(RECOVERY_HISTORY_STORAGE_KEY); setRecoveryHistory([]); }}>清空记录</button></div>
               {recoveryHistory.length === 0 ? <p className="muted">当前没有待恢复快照记录。</p> : recoveryHistory.map((item) => <div key={item.cacheId} className="recovery-item"><b>{item.name}</b><span>{new Date(item.savedAt).toLocaleString()}</span><code>{item.projectPath || '尚未保存的工程'}</code></div>)}
               <p className="muted">打开对应工程时会自动检测更新的快照，并提供恢复选择。</p>
+            </section>
+            <section className="recovery-center">
+              <div className="settings-section-title"><strong>工程版本时间线</strong><span>{currentProjectPath ? `最近 ${projectVersions.length} 个保存版本` : '请先保存工程'}</span></div>
+              {projectVersions.length === 0 ? <p className="muted">每次覆盖保存前会自动保留旧版本，最多 12 个，关闭软件后仍可恢复。</p> : projectVersions.map((version) => <div className="recovery-item" key={version.path}><b>{new Date(version.modifiedMs).toLocaleString()}</b><span>{(version.sizeBytes / 1024 / 1024).toFixed(1)} MB</span><button onClick={() => void restoreProjectVersion(version)}>恢复</button></div>)}
             </section>
             <PerformanceDiagnostics />
             <ProjectHealthPanel project={project} />
@@ -3979,6 +4063,8 @@ export function App() {
           </section>
         </div>
       )}
+
+      {workspaceSearchOpen && <WorkspaceSearch canvases={canvases.map((canvas) => ({ id: canvas.id, name: canvas.name, project: canvas.id === activeCanvasId ? project : canvasProject(canvas) }))} onClose={() => setWorkspaceSearchOpen(false)} onOpenHit={(hit) => void openWorkspaceSearchHit(hit)} />}
     </div>
   );
 }

@@ -11,7 +11,7 @@ function numberValue(value: string, fallback: number) {
 
 function proportionalSize(node: CanvasNode, next: number, axis: 'width' | 'height') {
   const ratio = node.height > 0 ? node.width / node.height : 1;
-  if (node.cropEnabled) return axis === 'width' ? { width: Math.max(20, next) } : { height: Math.max(20, next) };
+  if (node.cropEnabled || node.lockAspectRatio === false) return axis === 'width' ? { width: Math.max(20, next) } : { height: Math.max(20, next) };
   if (axis === 'width') {
     const width = Math.max(20, next);
     return { width, height: Math.max(20, Math.round(width / ratio)) };
@@ -34,6 +34,18 @@ export function InspectorPanel() {
   const asset = useMemo(() => selected?.assetId ? project.assets.find((item) => item.id === selected.assetId) : undefined, [project.assets, selected]);
   const [linkedMissing, setLinkedMissing] = useState(false);
   const patchSelected = (patch: Partial<CanvasNode>) => updateNodes(selectedNodes.map((node) => ({ id: node.id, patch })), true, false);
+  const distributeSelected = (axis: 'x' | 'y') => {
+    if (selectedNodes.length < 3) return;
+    const sorted = selectedNodes.slice().sort((a, b) => axis === 'x' ? a.x - b.x : a.y - b.y);
+    const first = sorted[0];
+    const last = sorted[sorted.length - 1];
+    const firstCenter = axis === 'x' ? first.x + first.width / 2 : first.y + first.height / 2;
+    const lastCenter = axis === 'x' ? last.x + last.width / 2 : last.y + last.height / 2;
+    const step = (lastCenter - firstCenter) / (sorted.length - 1);
+    updateNodes(sorted.slice(1, -1).map((node, index) => ({ id: node.id, patch: axis === 'x'
+      ? { x: firstCenter + step * (index + 1) - node.width / 2 }
+      : { y: firstCenter + step * (index + 1) - node.height / 2 } })), true, false);
+  };
 
   useEffect(() => {
     let active = true;
@@ -73,13 +85,18 @@ export function InspectorPanel() {
       <div className="panel-heading"><h2>属性</h2><span>{selectedNodes.length > 1 ? `${selectedNodes.length} 个节点` : selected.type}</span></div>
       <div className="property-list">
         {selectedNodes.length === 1 && <label>名称<input value={selected.title} onChange={(event) => updateNode(selected.id, { title: event.currentTarget.value }, true)} /></label>}
+        {selectedNodes.length === 1 && <label>节点标签<input value={(selected.tags || []).join(', ')} placeholder="灵感, 材质, 待处理" onChange={(event) => updateNode(selected.id, { tags: event.currentTarget.value.split(/[,，]/).map((tag) => tag.trim()).filter(Boolean) }, true)} /></label>}
         <div className="property-two-column">
           <label>X<input type="number" value={Math.round(selected.x)} onChange={(event) => updateNode(selected.id, { x: numberValue(event.currentTarget.value, selected.x) }, true)} /></label>
           <label>Y<input type="number" value={Math.round(selected.y)} onChange={(event) => updateNode(selected.id, { y: numberValue(event.currentTarget.value, selected.y) }, true)} /></label>
           <label>宽<input type="number" value={Math.round(selected.width)} onChange={(event) => updateNode(selected.id, proportionalSize(selected, numberValue(event.currentTarget.value, selected.width), 'width'), true)} /></label>
           <label>高<input type="number" value={Math.round(selected.height)} onChange={(event) => updateNode(selected.id, proportionalSize(selected, numberValue(event.currentTarget.value, selected.height), 'height'), true)} /></label>
         </div>
-        <label>旋转<input type="number" value={Math.round(selected.rotation)} onChange={(event) => patchSelected({ rotation: numberValue(event.currentTarget.value, selected.rotation) })} /></label>
+        <label>旋转<input type="number" step="15" value={Math.round(selected.rotation)} onChange={(event) => patchSelected({ rotation: numberValue(event.currentTarget.value, selected.rotation) })} /></label>
+        <div className="property-action-grid">
+          <button onClick={() => patchSelected({ rotation: -90 })}>−90°</button><button onClick={() => patchSelected({ rotation: 0 })}>归零</button><button onClick={() => patchSelected({ rotation: 90 })}>+90°</button>
+        </div>
+        {selectedNodes.length >= 3 && <div className="property-action-grid"><button onClick={() => distributeSelected('x')}>水平等间距</button><button onClick={() => distributeSelected('y')}>垂直等间距</button></div>}
         <label>透明度 <output>{Math.round((selected.opacity ?? 1) * 100)}%</output><input type="range" min="5" max="100" value={Math.round((selected.opacity ?? 1) * 100)} onChange={(event) => patchSelected({ opacity: Number(event.currentTarget.value) / 100 })} /></label>
         <div className="property-action-grid">
           <button className={selected.locked ? 'active' : ''} onClick={() => patchSelected({ locked: !selected.locked })}>{selected.locked ? '解除锁定' : '锁定节点'}</button>
@@ -89,6 +106,7 @@ export function InspectorPanel() {
 
         {selected.type === 'image' && <section className="property-section">
           <h3>图片无损编辑</h3>
+          <label className="inline-check"><input type="checkbox" checked={selected.lockAspectRatio !== false} onChange={(event) => patchSelected({ lockAspectRatio: event.currentTarget.checked })} />锁定宽高比</label>
           <div className="property-action-grid">
             <button className={selected.cropEnabled ? 'active' : ''} onClick={() => patchSelected({ cropEnabled: !selected.cropEnabled })}>裁切画框</button>
             <button onClick={() => patchSelected({ flipX: !selected.flipX })}>水平镜像</button>
@@ -117,6 +135,7 @@ export function InspectorPanel() {
         <div className="panel-heading"><h3>资源</h3><span>{asset.format.toUpperCase()}</span></div>
         <p>{(asset.fileSize / 1024 / 1024).toFixed(2)} MB</p>
         <p className="path-text">{asset.originalPath || asset.projectAssetPath}</p>
+        <label>资源标签<input value={(asset.tags || []).join(', ')} placeholder="人物, 配色, 建筑" onChange={(event) => updateAsset(asset.id, { tags: event.currentTarget.value.split(/[,，]/).map((tag) => tag.trim()).filter(Boolean) })} /></label>
         {linkedMissing && <p className="asset-missing-warning">链接文件已失联，请重新定位。</p>}
         <div className="segmented-control">
           <button className={(asset.storageMode || 'embedded') === 'embedded' ? 'active' : ''} onClick={() => updateAsset(asset.id, { storageMode: 'embedded' })}>嵌入工程</button>

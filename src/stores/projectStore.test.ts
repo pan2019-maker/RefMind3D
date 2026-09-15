@@ -68,4 +68,15 @@ describe('project history', () => {
     useProjectStore.getState().undo();
     expect(useProjectStore.getState().project.canvasLocked).toBe(false);
   });
+
+  it('merges exact duplicate assets and migrates every node reference', () => {
+    const first: AssetRecord = { id: 'asset-1', kind: 'image', name: 'one.png', originalPath: 'D:\\one.png', projectAssetPath: '', fileSize: 42, format: 'png', importedAt: '', contentHash: 'same' };
+    const second: AssetRecord = { ...first, id: 'asset-2', name: 'copy.png', originalPath: 'D:\\copy.png' };
+    useProjectStore.getState().setProject({ ...emptyProject(), assets: [first, second], nodes: [{ ...node(), assetId: second.id }] });
+    expect(useProjectStore.getState().mergeDuplicateAssets()).toBe(1);
+    expect(useProjectStore.getState().project.assets.map((asset) => asset.id)).toEqual(['asset-1']);
+    expect(useProjectStore.getState().project.nodes[0].assetId).toBe('asset-1');
+    useProjectStore.getState().undo();
+    expect(useProjectStore.getState().project.assets).toHaveLength(2);
+  });
 });

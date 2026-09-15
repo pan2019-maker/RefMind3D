@@ -1,6 +1,6 @@
 [package]
 name = "refmind3d"
-version = "1.8.0"
+version = "1.9.0"
 description = "High-performance image and 3D reference board"
 authors = ["RefMind3D Team"]
 edition = "2021"

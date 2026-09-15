@@ -14,6 +14,8 @@ import { performanceMetricsSnapshot, recordImageCacheResult, recordSourceRefresh
 import { adaptiveImageConcurrency, adaptiveResourceBudget } from '../performance/resourceBudget';
 import { FREE_TEXT_FONT_FAMILY, FREE_TEXT_PLACEHOLDER, freeTextNodeSize } from '../../shared/freeText';
 import { DoodleCanvas, type DoodleCanvasHandle } from './DoodleCanvas';
+import { CanvasNavigator } from './CanvasNavigator';
+import { GpuImageLayer, type GpuImageItem } from './GpuImageLayer';
 import { SpatialGridIndex } from './spatialIndex';
 import { snapMovingBounds, type SnapGuide } from './snapGuides';
 import { screenToWorld, stableWorldOrigin, worldToScreen } from './viewTransform';
@@ -752,6 +754,7 @@ export function CanvasView({
   const [resourceBudget, setResourceBudget] = useState(() => adaptiveResourceBudget(project.nodes.length, (navigator as Navigator & { deviceMemory?: number }).deviceMemory || 8));
   const [qualityTier, setQualityTier] = useState<'full' | 'balanced' | 'responsive'>('full');
   const [snapGuides, setSnapGuides] = useState<SnapGuide[]>([]);
+  const [gpuSupported, setGpuSupported] = useState(true);
   const [drag, setDrag] = useState<{
     ids?: string[];
     startX: number;
@@ -927,6 +930,7 @@ export function CanvasView({
     else nodeSpatialIndexRef.current.sync(project.nodes);
     return nodeSpatialIndexRef.current;
   }, [project.nodes]);
+  const worldOrigin = useMemo(() => stableWorldOrigin(view, viewportSize), [view, viewportSize]);
 
   const linksByNodeId = useMemo(() => {
     const map = new Map<string, typeof project.links>();
@@ -1041,6 +1045,18 @@ export function CanvasView({
   const liveModelIds = useMemo(() => closestNodeIds(visibleNodes.filter((node) => node.type === 'model'), viewportWorldCenter, resourceBudget.models), [resourceBudget.models, viewportWorldCenter, visibleNodes]);
   const liveVideoIds = useMemo(() => closestNodeIds(visibleNodes.filter((node) => node.type === 'video'), viewportWorldCenter, resourceBudget.videos), [resourceBudget.videos, viewportWorldCenter, visibleNodes]);
   const fullResolutionImageIds = useMemo(() => closestNodeIds(visibleNodes.filter((node) => node.type === 'image'), viewportWorldCenter, resourceBudget.fullImages), [resourceBudget.fullImages, viewportWorldCenter, visibleNodes]);
+  const gpuImageItems = useMemo(() => {
+    const images = renderedNodes.filter((node) => node.type === 'image');
+    if (!gpuSupported || images.length < 30 || (view.scale >= 0.32 && project.nodes.length < 2_000)) return [] as GpuImageItem[];
+    return images.flatMap((node) => {
+      const asset = node.assetId ? assetsById.get(node.assetId) : undefined;
+      if (!asset || selectedNodeIdSet.has(node.id) || node.cropEnabled || node.rotation || node.flipX || node.flipY || node.grayscale || project.canvasGrayscale) return [];
+      const screen = worldToScreen(node, view, worldOrigin);
+      return [{ id: node.id, src: assetUrl(asset, true), x: screen.x, y: screen.y, width: node.width * view.scale, height: node.height * view.scale, opacity: node.opacity ?? 1 }];
+    });
+  }, [assetsById, gpuSupported, project.canvasGrayscale, project.nodes.length, renderedNodes, selectedNodeIdSet, view, worldOrigin]);
+  const gpuImageIds = useMemo(() => new Set(gpuImageItems.map((item) => item.id)), [gpuImageItems]);
+  const handleGpuSupport = useCallback((supported: boolean) => setGpuSupported((current) => current === supported ? current : supported), []);
   const predictedPrefetchIds = useMemo(() => {
     const direction = panDirectionRef.current;
     if (direction.x === 0 && direction.y === 0) return new Set<string>();
@@ -1124,8 +1140,6 @@ export function CanvasView({
     }
     return [...links.values()];
   }, [linksByNodeId, renderedNodes]);
-
-  const worldOrigin = useMemo(() => stableWorldOrigin(view, viewportSize), [view, viewportSize]);
 
   useEffect(() => {
     if (selectedLinkId && !project.links.some((link) => link.id === selectedLinkId)) {
@@ -2410,6 +2424,7 @@ export function CanvasView({
         className="canvas-world screen-space-renderer"
       >
         {showGrid && !lowZoom && <div className="canvas-grid" />}
+        {gpuImageItems.length > 0 && <GpuImageLayer items={gpuImageItems} width={viewportSize.width} height={viewportSize.height} onSupportChange={handleGpuSupport} />}
         <svg className="mindmap-layer" width={viewportSize.width} height={viewportSize.height} viewBox={`0 0 ${viewportSize.width} ${viewportSize.height}`}>
           {renderedLinks.map((link) => {
             const fromNode = nodesById.get(link.fromNodeId);
@@ -2473,7 +2488,7 @@ export function CanvasView({
               <div
                 key={node.id}
                 data-node-id={node.id}
-                className={`canvas-node ${node.type}-canvas-node ${selected ? 'selected' : ''} ${editing ? 'editing' : ''} ${lockedByGroup ? 'group-child-locked' : ''} ${groupEditing ? 'group-edit-active' : ''} ${node.locked ? 'node-locked' : ''} ${editing && node.type === 'image' && node.cropEnabled ? 'crop-editing' : ''}`}
+                className={`canvas-node ${node.type}-canvas-node ${gpuImageIds.has(node.id) ? 'gpu-composited' : ''} ${selected ? 'selected' : ''} ${editing ? 'editing' : ''} ${lockedByGroup ? 'group-child-locked' : ''} ${groupEditing ? 'group-edit-active' : ''} ${node.locked ? 'node-locked' : ''} ${editing && node.type === 'image' && node.cropEnabled ? 'crop-editing' : ''}`}
                 style={{
                   left: screenRect.x,
                   top: screenRect.y,
@@ -2515,7 +2530,7 @@ export function CanvasView({
                   }
                 }}
               >
-                {node.type === 'image' && asset && (
+                {node.type === 'image' && asset && !gpuImageIds.has(node.id) && (
                   <CanvasImage
                     asset={asset}
                     node={node}
@@ -2694,6 +2709,13 @@ export function CanvasView({
           height={viewportSize.height}
         />
       </div>
+      <CanvasNavigator
+        key={`navigator-${projectCacheId}-${focusContentKey || 'main'}`}
+        nodes={project.nodes}
+        viewport={{ x: -view.x / view.scale, y: -view.y / view.scale, width: viewportSize.width / view.scale, height: viewportSize.height / view.scale }}
+        storageKey={`refmind3d.named-views.${projectCacheId}.${focusContentKey || 'main'}`}
+        onNavigate={(center) => setView((current) => ({ ...current, x: viewportSize.width / 2 - center.x * current.scale, y: viewportSize.height / 2 - center.y * current.scale }))}
+      />
       {activeGroupId && <div className="group-edit-indicator">组内编辑：双击组后已解锁组内物体，点击空白处退出</div>}
     </div>
   );

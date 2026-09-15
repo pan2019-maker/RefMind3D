@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context};
 use base64::Engine as _;
 use chrono::Utc;
-use image::{DynamicImage, GenericImageView, ImageFormat};
+use image::{DynamicImage, GenericImageView, ImageDecoder, ImageFormat, ImageReader, metadata::Orientation};
 use reqwest::header::{ACCEPT, ACCEPT_LANGUAGE, CONTENT_TYPE, REFERER, USER_AGENT};
 use serde::Serialize;
 use serde_json::Value;
@@ -524,8 +524,11 @@ fn decode_preview(path: &Path, ext: &str) -> anyhow::Result<DynamicImage> {
         let bytes = fs::read(path).with_context(|| "Read PSD/PSB file failed")?;
         return Ok(decode_psd_preview_or_placeholder(&bytes));
     }
-    let img = image::open(path)
+    let mut decoder = ImageReader::open(path)?.with_guessed_format()?.into_decoder()?;
+    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    let mut img = DynamicImage::from_decoder(decoder)
         .with_context(|| format!("Image decode failed for preview: {}", path.display()))?;
+    img.apply_orientation(orientation);
     Ok(limit_preview_size(img))
 }
 
@@ -533,7 +536,10 @@ fn decode_image_bytes_preview(bytes: &[u8], ext: &str) -> anyhow::Result<Dynamic
     if ext == "psd" || ext == "psb" {
         return Ok(decode_psd_preview_or_placeholder(bytes));
     }
-    let img = image::load_from_memory(bytes).map_err(|e| anyhow!("Image decode failed: {e}"))?;
+    let mut decoder = ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format()?.into_decoder()?;
+    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    let mut img = DynamicImage::from_decoder(decoder).map_err(|e| anyhow!("Image decode failed: {e}"))?;
+    img.apply_orientation(orientation);
     Ok(limit_preview_size(img))
 }
 

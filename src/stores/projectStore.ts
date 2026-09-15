@@ -22,6 +22,8 @@ interface ProjectState {
   setProject: (project: RefMindProject) => void;
   setProjectRoot: (rootPath: string) => void;
   updateProjectOptions: (patch: Pick<Partial<RefMindProject>, 'canvasLocked' | 'canvasGrayscale'>) => void;
+  updateSourceFolders: (folders: string[]) => void;
+  mergeDuplicateAssets: () => number;
   newProject: () => void;
   undo: () => void;
   redo: () => void;
@@ -82,9 +84,9 @@ function cloneNodes(nodes: CanvasNode[]): CanvasNode[] {
 // the immutable project root directly and share unchanged assets, document
 // payloads and doodle points instead of serializing the entire project on every
 // edit. Clipboard data still uses cloneProject because it is detached data.
-type PatchField = 'name' | 'rootPath' | 'assets' | 'nodes' | 'links' | 'doodles' | 'canvasLocked' | 'canvasGrayscale';
+type PatchField = 'name' | 'rootPath' | 'assets' | 'nodes' | 'links' | 'doodles' | 'canvasLocked' | 'canvasGrayscale' | 'sourceFolders';
 type ProjectPatch = { fields: PatchField[]; values: Partial<RefMindProject>; updatedAt: string };
-const ALL_PATCH_FIELDS: PatchField[] = ['name', 'rootPath', 'assets', 'nodes', 'links', 'doodles', 'canvasLocked', 'canvasGrayscale'];
+const ALL_PATCH_FIELDS: PatchField[] = ['name', 'rootPath', 'assets', 'nodes', 'links', 'doodles', 'canvasLocked', 'canvasGrayscale', 'sourceFolders'];
 
 function historySnapshot(project: RefMindProject, fields: PatchField[] = ALL_PATCH_FIELDS): ProjectPatch {
   const values: Partial<RefMindProject> = {};
@@ -410,6 +412,43 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     ...withHistory(state, Object.keys(patch) as PatchField[]),
     project: { ...state.project, ...patch, updatedAt: now() }
   })),
+  updateSourceFolders: (folders) => set((state) => ({
+    ...withHistory(state, ['sourceFolders']),
+    project: { ...state.project, sourceFolders: unique(folders), updatedAt: now() }
+  })),
+  mergeDuplicateAssets: () => {
+    let merged = 0;
+    set((state) => {
+      const canonicalByKey = new Map<string, string>();
+      const replacement = new Map<string, string>();
+      for (const asset of state.project.assets) {
+        const key = asset.contentHash
+          ? `hash:${asset.contentHash}`
+          : asset.originalPath
+            ? `path:${asset.originalPath.toLowerCase()}|${asset.fileSize}`
+            : '';
+        if (!key) continue;
+        const canonical = canonicalByKey.get(key);
+        if (canonical) {
+          replacement.set(asset.id, canonical);
+          merged += 1;
+        } else canonicalByKey.set(key, asset.id);
+      }
+      if (!merged) return state;
+      return {
+        ...withHistory(state, ['assets', 'nodes']),
+        project: {
+          ...state.project,
+          assets: state.project.assets.filter((asset) => !replacement.has(asset.id)),
+          nodes: state.project.nodes.map((node) => node.assetId && replacement.has(node.assetId)
+            ? { ...node, assetId: replacement.get(node.assetId) }
+            : node),
+          updatedAt: now()
+        }
+      };
+    });
+    return merged;
+  },
 
   newProject: () => set((state) => ({
     ...withHistory(state),

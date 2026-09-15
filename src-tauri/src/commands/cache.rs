@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context};
 use base64::Engine;
-use image::{DynamicImage, GenericImageView, ImageFormat};
+use image::{DynamicImage, GenericImageView, ImageDecoder, ImageFormat, ImageReader, metadata::Orientation};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
@@ -254,7 +254,13 @@ fn decode(bytes: &[u8], ext: &str) -> anyhow::Result<DynamicImage> {
         let psd = psd::Psd::from_bytes(bytes).map_err(|e| anyhow!("PSD 解码失败：{e}"))?;
         let rgba = image::ImageBuffer::from_raw(psd.width(), psd.height(), psd.rgba()).ok_or_else(|| anyhow!("PSD 像素数据无效"))?;
         Ok(DynamicImage::ImageRgba8(rgba))
-    } else { image::load_from_memory(bytes).map_err(|e| anyhow!("图片解码失败：{e}")) }
+    } else {
+        let mut decoder = ImageReader::new(Cursor::new(bytes)).with_guessed_format()?.into_decoder()?;
+        let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+        let mut image = DynamicImage::from_decoder(decoder)?;
+        image.apply_orientation(orientation);
+        Ok(image)
+    }
 }
 fn resize(image: DynamicImage, max: u32) -> DynamicImage { let (w,h) = image.dimensions(); if w.max(h) <= max { image } else { image.thumbnail(max,max) } }
 fn write_png(path: &Path, image: DynamicImage) -> anyhow::Result<()> { let mut out = Cursor::new(Vec::new()); image.write_to(&mut out, ImageFormat::Png)?; fs::write(path, out.into_inner()).with_context(|| format!("写入缓存失败：{}", path.display())) }
