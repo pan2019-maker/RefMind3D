@@ -751,6 +751,7 @@ export function CanvasView({
   } | null>(null);
   const [drawRect, setDrawRect] = useState<{ startX: number; startY: number; endX: number; endY: number } | null>(null);
   const [editingNodeId, setEditingNodeId] = useState<string | null>(null);
+  const [cropPan, setCropPan] = useState<{ nodeId: string; startX: number; startY: number; originX: number; originY: number } | null>(null);
   const [activeSheetByNode, setActiveSheetByNode] = useState<Record<string, number>>({});
   const [selectedSheetCellByNode, setSelectedSheetCellByNode] = useState<Record<string, { row: number; col: number }>>({});
   const [activeGroupId, setActiveGroupId] = useState<string | null>(null);
@@ -759,6 +760,7 @@ export function CanvasView({
   const [resize, setResize] = useState<{
     nodeId: string;
     handle: ResizeHandle;
+    startPoint: Point;
     startMetric: number;
     center: Point;
     origin: CanvasNode;
@@ -1208,6 +1210,14 @@ export function CanvasView({
     if (!editingNodeId) textEditHistoryRecordedRef.current = false;
   }, [editingNodeId]);
 
+  useEffect(() => {
+    const finishEditing = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && editingNodeId) { setEditingNodeId(null); setCropPan(null); }
+    };
+    window.addEventListener('keydown', finishEditing, true);
+    return () => window.removeEventListener('keydown', finishEditing, true);
+  }, [editingNodeId]);
+
   const worldPoint = (clientX: number, clientY: number) => {
     const rect = viewportRef.current?.getBoundingClientRect();
     const left = rect?.left || 0;
@@ -1439,6 +1449,14 @@ export function CanvasView({
 
   const onWheel = (event: React.WheelEvent) => {
     event.preventDefault();
+    if (editingNodeId) {
+      const cropNode = nodesById.get(editingNodeId);
+      if (cropNode?.type === 'image' && cropNode.cropEnabled) {
+        const factor = Math.exp(-event.deltaY * 0.0015);
+        updateNode(cropNode.id, { imageScale: Math.max(0.1, Math.min(8, (cropNode.imageScale || 1) * factor)) }, true, false);
+        return;
+      }
+    }
     const rect = viewportRef.current?.getBoundingClientRect();
     if (!rect) return;
     const mouseX = event.clientX - rect.left;
@@ -1562,7 +1580,7 @@ export function CanvasView({
       : [];
     interactionHistoryRecordedRef.current = false;
     resizePreviewRef.current = null;
-    setResize({ nodeId: target.id, handle, startMetric, center, origin: { ...target }, childOrigins });
+    setResize({ nodeId: target.id, handle, startPoint, startMetric, center, origin: { ...target }, childOrigins });
   };
 
   const resolveInteractiveNode = (node: CanvasNode) => {
@@ -1577,6 +1595,13 @@ export function CanvasView({
     if (project.canvasLocked || node.locked) {
       event.preventDefault();
       event.stopPropagation();
+      return;
+    }
+    if (event.button === 0 && node.type === 'image' && node.cropEnabled && editingNodeId === node.id) {
+      event.preventDefault();
+      event.stopPropagation();
+      beginHistory();
+      setCropPan({ nodeId: node.id, startX: event.clientX, startY: event.clientY, originX: node.imagePanX || 0, originY: node.imagePanY || 0 });
       return;
     }
     flushZoom();
@@ -1649,6 +1674,14 @@ export function CanvasView({
       return;
     }
     const pointer = rememberPointer(event.clientX, event.clientY);
+    if (cropPan) {
+      const node = nodesById.get(cropPan.nodeId);
+      if (!node) return;
+      const dx = (event.clientX - cropPan.startX) / Math.max(1, node.width * view.scale) * 100;
+      const dy = (event.clientY - cropPan.startY) / Math.max(1, node.height * view.scale) * 100;
+      updateNode(node.id, { imagePanX: Math.max(-100, Math.min(100, cropPan.originX + dx)), imagePanY: Math.max(-100, Math.min(100, cropPan.originY + dy)) }, false, false);
+      return;
+    }
     if (mindDrag) {
       setMindDrag((current) => {
         if (!current) return null;
@@ -1669,6 +1702,32 @@ export function CanvasView({
     }
     if (resize) {
       const current = pointer;
+      if (resize.origin.type === 'image' && resize.origin.cropEnabled) {
+        const dx = current.x - resize.startPoint.x;
+        const dy = current.y - resize.startPoint.y;
+        const patch: Partial<CanvasNode> = {};
+        if (resize.handle.includes('e')) patch.width = Math.max(24, resize.origin.width + dx);
+        if (resize.handle.includes('s')) patch.height = Math.max(24, resize.origin.height + dy);
+        if (resize.handle.includes('w')) {
+          patch.width = Math.max(24, resize.origin.width - dx);
+          patch.x = resize.origin.x + resize.origin.width - (patch.width || resize.origin.width);
+        }
+        if (resize.handle.includes('n')) {
+          patch.height = Math.max(24, resize.origin.height - dy);
+          patch.y = resize.origin.y + resize.origin.height - (patch.height || resize.origin.height);
+        }
+        const updates = [{ id: resize.nodeId, patch }];
+        resizePreviewRef.current = updates;
+        const element = viewportRef.current?.querySelector<HTMLElement>(`[data-node-id="${resize.nodeId}"]`);
+        if (element) {
+          const next = { ...resize.origin, ...patch };
+          element.style.left = `${next.x * view.scale + view.x}px`;
+          element.style.top = `${next.y * view.scale + view.y}px`;
+          element.style.width = `${next.width * view.scale}px`;
+          element.style.height = `${next.height * view.scale}px`;
+        }
+        return;
+      }
       const currentMetric = Math.max(1, resizeMetric(current, resize.center, resize.handle));
       const scale = Math.max(0.08, Math.min(20, currentMetric / resize.startMetric));
       const scaledFreeTextPatch = (origin: CanvasNode, center: Point) => {
@@ -1754,6 +1813,7 @@ export function CanvasView({
 
   const onMouseUp = (event?: ReactMouseEvent) => {
     flushZoom();
+    if (cropPan) setCropPan(null);
     // Window-capture listeners own the complete pan lifecycle. Keeping pan
     // finalization out of React mouseleave/mouseup prevents double commits.
     if (mindDrag) {
@@ -2307,7 +2367,7 @@ export function CanvasView({
               <div
                 key={node.id}
                 data-node-id={node.id}
-                className={`canvas-node ${node.type}-canvas-node ${selected ? 'selected' : ''} ${editing ? 'editing' : ''} ${lockedByGroup ? 'group-child-locked' : ''} ${groupEditing ? 'group-edit-active' : ''} ${node.locked ? 'node-locked' : ''}`}
+                className={`canvas-node ${node.type}-canvas-node ${selected ? 'selected' : ''} ${editing ? 'editing' : ''} ${lockedByGroup ? 'group-child-locked' : ''} ${groupEditing ? 'group-edit-active' : ''} ${node.locked ? 'node-locked' : ''} ${editing && node.type === 'image' && node.cropEnabled ? 'crop-editing' : ''}`}
                 style={{
                   left: screenRect.x,
                   top: screenRect.y,
@@ -2324,6 +2384,13 @@ export function CanvasView({
                 }}
                 onMouseDown={(event) => onNodeMouseDown(event, node)}
                 onDoubleClick={(event) => {
+                  if (node.type === 'image') {
+                    event.stopPropagation();
+                    if (!node.cropEnabled) updateNode(node.id, { cropEnabled: true }, true, false);
+                    setEditingNodeId(node.id);
+                    selectNode(node.id);
+                    return;
+                  }
                   if (node.type === 'group' && node.isGroupContainer !== false) {
                     event.stopPropagation();
                     setActiveGroupId(node.id);
@@ -2422,6 +2489,7 @@ export function CanvasView({
                     onSheetChange={(sheetIndex) => setActiveSheetByNode((current) => ({ ...current, [node.id]: sheetIndex }))}
                   />
                 )}
+                {editing && node.type === 'image' && node.cropEnabled && <div className="crop-edit-hint">拖动画面 · 滚轮缩放 · Esc 完成</div>}
                 {isTextNode(node) && editing && (
                   node.type === 'table' ? renderTableEditor(node) : (
                   node.type === 'document' && node.richTextHtml !== undefined ? renderRichDocumentEditor(node) : (
@@ -2479,7 +2547,7 @@ export function CanvasView({
                       <button
                         key={handle}
                         className={`uniform-resize-edge handle-${handle}`}
-                        title="等比缩放"
+                        title={node.type === 'image' && node.cropEnabled ? '调整裁切画框' : '等比例缩放'}
                         onMouseDown={(event) => beginUniformResize(event, node, handle)}
                       />
                     ))}

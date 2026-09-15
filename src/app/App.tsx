@@ -4,6 +4,7 @@ import { desktopDir, join } from '@tauri-apps/api/path';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import { readTextFile } from '@tauri-apps/plugin-fs';
 import { AssetPanel } from '../components/AssetPanel';
 import { InspectorPanel } from '../components/InspectorPanel';
 import { HierarchyPanel } from '../components/HierarchyPanel';
@@ -79,6 +80,8 @@ interface LocalAIRuntimeStatus {
 const API_ONLY_EDITION = import.meta.env.VITE_REFMIND_API_ONLY === '1';
 const WINDOW_OPACITY_STORAGE_KEY = 'refmind3d.window-opacity';
 const RECENT_PROJECTS_STORAGE_KEY = 'refmind3d.recent-projects';
+const RECOVERY_HISTORY_STORAGE_KEY = 'refmind3d.recovery-history';
+interface RecoveryHistoryItem { cacheId: string; projectPath: string; name: string; savedAt: string }
 
 function readRecentProjects(): string[] {
   try { return JSON.parse(localStorage.getItem(RECENT_PROJECTS_STORAGE_KEY) || '[]').filter((item: unknown) => typeof item === 'string').slice(0, 10); }
@@ -89,6 +92,11 @@ function persistRecentProject(path: string) {
   const next = [path, ...readRecentProjects().filter((item) => item !== path)].slice(0, 10);
   localStorage.setItem(RECENT_PROJECTS_STORAGE_KEY, JSON.stringify(next));
   return next;
+}
+
+function readRecoveryHistory(): RecoveryHistoryItem[] {
+  try { return JSON.parse(localStorage.getItem(RECOVERY_HISTORY_STORAGE_KEY) || '[]').slice(0, 8); }
+  catch { return []; }
 }
 
 function readWindowOpacity() {
@@ -125,6 +133,14 @@ interface AppSettings {
   storage: StorageSettings;
   ai: AISettings;
   shortcuts: ShortcutSettings;
+  theme: 'dark' | 'light' | 'glass';
+  autoOpenLastProject: boolean;
+  showRecentOnStart: boolean;
+  recentProjectLimit: number;
+  periodicSaveMinutes: number;
+  slideshowIntervalSeconds: number;
+  slideshowOrder: 'hierarchy' | 'shuffle' | 'random';
+  alignmentPadding: number;
 }
 
 type MenuAction = () => void | boolean | Promise<void | boolean>;
@@ -326,7 +342,15 @@ const defaultSettings: AppSettings = {
   importLayoutDirection: 'horizontal',
   storage: defaultStorage,
   ai: defaultAISettings,
-  shortcuts: defaultShortcuts
+  shortcuts: defaultShortcuts,
+  theme: 'dark',
+  autoOpenLastProject: false,
+  showRecentOnStart: true,
+  recentProjectLimit: 8,
+  periodicSaveMinutes: 5,
+  slideshowIntervalSeconds: 10,
+  slideshowOrder: 'hierarchy',
+  alignmentPadding: 24
 };
 
 function readSettings(): AppSettings {
@@ -375,6 +399,16 @@ function normalizeShortcut(shortcut: string) {
 function keyFromShortcut(shortcut: string) {
   const parts = normalizeShortcut(shortcut).split('+');
   return parts[parts.length - 1] || '';
+}
+
+function shortcutConflictKeys(shortcuts: ShortcutSettings) {
+  const byValue = new Map<string, ShortcutKey[]>();
+  (Object.keys(shortcuts) as ShortcutKey[]).forEach((key) => {
+    const value = normalizeShortcut(shortcuts[key]);
+    if (!value) return;
+    byValue.set(value, [...(byValue.get(value) || []), key]);
+  });
+  return new Set([...byValue.values()].filter((keys) => keys.length > 1).flat());
 }
 
 function isMouseShortcut(shortcut: string) {
@@ -895,6 +929,7 @@ export function App() {
   const [opacityPanelOpen, setOpacityPanelOpen] = useState(false);
   const [settings, setSettings] = useState<AppSettings>(() => readSettings());
   const [recentProjects, setRecentProjects] = useState<string[]>(readRecentProjects);
+  const [recoveryHistory, setRecoveryHistory] = useState<RecoveryHistoryItem[]>(readRecoveryHistory);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const preferInternalClipboardRef = useRef(false);
@@ -959,7 +994,9 @@ export function App() {
   const [modelPreview, setModelPreview] = useState<ImportedModel | null>(null);
   const [presentationMode, setPresentationMode] = useState(false);
   const [presentationAutoPlay, setPresentationAutoPlay] = useState(false);
+  const [presentationSeed, setPresentationSeed] = useState(0);
   const [mousePassthrough, setMousePassthrough] = useState(false);
+  const [sampledColor, setSampledColor] = useState('');
   const [aiPrompt, setAiPrompt] = useState('');
   const [aiResponse, setAiResponse] = useState('');
   const [aiBusy, setAiBusy] = useState(false);
@@ -967,6 +1004,8 @@ export function App() {
   const [localOllamaModels, setLocalOllamaModels] = useState<string[]>([]);
   const [modelInstallBusy, setModelInstallBusy] = useState('');
   const launchProjectHandledRef = useRef(false);
+  const autoOpenAttemptedRef = useRef(false);
+  const periodicSaveBusyRef = useRef(false);
   const [aiDockTop, setAiDockTop] = useState(96);
   const [aiDockOpen, setAiDockOpen] = useState(false);
   const [canvasDockOpen, setCanvasDockOpen] = useState(false);
@@ -1487,6 +1526,11 @@ export function App() {
     setSavedWorkspaceSignature(workspaceContentSignature(savedCanvases, activeCanvasId, project));
     setCachePathDirty(false);
     void clearRecoveryProject(workspaceCacheId).catch(() => undefined);
+    setRecoveryHistory((current) => {
+      const next = current.filter((item) => item.cacheId !== workspaceCacheId);
+      localStorage.setItem(RECOVERY_HISTORY_STORAGE_KEY, JSON.stringify(next));
+      return next;
+    });
     setStatus(`多画布工程已保存：${path}`);
     showProjectSavedNotice(path);
   };
@@ -1508,6 +1552,40 @@ export function App() {
   };
 
   useEffect(() => {
+    if (!currentProjectPath || !hasUnsavedChanges || settings.periodicSaveMinutes <= 0) return;
+    const timer = window.setTimeout(() => {
+      if (periodicSaveBusyRef.current) return;
+      periodicSaveBusyRef.current = true;
+      void saveWorkspaceToPath(currentProjectPath)
+        .then(() => setStatus('定时保存完成'))
+        .catch((error) => console.warn('Periodic save failed', error))
+        .finally(() => { periodicSaveBusyRef.current = false; });
+    }, settings.periodicSaveMinutes * 60_000);
+    return () => window.clearTimeout(timer);
+  }, [currentProjectPath, currentWorkspaceSignature, hasUnsavedChanges, settings.periodicSaveMinutes]);
+
+  const exportPreferences = async () => {
+    const path = await save({ filters: [{ name: 'RefMind3D Settings', extensions: ['json'] }], defaultPath: 'RefMind3D-settings.json' });
+    if (!path) return;
+    const json = JSON.stringify(settings, null, 2);
+    const bytes = new TextEncoder().encode(json);
+    let binary = '';
+    bytes.forEach((byte) => { binary += String.fromCharCode(byte); });
+    await invoke('save_data_url_to_path', { path, dataUrl: `data:application/json;base64,${btoa(binary)}` });
+    setStatus('设置已导出');
+  };
+
+  const importPreferences = async () => {
+    const path = await open({ multiple: false, filters: [{ name: 'RefMind3D Settings', extensions: ['json'] }] });
+    if (!path || Array.isArray(path)) return;
+    try {
+      const imported = JSON.parse(await readTextFile(path)) as Partial<AppSettings>;
+      updateSettings(imported);
+      setStatus('设置已导入');
+    } catch (error) { alert(`设置文件无效：${String(error)}`); }
+  };
+
+  useEffect(() => {
     if (!currentProjectPath || !hasUnsavedChanges) return;
     const timer = window.setTimeout(() => {
       if (recoverySaveBusyRef.current) return;
@@ -1518,6 +1596,12 @@ export function App() {
         recoveryBaselineRef.current
       );
       void saveRecoveryProject(workspaceCacheId, recovery)
+        .then(() => setRecoveryHistory((current) => {
+          const item = { cacheId: workspaceCacheId, projectPath: currentProjectPath, name: project.name, savedAt: new Date().toISOString() };
+          const next = [item, ...current.filter((entry) => entry.cacheId !== workspaceCacheId)].slice(0, 8);
+          localStorage.setItem(RECOVERY_HISTORY_STORAGE_KEY, JSON.stringify(next));
+          return next;
+        }))
         .catch((error) => console.warn('写入自动恢复副本失败', error))
         .finally(() => { recoverySaveBusyRef.current = false; });
     }, 45_000);
@@ -1581,6 +1665,13 @@ export function App() {
     setCurrentProjectPath(path);
     setStatus(`旧版单画布工程已打开：${path}`);
   };
+
+  useEffect(() => {
+    if (autoOpenAttemptedRef.current) return;
+    autoOpenAttemptedRef.current = true;
+    if (!settings.autoOpenLastProject || recentProjects.length === 0 || currentProjectPath) return;
+    void loadProjectFromPath(recentProjects[0]).catch((error) => setStatus(`自动打开最近工程失败：${String(error)}`));
+  }, []);
 
   const loadProjectFromDataUrl = async (dataUrl: string, name: string) => {
     const loaded = await loadProjectDataUrl(dataUrl, name);
@@ -2342,7 +2433,7 @@ export function App() {
       return;
     }
     const bounds = boundsForNodes(nodes);
-    const gap = 24;
+    const gap = settings.alignmentPadding;
     let cursor = axis === 'horizontal' ? bounds.left : bounds.top;
     const updates = nodes.map((node) => {
       const patch = axis === 'horizontal'
@@ -2363,7 +2454,7 @@ export function App() {
     }
     const bounds = boundsForNodes(nodes);
     const columns = Math.ceil(Math.sqrt(nodes.length));
-    const gap = 24;
+    const gap = settings.alignmentPadding;
     const cellWidth = Math.max(...nodes.map((node) => node.width)) + gap;
     const cellHeight = Math.max(...nodes.map((node) => node.height)) + gap;
     const updates = nodes.map((node, index) => {
@@ -2385,9 +2476,49 @@ export function App() {
     if (nodes.length < 2) return;
     const bounds = boundsForNodes(nodes);
     const columns = Math.ceil(Math.sqrt(nodes.length));
-    const cellWidth = Math.max(...nodes.map((node) => node.width)) + 24;
-    const cellHeight = Math.max(...nodes.map((node) => node.height)) + 24;
+    const cellWidth = Math.max(...nodes.map((node) => node.width)) + settings.alignmentPadding;
+    const cellHeight = Math.max(...nodes.map((node) => node.height)) + settings.alignmentPadding;
     applyLayoutUpdates(nodes.map((node, index) => ({ id: node.id, patch: { x: Math.round(bounds.left + (index % columns) * cellWidth), y: Math.round(bounds.top + Math.floor(index / columns) * cellHeight) } })), '已按名称智能排列');
+  };
+
+  const packNodes = (input: CanvasNode[], message: string) => {
+    if (input.length < 2) return;
+    const origin = boundsForNodes(input);
+    const gap = settings.alignmentPadding;
+    const targetWidth = Math.sqrt(input.reduce((sum, node) => sum + (node.width + gap) * (node.height + gap), 0) * 1.35);
+    let x = origin.left;
+    let y = origin.top;
+    let rowHeight = 0;
+    const updates: Array<{ id: string; patch: Partial<CanvasNode> }> = [];
+    for (const node of input) {
+      if (x > origin.left && x + node.width > origin.left + targetWidth) {
+        x = origin.left;
+        y += rowHeight + gap;
+        rowHeight = 0;
+      }
+      updates.push({ id: node.id, patch: { x: Math.round(x), y: Math.round(y) } });
+      x += node.width + gap;
+      rowHeight = Math.max(rowHeight, node.height);
+    }
+    applyLayoutUpdates(updates, message);
+  };
+
+  const arrangeSelectedOptimal = () => packNodes(selectedLayoutNodes().slice().sort((a, b) => (b.height * b.width) - (a.height * a.width)), '已进行紧凑智能装箱');
+  const arrangeSelectedByAsset = (mode: 'path' | 'addition' | 'order' | 'random') => {
+    const assets = new Map(project.assets.map((asset) => [asset.id, asset]));
+    let nodes = selectedLayoutNodes().slice();
+    if (mode === 'path') nodes.sort((a, b) => (assets.get(a.assetId || '')?.originalPath || a.title).localeCompare(assets.get(b.assetId || '')?.originalPath || b.title));
+    if (mode === 'addition') nodes.sort((a, b) => (assets.get(a.assetId || '')?.importedAt || '').localeCompare(assets.get(b.assetId || '')?.importedAt || ''));
+    if (mode === 'order') nodes.sort((a, b) => a.zIndex - b.zIndex);
+    if (mode === 'random') nodes = nodes.sort(() => Math.random() - 0.5);
+    packNodes(nodes, `已按${mode === 'path' ? '路径' : mode === 'addition' ? '添加顺序' : mode === 'order' ? '层级顺序' : '随机顺序'}排列`);
+  };
+
+  const stackSelected = () => {
+    const nodes = selectedLayoutNodes();
+    if (nodes.length < 2) return;
+    const anchor = boundsForNodes(nodes);
+    applyLayoutUpdates(nodes.map((node) => ({ id: node.id, patch: { x: Math.round(anchor.centerX - node.width / 2), y: Math.round(anchor.centerY - node.height / 2) } })), '已堆叠选中对象');
   };
 
   const normalizeSelectedArea = () => {
@@ -2520,11 +2651,39 @@ export function App() {
     setStatus(selectedNodeIds.length > 0 ? '已定位并拉近选中对象' : '已定位全部导入对象');
   };
 
+  const pickScreenColor = async () => {
+    const EyeDropperCtor = (window as unknown as { EyeDropper?: new () => { open: () => Promise<{ sRGBHex: string }> } }).EyeDropper;
+    if (!EyeDropperCtor) { alert('当前 WebView 不支持屏幕取色器。'); return; }
+    try {
+      const result = await new EyeDropperCtor().open();
+      setSampledColor(result.sRGBHex);
+      await navigator.clipboard.writeText(result.sRGBHex);
+      setStatus(`已复制颜色 ${result.sRGBHex}`);
+    } catch { /* User cancelled the native picker. */ }
+  };
+
+  const showImageCoordinates = () => {
+    const node = project.nodes.find((item) => selectedNodeIds.includes(item.id) && item.type === 'image');
+    const asset = node?.assetId ? project.assets.find((item) => item.id === node.assetId) as (AssetRecord & { width?: number; height?: number }) | undefined : undefined;
+    if (!node || !asset) { setStatus(`画布坐标：${Math.round(lastCanvasPoint.x)}, ${Math.round(lastCanvasPoint.y)}`); return; }
+    const localX = Math.max(0, Math.min(node.width, lastCanvasPoint.x - node.x));
+    const localY = Math.max(0, Math.min(node.height, lastCanvasPoint.y - node.y));
+    const pixelX = Math.round(localX / Math.max(1, node.width) * (asset.width || node.width));
+    const pixelY = Math.round(localY / Math.max(1, node.height) * (asset.height || node.height));
+    setStatus(`${asset.name} · 原图坐标 ${pixelX}, ${pixelY} · ${asset.width || '?'}×${asset.height || '?'}`);
+  };
+
   const navigatePresentation = (direction: -1 | 1) => {
-    const nodes = visualOrder(project.nodes.filter((node) => !node.hidden && node.type !== 'group'));
+    let nodes = visualOrder(project.nodes.filter((node) => !node.hidden && node.type !== 'group'));
     if (nodes.length === 0) return;
+    if (settings.slideshowOrder === 'shuffle') {
+      const score = (id: string) => [...id].reduce((sum, char) => ((sum * 33) ^ char.charCodeAt(0)) >>> 0, presentationSeed);
+      nodes = nodes.slice().sort((a, b) => score(a.id) - score(b.id));
+    }
     const currentIndex = nodes.findIndex((node) => selectedNodeIds.includes(node.id));
-    const nextIndex = currentIndex < 0 ? 0 : (currentIndex + direction + nodes.length) % nodes.length;
+    const nextIndex = settings.slideshowOrder === 'random'
+      ? Math.floor(Math.random() * nodes.length)
+      : currentIndex < 0 ? 0 : (currentIndex + direction + nodes.length) % nodes.length;
     selectNode(nodes[nextIndex].id);
     window.dispatchEvent(new CustomEvent('refmind3d-focus-node-ids', { detail: { ids: [nodes[nextIndex].id] } }));
     setStatus(`浏览 ${nextIndex + 1} / ${nodes.length}：${nodes[nextIndex].title}`);
@@ -2532,20 +2691,20 @@ export function App() {
 
   useEffect(() => {
     if (!presentationMode || !presentationAutoPlay) return;
-    const timer = window.setInterval(() => navigatePresentation(1), 3000);
+    const timer = window.setInterval(() => navigatePresentation(1), Math.max(1, settings.slideshowIntervalSeconds) * 1000);
     return () => window.clearInterval(timer);
-  }, [presentationAutoPlay, presentationMode, project.nodes, selectedNodeIds]);
+  }, [presentationAutoPlay, presentationMode, project.nodes, selectedNodeIds, settings.slideshowIntervalSeconds, settings.slideshowOrder, presentationSeed]);
 
   useEffect(() => {
     if (!presentationMode) return;
     const onPresentationKey = (event: KeyboardEvent) => {
-      if (event.key === 'ArrowRight' || event.key === 'PageDown') { event.preventDefault(); navigatePresentation(1); }
-      if (event.key === 'ArrowLeft' || event.key === 'PageUp') { event.preventDefault(); navigatePresentation(-1); }
+      if (event.key === 'ArrowRight' || event.key === 'PageDown') { event.preventDefault(); setPresentationAutoPlay(false); navigatePresentation(1); }
+      if (event.key === 'ArrowLeft' || event.key === 'PageUp') { event.preventDefault(); setPresentationAutoPlay(false); navigatePresentation(-1); }
       if (event.key === 'Escape') { event.preventDefault(); setPresentationMode(false); setPresentationAutoPlay(false); }
     };
     window.addEventListener('keydown', onPresentationKey, true);
     return () => window.removeEventListener('keydown', onPresentationKey, true);
-  }, [presentationMode, project.nodes, selectedNodeIds]);
+  }, [presentationMode, project.nodes, selectedNodeIds, settings.slideshowOrder, presentationSeed]);
 
   const resetView = () => {
     closeMenu();
@@ -2999,7 +3158,7 @@ export function App() {
 
   return (
     <div
-      className={`app-shell pureref-shell ${canvasSwitching ? 'canvas-transition-active' : ''} ${fullscreen ? 'fullscreen-canvas' : ''}`}
+      className={`app-shell pureref-shell theme-${settings.theme} ${canvasSwitching ? 'canvas-transition-active' : ''} ${fullscreen ? 'fullscreen-canvas' : ''}`}
       onContextMenu={(event) => {
         event.preventDefault();
         if (event.altKey) return;
@@ -3056,9 +3215,9 @@ export function App() {
           }}
           onPointerWorldChange={setLastCanvasPoint}
         />
-        {!currentProjectPath && project.nodes.length === 0 && recentProjects.length > 0 && <section className="welcome-recent-projects">
+        {settings.showRecentOnStart && !currentProjectPath && project.nodes.length === 0 && recentProjects.length > 0 && <section className="welcome-recent-projects">
           <strong>最近工程</strong><span>快速回到上次工作</span>
-          {recentProjects.slice(0, 6).map((path) => <button key={path} title={path} onClick={() => void loadProjectFromPath(path)}>{path.split(/[\\/]/).pop()}</button>)}
+          {recentProjects.slice(0, settings.recentProjectLimit).map((path) => <button key={path} title={path} onClick={() => void loadProjectFromPath(path)}><span className="recent-thumb">R3D</span>{path.split(/[\\/]/).pop()}</button>)}
           <button className="subtle" onClick={() => { localStorage.removeItem(RECENT_PROJECTS_STORAGE_KEY); setRecentProjects([]); }}>清空记录</button>
         </section>}
         {settings.showInspectorPanel && <InspectorPanel />}
@@ -3106,10 +3265,18 @@ export function App() {
           <div className="canvas-mode-actions">
             <button className={project.canvasLocked ? 'active' : ''} onClick={() => updateProjectOptions({ canvasLocked: !project.canvasLocked })}>{project.canvasLocked ? '解除画布锁定' : '锁定画布内容'}</button>
             <button className={project.canvasGrayscale ? 'active' : ''} onClick={() => updateProjectOptions({ canvasGrayscale: !project.canvasGrayscale })}>{project.canvasGrayscale ? '恢复画布彩色' : '画布灰度检查'}</button>
-            <button onClick={() => { setPresentationMode(true); navigatePresentation(1); setOpacityPanelOpen(false); }}>连续浏览 / 演示</button>
+            <button onClick={() => { setPresentationSeed(Date.now()); setPresentationMode(true); navigatePresentation(1); setOpacityPanelOpen(false); }}>连续浏览 / 演示</button>
             <button onClick={() => { setExportCenterOpen(true); setOpacityPanelOpen(false); }}>打开导出中心</button>
             <button disabled={selectedNodeIds.length < 2} onClick={arrangeSelectedByName}>按名称智能排列</button>
             <button disabled={selectedNodeIds.length < 2} onClick={normalizeSelectedArea}>统一视觉面积</button>
+            <button disabled={selectedNodeIds.length < 2} onClick={arrangeSelectedOptimal}>紧凑智能装箱</button>
+            <button disabled={selectedNodeIds.length < 2} onClick={() => arrangeSelectedByAsset('path')}>按资源路径排列</button>
+            <button disabled={selectedNodeIds.length < 2} onClick={() => arrangeSelectedByAsset('addition')}>按添加顺序排列</button>
+            <button disabled={selectedNodeIds.length < 2} onClick={() => arrangeSelectedByAsset('order')}>按层级顺序排列</button>
+            <button disabled={selectedNodeIds.length < 2} onClick={() => arrangeSelectedByAsset('random')}>随机排列</button>
+            <button disabled={selectedNodeIds.length < 2} onClick={stackSelected}>堆叠选中对象</button>
+            <button onClick={() => void pickScreenColor()}>屏幕取色{sampledColor ? ` ${sampledColor}` : ''}</button>
+            <button onClick={showImageCoordinates}>查看图片坐标</button>
             <span className="passthrough-hint">按住 Ctrl+Alt+M：临时鼠标穿透{mousePassthrough ? '（已启用）' : ''}</span>
           </div>
           <div className="canvas-opacity-heading">
@@ -3575,6 +3742,21 @@ export function App() {
                 <option value="vertical">纵向一字排列</option>
               </select>
             </label>
+            <section className="workflow-settings">
+              <div className="settings-section-title"><strong>工作流与外观</strong><div><button onClick={() => void importPreferences()}>导入设置</button><button onClick={() => void exportPreferences()}>导出设置</button></div></div>
+              <div className="theme-preset-row">
+                {(['dark', 'light', 'glass'] as const).map((theme) => <button key={theme} className={settings.theme === theme ? 'active' : ''} onClick={() => updateSettings({ theme })}>{theme === 'dark' ? '深色' : theme === 'light' ? '浅色' : '玻璃'}</button>)}
+              </div>
+              <label><input type="checkbox" checked={settings.showRecentOnStart} onChange={(event) => updateSettings({ showRecentOnStart: event.currentTarget.checked })} /> 空白启动页显示最近工程</label>
+              <label><input type="checkbox" checked={settings.autoOpenLastProject} onChange={(event) => updateSettings({ autoOpenLastProject: event.currentTarget.checked })} /> 启动时自动打开最近工程</label>
+              <div className="workflow-setting-grid">
+                <label>最近工程数量<input type="number" min="1" max="20" value={settings.recentProjectLimit} onChange={(event) => updateSettings({ recentProjectLimit: Math.max(1, Math.min(20, Number(event.currentTarget.value) || 8)) })} /></label>
+                <label>定时保存（分钟，0 为关闭）<input type="number" min="0" max="120" value={settings.periodicSaveMinutes} onChange={(event) => updateSettings({ periodicSaveMinutes: Math.max(0, Math.min(120, Number(event.currentTarget.value) || 0)) })} /></label>
+                <label>排列间距<input type="number" min="0" max="200" value={settings.alignmentPadding} onChange={(event) => updateSettings({ alignmentPadding: Math.max(0, Math.min(200, Number(event.currentTarget.value) || 0)) })} /></label>
+                <label>演示间隔（秒）<input type="number" min="1" max="600" value={settings.slideshowIntervalSeconds} onChange={(event) => updateSettings({ slideshowIntervalSeconds: Math.max(1, Math.min(600, Number(event.currentTarget.value) || 10)) })} /></label>
+                <label>演示顺序<select value={settings.slideshowOrder} onChange={(event) => updateSettings({ slideshowOrder: event.currentTarget.value as AppSettings['slideshowOrder'] })}><option value="hierarchy">层级顺序</option><option value="shuffle">随机但不重复</option><option value="random">完全随机</option></select></label>
+              </div>
+            </section>
             <section className="storage-settings">
               <div className="settings-section-title">
                 <strong>当前工程图片缓存</strong>
@@ -3602,6 +3784,11 @@ export function App() {
                 保存工程时内嵌图片、模型、视频和文档本体
               </label>
               <p className="muted">每个工程独立保存自己的缓存地址，工程内所有画布共享该目录。画布优先显示缩略图，再按屏幕显示尺寸加载解码预览；原文件大小或修改时间变化后自动重建。当前工程缓存上限为 10 GB，卸载默认保留。</p>
+            </section>
+            <section className="recovery-center">
+              <div className="settings-section-title"><strong>恢复中心</strong><button onClick={() => { localStorage.removeItem(RECOVERY_HISTORY_STORAGE_KEY); setRecoveryHistory([]); }}>清空记录</button></div>
+              {recoveryHistory.length === 0 ? <p className="muted">当前没有待恢复快照记录。</p> : recoveryHistory.map((item) => <div key={item.cacheId} className="recovery-item"><b>{item.name}</b><span>{new Date(item.savedAt).toLocaleString()}</span><code>{item.projectPath || '尚未保存的工程'}</code></div>)}
+              <p className="muted">打开对应工程时会自动检测更新的快照，并提供恢复选择。</p>
             </section>
             <PerformanceDiagnostics />
             <ProjectHealthPanel project={project} />
@@ -3764,13 +3951,14 @@ export function App() {
                 <button onClick={resetShortcuts}>恢复默认</button>
               </div>
               {(Object.keys(shortcutNames) as ShortcutKey[]).map((key) => (
-                <label key={key} className="shortcut-row">
+                <label key={key} className={`shortcut-row ${shortcutConflictKeys(settings.shortcuts).has(key) ? 'shortcut-conflict' : ''}`}>
                   <span>{shortcutNames[key]}</span>
                   <input
                     value={settings.shortcuts[key]}
                     onChange={(event) => updateShortcut(key, event.currentTarget.value)}
                     spellCheck={false}
                   />
+                  {shortcutConflictKeys(settings.shortcuts).has(key) && <small>与其他操作冲突</small>}
                 </label>
               ))}
               <p className="muted">键盘格式示例：Ctrl+N、Ctrl+Shift+Z、Alt+T。鼠标格式示例：Alt+RightMouse、Alt+LeftMouse。</p>

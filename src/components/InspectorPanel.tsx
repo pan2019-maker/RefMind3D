@@ -1,4 +1,6 @@
-import { useMemo } from 'react';
+import { useEffect, useMemo, useState } from 'react';
+import { open } from '@tauri-apps/plugin-dialog';
+import { exists, stat } from '@tauri-apps/plugin-fs';
 import { useProjectStore } from '../stores/projectStore';
 import type { CanvasNode, ImportedModel } from '../shared/types';
 
@@ -30,7 +32,39 @@ export function InspectorPanel() {
   const selectedNodes = useMemo(() => project.nodes.filter((node) => selectedNodeIds.includes(node.id)), [project.nodes, selectedNodeIds]);
   const selected = selectedNodes[0];
   const asset = useMemo(() => selected?.assetId ? project.assets.find((item) => item.id === selected.assetId) : undefined, [project.assets, selected]);
+  const [linkedMissing, setLinkedMissing] = useState(false);
   const patchSelected = (patch: Partial<CanvasNode>) => updateNodes(selectedNodes.map((node) => ({ id: node.id, patch })), true, false);
+
+  useEffect(() => {
+    let active = true;
+    if (!asset || asset.storageMode !== 'linked' || !asset.originalPath) { setLinkedMissing(false); return; }
+    void exists(asset.originalPath).then((value) => { if (active) setLinkedMissing(!value); }).catch(() => { if (active) setLinkedMissing(true); });
+    return () => { active = false; };
+  }, [asset]);
+
+  const relinkAsset = async () => {
+    if (!asset) return;
+    const path = await open({ multiple: false, title: `重新定位 ${asset.name}` });
+    if (!path || Array.isArray(path)) return;
+    const info = await stat(path);
+    updateAsset(asset.id, { originalPath: path, projectAssetPath: path, previewPath: asset.kind === 'image' ? path : asset.previewPath, fileSize: info.size, storageMode: 'linked' });
+    setLinkedMissing(false);
+    window.dispatchEvent(new Event('refmind3d-image-cache-reset'));
+  };
+
+  const batchRelink = async () => {
+    const paths = await open({ multiple: true, title: '选择需要匹配的原始文件' });
+    if (!paths) return;
+    const candidates = Array.isArray(paths) ? paths : [paths];
+    for (const path of candidates) {
+      const name = path.split(/[\\/]/).pop()?.toLowerCase();
+      const target = project.assets.find((item) => item.storageMode === 'linked' && item.name.toLowerCase() === name);
+      if (!target) continue;
+      const info = await stat(path);
+      updateAsset(target.id, { originalPath: path, projectAssetPath: path, previewPath: target.kind === 'image' ? path : target.previewPath, fileSize: info.size });
+    }
+    window.dispatchEvent(new Event('refmind3d-image-cache-reset'));
+  };
 
   if (!selected) return <aside className="inspector-panel"><h2>属性</h2><p className="muted">选择一个或多个节点后可编辑属性。</p></aside>;
 
@@ -83,10 +117,12 @@ export function InspectorPanel() {
         <div className="panel-heading"><h3>资源</h3><span>{asset.format.toUpperCase()}</span></div>
         <p>{(asset.fileSize / 1024 / 1024).toFixed(2)} MB</p>
         <p className="path-text">{asset.originalPath || asset.projectAssetPath}</p>
+        {linkedMissing && <p className="asset-missing-warning">链接文件已失联，请重新定位。</p>}
         <div className="segmented-control">
           <button className={(asset.storageMode || 'embedded') === 'embedded' ? 'active' : ''} onClick={() => updateAsset(asset.id, { storageMode: 'embedded' })}>嵌入工程</button>
           <button className={asset.storageMode === 'linked' ? 'active' : ''} onClick={() => updateAsset(asset.id, { storageMode: 'linked' })}>链接原文件</button>
         </div>
+        <div className="property-action-grid"><button onClick={() => void relinkAsset()}>重新定位当前资源</button><button onClick={() => void batchRelink()}>批量按文件名匹配</button></div>
         <p className="muted">嵌入便于携带；链接可减小工程体积，但移动原文件后需要重新定位。</p>
         {asset.kind === 'model' && <div className="model-stats"><p>顶点：{(asset as ImportedModel).stats.vertices ?? '未知'}</p><p>面数：{(asset as ImportedModel).stats.faces ?? '未知'}</p></div>}
       </div>}
