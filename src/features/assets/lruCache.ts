@@ -25,6 +25,14 @@ export class LruCache<K, V> {
     }
   }
 
+  delete(key: K) {
+    return this.values.delete(key);
+  }
+
+  keys() {
+    return [...this.values.keys()];
+  }
+
   clear() {
     this.values.clear();
   }

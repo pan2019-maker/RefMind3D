@@ -1,5 +1,6 @@
 import { lazy, memo, MouseEvent as ReactMouseEvent, Suspense, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type MutableRefObject, type PointerEvent as ReactPointerEvent } from 'react';
 import { convertFileSrc } from '@tauri-apps/api/core';
+import { stat } from '@tauri-apps/plugin-fs';
 import { useShallow } from 'zustand/react/shallow';
 import { useProjectStore } from '../../stores/projectStore';
 import type { AssetRecord, CanvasNode, DoodleStroke, DoodleTool, ImportedModel, SpreadsheetCell, SpreadsheetCellStyle, SpreadsheetMerge, SpreadsheetSheet, SpreadsheetWorkbook } from '../../shared/types';
@@ -8,11 +9,14 @@ import { ImageLoadCancelledError, imageLoadScheduler } from '../assets/imageLoad
 import { LruCache } from '../assets/lruCache';
 import { getModelCover, modelCoverKey, setModelCover } from '../assets/modelCoverCache';
 import { closestNodeIds, nextImagePreviewTier } from '../assets/previewPolicy';
-import { performanceMetricsSnapshot, recordImageCacheResult, updatePerformanceMetrics } from '../performance/performanceMetrics';
-import { adaptiveResourceBudget } from '../performance/resourceBudget';
+import { linkedAssetsToWatch, sourceSignatureKey } from '../assets/sourceWatch';
+import { performanceMetricsSnapshot, recordImageCacheResult, recordSourceRefresh, updatePerformanceMetrics } from '../performance/performanceMetrics';
+import { adaptiveImageConcurrency, adaptiveResourceBudget } from '../performance/resourceBudget';
 import { FREE_TEXT_FONT_FAMILY, FREE_TEXT_PLACEHOLDER, freeTextNodeSize } from '../../shared/freeText';
 import { DoodleCanvas, type DoodleCanvasHandle } from './DoodleCanvas';
 import { SpatialGridIndex } from './spatialIndex';
+import { snapMovingBounds, type SnapGuide } from './snapGuides';
+import { screenToWorld, stableWorldOrigin, worldToScreen } from './viewTransform';
 
 const LazyModelViewer = lazy(() => import('../model-viewer/ModelViewer').then((module) => ({ default: module.ModelViewer })));
 
@@ -36,6 +40,7 @@ interface Point {
 
 type ResizeHandle = 'n' | 's' | 'e' | 'w' | 'ne' | 'nw' | 'se' | 'sw';
 type SelectionMode = 'replace' | 'add' | 'subtract';
+type InputMode = 'idle' | 'pan' | 'select' | 'move' | 'resize' | 'crop' | 'draw' | 'doodle' | 'link';
 
 const DIRECT_IMAGE_FORMATS = new Set(['png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif', 'ico', 'avif', 'svg']);
 const preparedImageCache = new LruCache<string, { value: PreparedImageCache; checkedAt: number }>(384);
@@ -564,6 +569,19 @@ const CanvasImage = memo(function CanvasImage({ asset, node, canvasGrayscale, pr
       : previewTier === 'medium' ? cached.mediumUrl
         : previewTier === 'full' ? fullResolutionAssetUrl(asset) : cached.previewUrl)
     : assetUrl(asset, true);
+  const [resolvedSrc, setResolvedSrc] = useState(src);
+
+  useEffect(() => {
+    if (src === resolvedSrc) return;
+    let cancelled = false;
+    const image = new Image();
+    image.src = src;
+    const ready = typeof image.decode === 'function'
+      ? image.decode().catch(() => undefined)
+      : new Promise<void>((resolve) => { image.onload = () => resolve(); image.onerror = () => resolve(); });
+    void ready.then(() => { if (!cancelled) setResolvedSrc(src); });
+    return () => { cancelled = true; };
+  }, [resolvedSrc, src]);
 
   const imageTransform = [
     `translate(${node.imagePanX || 0}%, ${node.imagePanY || 0}%)`,
@@ -577,7 +595,8 @@ const CanvasImage = memo(function CanvasImage({ asset, node, canvasGrayscale, pr
       <span className="image-node-fallback">{title || '图片预览'}</span>
       <img
         className="image-node"
-        src={src}
+        src={resolvedSrc}
+        data-preview-tier={previewTier}
         draggable={false}
         loading={visible ? 'eager' : 'lazy'}
         decoding="async"
@@ -731,6 +750,8 @@ export function CanvasView({
   const [pageVisible, setPageVisible] = useState(() => document.visibilityState !== 'hidden');
   const [imageCacheEpoch, setImageCacheEpoch] = useState(0);
   const [resourceBudget, setResourceBudget] = useState(() => adaptiveResourceBudget(project.nodes.length, (navigator as Navigator & { deviceMemory?: number }).deviceMemory || 8));
+  const [qualityTier, setQualityTier] = useState<'full' | 'balanced' | 'responsive'>('full');
+  const [snapGuides, setSnapGuides] = useState<SnapGuide[]>([]);
   const [drag, setDrag] = useState<{
     ids?: string[];
     startX: number;
@@ -791,6 +812,11 @@ export function CanvasView({
   const panDirectionRef = useRef({ x: 0, y: 0 });
   const retainedNodeIdsRef = useRef(new Map<string, number>());
   const performanceCountsRef = useRef({ totalNodes: 0, renderedNodes: 0, visibleNodes: 0, activeModels: 0, activeVideos: 0 });
+  const qualityTierRef = useRef(qualityTier);
+  const sourceSignaturesRef = useRef(new Map<string, string>());
+  const visibleAssetIdsRef = useRef<ReadonlySet<string>>(new Set());
+  const inputModeRef = useRef<InputMode>('idle');
+  qualityTierRef.current = qualityTier;
 
   const flushZoom = () => {
     if (wheelTimeoutRef.current !== null) {
@@ -831,7 +857,13 @@ export function CanvasView({
       performanceMetricsSnapshot().fps
     ));
     update();
-    const timer = window.setInterval(update, 2_000);
+    const timer = window.setInterval(() => {
+      const fps = performanceMetricsSnapshot().fps;
+      const memory = (navigator as Navigator & { deviceMemory?: number }).deviceMemory || 8;
+      imageLoadScheduler.setConcurrency(adaptiveImageConcurrency(memory, fps));
+      setQualityTier(fps > 0 && fps < 42 ? 'responsive' : fps > 0 && fps < 54 ? 'balanced' : 'full');
+      update();
+    }, 2_000);
     return () => window.clearInterval(timer);
   }, [project.nodes.length]);
 
@@ -864,17 +896,6 @@ export function CanvasView({
     window.addEventListener('refmind3d-image-cache-reset', reset);
     return () => window.removeEventListener('refmind3d-image-cache-reset', reset);
   }, []);
-
-  useEffect(() => {
-    if (!pageVisible) return;
-    // One board-level timer coalesces source-file checks for all visible images.
-    // Cache hits are cheap and changed size/mtime/content samples regenerate once.
-    const timer = window.setInterval(() => {
-      preparedImageCache.clear();
-      setImageCacheEpoch((value) => value + 1);
-    }, 30_000);
-    return () => window.clearInterval(timer);
-  }, [pageVisible]);
 
   const assetsById = useMemo(() => {
     const map = new Map<string, AssetRecord>();
@@ -983,6 +1004,35 @@ export function CanvasView({
     height: viewportSize.height / view.scale
   }).filter((node) => !node.hidden), [nodeSpatialIndex, project.nodes, view, viewportSize]);
   const visibleNodeIds = useMemo(() => new Set(visibleNodes.map((node) => node.id)), [visibleNodes]);
+  const visibleAssetIds = useMemo(() => new Set(visibleNodes.flatMap((node) => node.assetId ? [node.assetId] : [])), [visibleNodes]);
+  visibleAssetIdsRef.current = visibleAssetIds;
+
+  useEffect(() => {
+    if (!pageVisible) return;
+    let cancelled = false;
+    const poll = async () => {
+      const changed = new Set<string>();
+      const watched = linkedAssetsToWatch(project.assets, visibleAssetIdsRef.current);
+      await Promise.all(watched.map(async (asset) => {
+        try {
+          const info = await stat(asset.originalPath);
+          const signature = sourceSignatureKey({ size: info.size, modifiedMs: info.mtime?.getTime() || 0 });
+          const previous = sourceSignaturesRef.current.get(asset.id);
+          sourceSignaturesRef.current.set(asset.id, signature);
+          if (previous && previous !== signature) changed.add(asset.id);
+        } catch { /* Missing assets are surfaced by the inspector. */ }
+      }));
+      if (cancelled || changed.size === 0) return;
+      for (const key of preparedImageCache.keys()) {
+        if ([...changed].some((id) => key.endsWith(`:${id}`))) preparedImageCache.delete(key);
+      }
+      changed.forEach(() => recordSourceRefresh());
+      setImageCacheEpoch((value) => value + 1);
+    };
+    void poll();
+    const timer = window.setInterval(() => void poll(), 5_000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [pageVisible, project.assets]);
 
   const viewportWorldCenter = useMemo(() => ({
     x: (-view.x + viewportSize.width / 2) / view.scale,
@@ -1017,23 +1067,42 @@ export function CanvasView({
     let previousFrame = windowStarted;
     let frames = 0;
     let slowFrames = 0;
+    let frameTimeTotal = 0;
     const sample = (now: number) => {
       const frameTime = now - previousFrame;
       previousFrame = now;
       frames += 1;
+      frameTimeTotal += frameTime;
       if (frameTime > 34) slowFrames += 1;
       if (now - windowStarted >= 1000) {
+        const tiers = viewportRef.current?.querySelectorAll<HTMLImageElement>('img[data-preview-tier]') || [];
+        const counts = { thumbnail: 0, medium: 0, preview: 0, full: 0 };
+        let textureBytes = 0;
+        tiers.forEach((image) => {
+          const tier = image.dataset.previewTier as keyof typeof counts;
+          if (tier in counts) counts[tier] += 1;
+          textureBytes += Math.max(1, image.naturalWidth) * Math.max(1, image.naturalHeight) * 4;
+        });
         updatePerformanceMetrics({
           ...performanceCountsRef.current,
           fps: Math.round(frames * 1000 / (now - windowStarted)),
           slowFrames,
+          frameTimeMs: Math.round(frameTimeTotal / Math.max(1, frames) * 10) / 10,
+          qualityTier: qualityTierRef.current,
+          imageTierThumbnail: counts.thumbnail,
+          imageTierMedium: counts.medium,
+          imageTierPreview: counts.preview,
+          imageTierFull: counts.full,
+          estimatedTextureMb: Math.round(textureBytes / 1024 / 1024),
           imageMemoryEntries: preparedImageCache.size,
           imageLoadsActive: imageLoadScheduler.activeCount,
-          imageLoadsQueued: imageLoadScheduler.queuedCount
+          imageLoadsQueued: imageLoadScheduler.queuedCount,
+          imageLoadConcurrency: imageLoadScheduler.concurrencyLimit
         });
         windowStarted = now;
         frames = 0;
         slowFrames = 0;
+        frameTimeTotal = 0;
       }
       animationFrame = requestAnimationFrame(sample);
     };
@@ -1055,6 +1124,8 @@ export function CanvasView({
     }
     return [...links.values()];
   }, [linksByNodeId, renderedNodes]);
+
+  const worldOrigin = useMemo(() => stableWorldOrigin(view, viewportSize), [view, viewportSize]);
 
   useEffect(() => {
     if (selectedLinkId && !project.links.some((link) => link.id === selectedLinkId)) {
@@ -1096,20 +1167,17 @@ export function CanvasView({
   }, []);
 
   const toScreenPoint = (point: Point): Point => ({
-    x: point.x * view.scale + view.x,
-    y: point.y * view.scale + view.y
+    ...worldToScreen(point, view, worldOrigin)
   });
 
   const toScreenRect = (rect: Rect): Rect => ({
-    x: rect.x * view.scale + view.x,
-    y: rect.y * view.scale + view.y,
+    ...worldToScreen(rect, view, worldOrigin),
     width: rect.width * view.scale,
     height: rect.height * view.scale
   });
 
   const screenNodeRect = (node: CanvasNode): Rect => ({
-    x: node.x * view.scale + view.x,
-    y: node.y * view.scale + view.y,
+    ...worldToScreen(node, view, worldOrigin),
     width: Math.max(1, node.width * view.scale),
     height: Math.max(1, node.height * view.scale)
   });
@@ -1223,10 +1291,8 @@ export function CanvasView({
     const left = rect?.left || 0;
     const top = rect?.top || 0;
     const current = zoomRef.current || view;
-    return {
-      x: (clientX - left - current.x) / current.scale,
-      y: (clientY - top - current.y) / current.scale
-    };
+    const origin = stableWorldOrigin(current, viewportSize);
+    return screenToWorld({ x: clientX - left, y: clientY - top }, current, origin);
   };
 
   const rememberPointer = (clientX: number, clientY: number) => {
@@ -1258,7 +1324,8 @@ export function CanvasView({
   };
 
   const beginDoodleStroke = (event: ReactPointerEvent<HTMLDivElement>) => {
-    if (!doodleMode || event.button !== 0 || event.altKey) return;
+    if (!doodleMode || event.button !== 0 || event.altKey || inputModeRef.current !== 'idle') return;
+    inputModeRef.current = 'doodle';
     flushZoom();
     event.preventDefault();
     event.stopPropagation();
@@ -1308,6 +1375,7 @@ export function CanvasView({
     if (isVisibleShape) addDoodleStroke(finalStroke);
     activeDoodleRef.current = null;
     activeDoodlePointerRef.current = null;
+    inputModeRef.current = 'idle';
     doodleCanvasRef.current?.clearActiveStroke();
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
       event.currentTarget.releasePointerCapture(event.pointerId);
@@ -1318,6 +1386,7 @@ export function CanvasView({
     if (doodleMode) return;
     activeDoodleRef.current = null;
     activeDoodlePointerRef.current = null;
+    if (inputModeRef.current === 'doodle') inputModeRef.current = 'idle';
     doodleCanvasRef.current?.clearActiveStroke();
   }, [doodleMode]);
 
@@ -1373,12 +1442,14 @@ export function CanvasView({
       }));
       panPreviewRef.current = { x: 0, y: 0 };
       setDrag(null);
+      inputModeRef.current = 'idle';
     };
 
     const handleMousedown = (event: MouseEvent) => {
       const isMiddle = event.button === 1;
       const isAltLeft = event.altKey && event.button === 0;
       if (!isMiddle && !isAltLeft) return;
+      if (inputModeRef.current !== 'idle') return;
 
       const viewport = viewportRef.current;
       const target = event.target as Node | null;
@@ -1386,6 +1457,7 @@ export function CanvasView({
 
       event.preventDefault();
       event.stopPropagation();
+      inputModeRef.current = 'pan';
 
       // Capture the pending zoom camera before flushing it. React state is
       // asynchronous, so reading viewRef after flushZoom used to occasionally
@@ -1449,6 +1521,7 @@ export function CanvasView({
 
   const onWheel = (event: React.WheelEvent) => {
     event.preventDefault();
+    if (inputModeRef.current !== 'idle') return;
     if (editingNodeId) {
       const cropNode = nodesById.get(editingNodeId);
       if (cropNode?.type === 'image' && cropNode.cropEnabled) {
@@ -1502,6 +1575,7 @@ export function CanvasView({
 
   const onCanvasMouseDown = (event: ReactMouseEvent) => {
     flushZoom();
+    if (inputModeRef.current !== 'idle') return;
     if (mouseShortcutMatches(event, mindChildShortcut)) return;
     if (doodleMode && event.button === 0) return;
     setSelectedLinkId(null);
@@ -1511,6 +1585,7 @@ export function CanvasView({
     const point = rememberPointer(event.clientX, event.clientY);
 
     if (drawMode) {
+      inputModeRef.current = 'draw';
       clearSelection();
       setEditingNodeId(null);
       setActiveGroupId(null);
@@ -1521,6 +1596,7 @@ export function CanvasView({
     setEditingNodeId(null);
     setActiveGroupId(null);
     const mode: SelectionMode = event.shiftKey ? 'add' : ((event.ctrlKey || event.metaKey) ? 'subtract' : 'replace');
+    inputModeRef.current = 'select';
     if (mode === 'replace') clearSelection();
     setSelection({
       startX: point.x,
@@ -1533,12 +1609,14 @@ export function CanvasView({
   };
 
   const beginMindChildDrag = (event: ReactMouseEvent, node: CanvasNode) => {
+    if (inputModeRef.current !== 'idle') return;
     flushZoom();
     event.preventDefault();
     event.stopPropagation();
     const parent = node.groupId ? nodesById.get(node.groupId) : undefined;
     const activeNode = isLockedContainerGroup(parent) && activeGroupId !== node.groupId ? parent || node : node;
     if (!isConnectableNode(activeNode)) return;
+    inputModeRef.current = 'link';
     if (!selectedNodeIdSet.has(activeNode.id)) selectNode(activeNode.id);
     const current = rememberPointer(event.clientX, event.clientY);
     const start = horizontalConnectionPoint(activeNode, current);
@@ -1564,6 +1642,8 @@ export function CanvasView({
   };
 
   const beginUniformResize = (event: ReactMouseEvent, node: CanvasNode, handle: ResizeHandle) => {
+    if (inputModeRef.current !== 'idle') return;
+    inputModeRef.current = 'resize';
     flushZoom();
     event.preventDefault();
     event.stopPropagation();
@@ -1592,6 +1672,7 @@ export function CanvasView({
   };
 
   const onNodeMouseDown = (event: ReactMouseEvent, node: CanvasNode) => {
+    if (inputModeRef.current !== 'idle') return;
     if (project.canvasLocked || node.locked) {
       event.preventDefault();
       event.stopPropagation();
@@ -1601,6 +1682,7 @@ export function CanvasView({
       event.preventDefault();
       event.stopPropagation();
       beginHistory();
+      inputModeRef.current = 'crop';
       setCropPan({ nodeId: node.id, startX: event.clientX, startY: event.clientY, originX: node.imagePanX || 0, originY: node.imagePanY || 0 });
       return;
     }
@@ -1619,6 +1701,7 @@ export function CanvasView({
     // background this enters that group for this one marquee operation.
     if (event.shiftKey) {
       event.preventDefault();
+      inputModeRef.current = 'select';
       const parent = node.groupId ? nodesById.get(node.groupId) : undefined;
       const scopeGroupId = isLockedContainerGroup(parent)
         ? parent?.id
@@ -1660,6 +1743,7 @@ export function CanvasView({
     interactionHistoryRecordedRef.current = false;
     nodeDragPreviewRef.current = { dx: 0, dy: 0 };
     setDrag({ ids: activeIds, startX: event.clientX, startY: event.clientY, origins, originX: target.x, originY: target.y });
+    inputModeRef.current = 'move';
   };
 
   const onMouseMove = (event: ReactMouseEvent) => {
@@ -1721,8 +1805,9 @@ export function CanvasView({
         const element = viewportRef.current?.querySelector<HTMLElement>(`[data-node-id="${resize.nodeId}"]`);
         if (element) {
           const next = { ...resize.origin, ...patch };
-          element.style.left = `${next.x * view.scale + view.x}px`;
-          element.style.top = `${next.y * view.scale + view.y}px`;
+          const screen = worldToScreen(next, view, worldOrigin);
+          element.style.left = `${screen.x}px`;
+          element.style.top = `${screen.y}px`;
           element.style.width = `${next.width * view.scale}px`;
           element.style.height = `${next.height * view.scale}px`;
         }
@@ -1781,8 +1866,9 @@ export function CanvasView({
         const element = viewportRef.current?.querySelector<HTMLElement>(`[data-node-id="${update.id}"]`);
         if (!origin || !element) continue;
         const next = { ...origin, ...update.patch };
-        element.style.left = `${next.x * view.scale + view.x}px`;
-        element.style.top = `${next.y * view.scale + view.y}px`;
+        const screen = worldToScreen(next, view, worldOrigin);
+        element.style.left = `${screen.x}px`;
+        element.style.top = `${screen.y}px`;
         element.style.width = `${Math.max(1, next.width * view.scale)}px`;
         element.style.height = `${Math.max(1, next.height * view.scale)}px`;
         element.style.willChange = 'left, top, width, height';
@@ -1799,12 +1885,30 @@ export function CanvasView({
     const dx = event.clientX - drag.startX;
     const dy = event.clientY - drag.startY;
     if (drag.ids && drag.origins) {
-      nodeDragPreviewRef.current = { dx: dx / view.scale, dy: dy / view.scale };
+      let worldDx = dx / view.scale;
+      let worldDy = dy / view.scale;
+      if (!event.altKey) {
+        const movingNodes = drag.ids.map((id) => nodesById.get(id)).filter((node): node is CanvasNode => Boolean(node));
+        const bounds = boundsForNodes(movingNodes);
+        if (bounds) {
+          const snapped = snapMovingBounds(
+            { x: bounds.left + worldDx, y: bounds.top + worldDy, width: bounds.width, height: bounds.height },
+            renderedNodes.filter((node) => !drag.ids?.includes(node.id)),
+            7 / view.scale
+          );
+          worldDx += snapped.dx;
+          worldDy += snapped.dy;
+          setSnapGuides(snapped.guides);
+        }
+      } else setSnapGuides([]);
+      nodeDragPreviewRef.current = { dx: worldDx, dy: worldDy };
+      const screenDx = worldDx * view.scale;
+      const screenDy = worldDy * view.scale;
       for (const id of drag.ids) {
         const element = viewportRef.current?.querySelector<HTMLElement>(`[data-node-id="${id}"]`);
         const node = nodesById.get(id);
         if (element && node) {
-          element.style.transform = `translate3d(${dx}px, ${dy}px, 0) rotate(${node.rotation}deg)`;
+          element.style.transform = `translate3d(${screenDx}px, ${screenDy}px, 0) rotate(${node.rotation}deg)`;
           element.style.willChange = 'transform';
         }
       }
@@ -1914,6 +2018,8 @@ export function CanvasView({
     }
     setResize(null);
     setDrag(null);
+    setSnapGuides([]);
+    inputModeRef.current = 'idle';
     interactionHistoryRecordedRef.current = false;
   };
 
@@ -2279,7 +2385,7 @@ export function CanvasView({
   return (
     <div
       ref={viewportRef}
-      className={`canvas-viewport ${drawMode ? 'draw-mode' : ''} ${doodleMode ? 'doodle-mode' : ''} ${activeGroupId ? 'group-edit-mode' : ''} ${lowZoom ? 'low-zoom' : ''} ${largeCanvasMode ? 'large-canvas-mode' : ''} ${(drag || resize) ? 'is-interacting' : ''} ${drag?.pan ? 'is-panning' : ''}`}
+      className={`canvas-viewport quality-${qualityTier} ${drawMode ? 'draw-mode' : ''} ${doodleMode ? 'doodle-mode' : ''} ${activeGroupId ? 'group-edit-mode' : ''} ${lowZoom ? 'low-zoom' : ''} ${largeCanvasMode ? 'large-canvas-mode' : ''} ${(drag || resize) ? 'is-interacting' : ''} ${drag?.pan ? 'is-panning' : ''}`}
       onWheel={onWheel}
       onPointerDownCapture={beginDoodleStroke}
       onPointerMoveCapture={continueDoodleStroke}
@@ -2574,6 +2680,12 @@ export function CanvasView({
             />
           );
         })()}
+        <div className="smart-guide-layer" aria-hidden="true">
+          {snapGuides.map((guide) => {
+            const screen = toScreenPoint(guide.axis === 'x' ? { x: guide.value, y: 0 } : { x: 0, y: guide.value });
+            return <span key={`${guide.axis}:${guide.value}`} className={`smart-guide smart-guide-${guide.axis}`} style={guide.axis === 'x' ? { left: screen.x } : { top: screen.y }} />;
+          })}
+        </div>
         <DoodleCanvas
           ref={doodleCanvasRef}
           strokes={project.doodles || []}

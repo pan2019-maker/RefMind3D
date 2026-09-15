@@ -26,7 +26,12 @@ export class ImageLoadScheduler {
   private active = 0;
   private order = 0;
 
-  constructor(private readonly concurrency = 3) {}
+  constructor(private concurrency = 3) {}
+
+  setConcurrency(value: number) {
+    this.concurrency = Math.max(1, Math.min(8, Math.round(value)));
+    this.pump();
+  }
 
   schedule<T>(key: string, priority: ImageLoadPriority, run: () => Promise<T>): Promise<T> {
     const existing = this.entries.get(key) as QueueEntry<T> | undefined;
@@ -62,6 +67,10 @@ export class ImageLoadScheduler {
 
   get queuedCount() {
     return this.queued.length;
+  }
+
+  get concurrencyLimit() {
+    return this.concurrency;
   }
 
   private pump() {

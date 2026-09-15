@@ -1006,6 +1006,7 @@ export function App() {
   const launchProjectHandledRef = useRef(false);
   const autoOpenAttemptedRef = useRef(false);
   const periodicSaveBusyRef = useRef(false);
+  const saveQueueRef = useRef<Promise<void>>(Promise.resolve());
   const [aiDockTop, setAiDockTop] = useState(96);
   const [aiDockOpen, setAiDockOpen] = useState(false);
   const [canvasDockOpen, setCanvasDockOpen] = useState(false);
@@ -1511,7 +1512,7 @@ export function App() {
     }
   };
 
-  const saveWorkspaceToPath = async (path: string) => {
+  const writeWorkspaceToPath = async (path: string) => {
     const saveStarted = performance.now();
     const materialized = await materializeCanvases(canvases);
     const workspaceFile = createWorkspaceFile(materialized, activeCanvasId, project, workspaceCacheId, workspaceCacheDirectory);
@@ -1533,6 +1534,17 @@ export function App() {
     });
     setStatus(`多画布工程已保存：${path}`);
     showProjectSavedNotice(path);
+  };
+
+  // Manual, periodic and close-triggered saves share one queue. Requests are
+  // committed in order, so a slow older write cannot finish after a newer one.
+  const saveWorkspaceToPath = (path: string) => {
+    const queued = saveQueueRef.current.then(
+      () => writeWorkspaceToPath(path),
+      () => writeWorkspaceToPath(path)
+    );
+    saveQueueRef.current = queued.then(() => undefined, () => undefined);
+    return queued;
   };
 
   const saveProjectAs = async () => {

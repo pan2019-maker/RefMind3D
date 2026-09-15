@@ -10,3 +10,10 @@ export function adaptiveResourceBudget(nodeCount: number, deviceMemoryGb = 8, fp
     fullImages: Math.max(4, Math.round(12 * scale))
   };
 }
+
+
+export function adaptiveImageConcurrency(deviceMemoryGb = 8, fps = 60) {
+  if ((fps > 0 && fps < 42) || deviceMemoryGb <= 4) return 1;
+  if ((fps > 0 && fps < 54) || deviceMemoryGb <= 8) return 2;
+  return 4;
+}

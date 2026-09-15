@@ -122,6 +122,12 @@ export function InspectorPanel() {
           <button className={(asset.storageMode || 'embedded') === 'embedded' ? 'active' : ''} onClick={() => updateAsset(asset.id, { storageMode: 'embedded' })}>嵌入工程</button>
           <button className={asset.storageMode === 'linked' ? 'active' : ''} onClick={() => updateAsset(asset.id, { storageMode: 'linked' })}>链接原文件</button>
         </div>
+        {asset.storageMode === 'linked' && (
+          <label className="inline-check">
+            <input type="checkbox" checked={asset.autoRefresh !== false} onChange={(event) => updateAsset(asset.id, { autoRefresh: event.currentTarget.checked })} />
+            源文件变化后自动刷新
+          </label>
+        )}
         <div className="property-action-grid"><button onClick={() => void relinkAsset()}>重新定位当前资源</button><button onClick={() => void batchRelink()}>批量按文件名匹配</button></div>
         <p className="muted">嵌入便于携带；链接可减小工程体积，但移动原文件后需要重新定位。</p>
         {asset.kind === 'model' && <div className="model-stats"><p>顶点：{(asset as ImportedModel).stats.vertices ?? '未知'}</p><p>面数：{(asset as ImportedModel).stats.faces ?? '未知'}</p></div>}

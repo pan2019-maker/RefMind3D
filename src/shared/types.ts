@@ -30,6 +30,8 @@ export interface AssetRecord {
   spreadsheetData?: SpreadsheetWorkbook;
   /** Embedded keeps a portable copy in the project; linked keeps the source path. */
   storageMode?: 'embedded' | 'linked';
+  /** Linked files refresh their decoded cache when size or modification time changes. */
+  autoRefresh?: boolean;
 }
 
 export interface DocumentMedia {

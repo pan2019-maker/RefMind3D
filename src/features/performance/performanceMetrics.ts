@@ -7,17 +7,28 @@ export interface PerformanceMetrics {
   imageMemoryEntries: number;
   imageLoadsActive: number;
   imageLoadsQueued: number;
+  imageLoadConcurrency: number;
   imageCacheHits: number;
   imageCacheMisses: number;
   fps: number;
   slowFrames: number;
+  frameTimeMs: number;
+  qualityTier: 'full' | 'balanced' | 'responsive';
+  imageTierThumbnail: number;
+  imageTierMedium: number;
+  imageTierPreview: number;
+  imageTierFull: number;
+  estimatedTextureMb: number;
+  sourceRefreshes: number;
   lastSaveMs?: number;
 }
 
 const metrics: PerformanceMetrics = {
   totalNodes: 0, renderedNodes: 0, visibleNodes: 0, activeModels: 0, activeVideos: 0,
-  imageMemoryEntries: 0, imageLoadsActive: 0, imageLoadsQueued: 0,
-  imageCacheHits: 0, imageCacheMisses: 0, fps: 0, slowFrames: 0
+  imageMemoryEntries: 0, imageLoadsActive: 0, imageLoadsQueued: 0, imageLoadConcurrency: 3,
+  imageCacheHits: 0, imageCacheMisses: 0, fps: 0, slowFrames: 0,
+  frameTimeMs: 0, qualityTier: 'full', imageTierThumbnail: 0, imageTierMedium: 0,
+  imageTierPreview: 0, imageTierFull: 0, estimatedTextureMb: 0, sourceRefreshes: 0
 };
 
 const EVENT_NAME = 'refmind3d-performance-metrics';
@@ -34,6 +45,10 @@ export function recordImageCacheResult(hit: boolean) {
 
 export function recordProjectSave(milliseconds: number) {
   updatePerformanceMetrics({ lastSaveMs: Math.round(milliseconds) });
+}
+
+export function recordSourceRefresh() {
+  metrics.sourceRefreshes += 1;
 }
 
 export function performanceMetricsSnapshot(): PerformanceMetrics {

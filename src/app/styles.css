@@ -1504,6 +1504,23 @@ h3 { font-size: 13px; color: #c8c8c8; margin-top: 16px; }
      every image node separately causes GPU-layer churn on large boards. */
   will-change: auto !important;
 }
+
+/* Keep the canvas in independent compositor/paint islands. Interaction only
+   promotes the layer that is actually moving, while static nodes remain cached. */
+.canvas-world,
+.mindmap-layer,
+.smart-guide-layer,
+.doodle-layer { contain: layout paint style; }
+.canvas-node { contain: layout paint style; backface-visibility: hidden; }
+.canvas-viewport.is-interacting .canvas-node:not(.selected) { pointer-events: none; }
+.canvas-viewport.quality-balanced .canvas-node { box-shadow: none !important; }
+.canvas-viewport.quality-responsive .canvas-node { box-shadow: none !important; filter: none; }
+.canvas-viewport.quality-responsive .canvas-grid { visibility: hidden; }
+
+.smart-guide-layer { position: absolute; inset: 0; z-index: 2147483000; pointer-events: none; overflow: hidden; }
+.smart-guide { position: absolute; background: #55a7ff; box-shadow: 0 0 0 1px rgba(0,0,0,.35); }
+.smart-guide-x { top: 0; bottom: 0; width: 1px; }
+.smart-guide-y { left: 0; right: 0; height: 1px; }
 .canvas-world.screen-space-renderer .mindmap-layer {
   position: absolute !important;
   left: 0 !important;
