@@ -6,6 +6,8 @@ interface ProjectState {
   project: RefMindProject;
   selectedNodeIds: string[];
   clipboardNodes: CanvasNode[];
+  clipboardLinks: MindLink[];
+  clipboardAssets: AssetRecord[];
   history: ProjectPatch[];
   future: ProjectPatch[];
   addAsset: (asset: AssetRecord) => void;
@@ -78,6 +80,10 @@ function createEmptyProject(): RefMindProject {
 
 function cloneNodes(nodes: CanvasNode[]): CanvasNode[] {
   return JSON.parse(JSON.stringify(nodes)) as CanvasNode[];
+}
+
+function cloneClipboard<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
 }
 
 // Store mutations always replace the affected arrays/objects. History can keep
@@ -272,6 +278,8 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
   project: createEmptyProject(),
   selectedNodeIds: [],
   clipboardNodes: [],
+  clipboardLinks: [],
+  clipboardAssets: [],
   history: [],
   future: [],
 
@@ -480,10 +488,14 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 
   copySelected: () => {
     const state = get();
-    const nodes = state.project.nodes.filter((node) => state.selectedNodeIds.includes(node.id));
-    // Copy only selected nodes. Serializing the whole project here previously
-    // duplicated every embedded asset merely to obtain this small node array.
-    set({ clipboardNodes: cloneNodes(nodes) });
+    const selected = new Set(state.selectedNodeIds);
+    const nodes = state.project.nodes.filter((node) => selected.has(node.id));
+    const assetIds = new Set(nodes.flatMap((node) => node.assetId ? [node.assetId] : []));
+    set({
+      clipboardNodes: cloneNodes(nodes),
+      clipboardLinks: cloneClipboard(state.project.links.filter((link) => selected.has(link.fromNodeId) && selected.has(link.toNodeId))),
+      clipboardAssets: cloneClipboard(state.project.assets.filter((asset) => assetIds.has(asset.id)))
+    });
   },
 
   pasteClipboard: (at) => set((state) => {
@@ -495,17 +507,34 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     const maxY = Math.max(...state.clipboardNodes.map((node) => node.y + node.height));
     const offsetX = at ? Math.round(at.x - (minX + maxX) / 2) : 36;
     const offsetY = at ? Math.round(at.y - (minY + maxY) / 2) : 36;
+    const nodeIds = new Map(state.clipboardNodes.map((node) => [node.id, crypto.randomUUID()]));
+    const existingAssets = new Set(state.project.assets.map((asset) => asset.id));
+    const assetIds = new Map(state.clipboardAssets.map((asset) => [asset.id, existingAssets.has(asset.id) ? asset.id : crypto.randomUUID()]));
+    const pastedAssets = state.clipboardAssets
+      .filter((asset) => !existingAssets.has(asset.id))
+      .map((asset) => ({ ...asset, id: assetIds.get(asset.id)! }));
     const pasted = state.clipboardNodes.map((node) => ({
       ...node,
-      id: crypto.randomUUID(),
-      groupId: undefined,
+      id: nodeIds.get(node.id)!,
+      assetId: node.assetId ? (assetIds.get(node.assetId) || node.assetId) : undefined,
+      groupId: node.groupId ? nodeIds.get(node.groupId) : undefined,
       x: node.x + offsetX,
       y: node.y + offsetY,
       zIndex: ++z
     }));
+    const pastedLinks = state.clipboardLinks.flatMap((link) => {
+      const fromNodeId = nodeIds.get(link.fromNodeId); const toNodeId = nodeIds.get(link.toNodeId);
+      return fromNodeId && toNodeId ? [{ ...link, id: crypto.randomUUID(), fromNodeId, toNodeId }] : [];
+    });
     return {
       ...withHistory(state),
-      project: { ...state.project, nodes: applyGroupRules([...state.project.nodes, ...pasted]), updatedAt: now() },
+      project: {
+        ...state.project,
+        assets: [...state.project.assets, ...pastedAssets],
+        nodes: applyGroupRules([...state.project.nodes, ...pasted]),
+        links: [...state.project.links, ...pastedLinks],
+        updatedAt: now()
+      },
       selectedNodeIds: pasted.map((node) => node.id)
     };
   }),

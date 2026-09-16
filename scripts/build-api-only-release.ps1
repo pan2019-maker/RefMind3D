@@ -54,13 +54,13 @@ $shortcutIcon = Join-Path $Root "src-tauri\icons\icon.ico"
 if (!(Test-Path -LiteralPath $shortcutIcon)) {
   throw "Shortcut icon was not found: $shortcutIcon"
 }
-Copy-Item -LiteralPath $shortcutIcon -Destination (Join-Path $AppStage "RefMind3D-App-1.11.0.ico") -Force
+Copy-Item -LiteralPath $shortcutIcon -Destination (Join-Path $AppStage "RefMind3D-App-1.12.0.ico") -Force
 
 $projectIcon = Join-Path $Root "src-tauri\icons\refmind3d-file.ico"
 if (!(Test-Path -LiteralPath $projectIcon)) {
   throw "Project icon was not found: $projectIcon"
 }
-Copy-Item -LiteralPath $projectIcon -Destination (Join-Path $AppStage "RefMind3D-Project-1.11.0.ico") -Force
+Copy-Item -LiteralPath $projectIcon -Destination (Join-Path $AppStage "RefMind3D-Project-1.12.0.ico") -Force
 
 $downloadDir = Join-Path $Root "vendor\downloads"
 $webView2Installer = Join-Path $downloadDir "MicrosoftEdgeWebView2RuntimeInstallerX64.exe"
@@ -87,6 +87,16 @@ if (!(Test-Path -LiteralPath $setup)) {
 
 $final = Join-Path $OutDir "RefMind3D_Setup.exe"
 Copy-Item -LiteralPath $setup -Destination $final -Force
+
+# Production signing is enabled only when the owner supplies a real Windows
+# code-signing certificate thumbprint. Never fabricate or silently self-sign a
+# public installer. The SHA-256 sidecar is always generated for verification.
+if ($env:REFMIND3D_SIGN_CERT_SHA1) {
+  $signtool = Find-Tool "signtool.exe" @("C:\Program Files (x86)\Windows Kits\10\bin\x64\signtool.exe") "Install the Windows SDK signing tools."
+  Invoke-Native $signtool @("sign", "/sha1", $env:REFMIND3D_SIGN_CERT_SHA1, "/fd", "SHA256", "/tr", "http://timestamp.digicert.com", "/td", "SHA256", $final)
+}
+$installerHash = (Get-FileHash -LiteralPath $final -Algorithm SHA256).Hash.ToLowerInvariant()
+Set-Content -LiteralPath "$final.sha256" -Value "$installerHash  RefMind3D_Setup.exe" -Encoding ascii
 
 # Copy the installer to the user's workspace directory
 $destDir = "d:\RefMind3D_Gemini"

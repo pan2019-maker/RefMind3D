@@ -1,7 +1,9 @@
 use anyhow::{anyhow, Context};
 use base64::Engine as _;
 use chrono::Utc;
-use image::{DynamicImage, GenericImageView, ImageDecoder, ImageFormat, ImageReader, metadata::Orientation};
+use image::{
+    metadata::Orientation, DynamicImage, GenericImageView, ImageDecoder, ImageFormat, ImageReader,
+};
 use reqwest::header::{ACCEPT, ACCEPT_LANGUAGE, CONTENT_TYPE, REFERER, USER_AGENT};
 use serde::Serialize;
 use serde_json::Value;
@@ -46,17 +48,31 @@ const PREVIEW_MAX_SIDE: u32 = 2400;
 const MAX_REMOTE_IMAGE_BYTES: u64 = 200 * 1024 * 1024;
 
 fn detect_color_profile(bytes: &[u8]) -> Option<String> {
-    let mut decoder = ImageReader::new(Cursor::new(bytes)).with_guessed_format().ok()?.into_decoder().ok()?;
+    let mut decoder = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_decoder()
+        .ok()?;
     match decoder.icc_profile() {
-        Ok(Some(profile)) if !profile.is_empty() => Some(format!("Embedded ICC ({} KB)", (profile.len() + 1023) / 1024)),
+        Ok(Some(profile)) if !profile.is_empty() => Some(format!(
+            "Embedded ICC ({} KB)",
+            (profile.len() + 1023) / 1024
+        )),
         _ => Some("sRGB / 未嵌入 ICC".to_string()),
     }
 }
 
 fn average_hash(image: DynamicImage) -> u64 {
-    let pixels = image.resize_exact(8, 8, image::imageops::FilterType::Triangle).to_luma8();
+    let pixels = image
+        .resize_exact(8, 8, image::imageops::FilterType::Triangle)
+        .to_luma8();
     let average = pixels.pixels().map(|pixel| pixel.0[0] as u32).sum::<u32>() / 64;
-    pixels.pixels().enumerate().fold(0u64, |hash, (index, pixel)| hash | (((pixel.0[0] as u32 >= average) as u64) << index))
+    pixels
+        .pixels()
+        .enumerate()
+        .fold(0u64, |hash, (index, pixel)| {
+            hash | (((pixel.0[0] as u32 >= average) as u64) << index)
+        })
 }
 
 #[tauri::command]
@@ -64,29 +80,48 @@ pub async fn find_visual_duplicates(assets: Vec<Value>) -> Result<Vec<Vec<String
     tauri::async_runtime::spawn_blocking(move || {
         let mut hashes = Vec::<(String, u64)>::new();
         for asset in assets.into_iter().take(2000) {
-            if asset.get("kind").and_then(Value::as_str) != Some("image") { continue; }
-            let Some(id) = asset.get("id").and_then(Value::as_str) else { continue };
-            let path = ["originalPath", "projectAssetPath", "previewPath"].iter()
+            if asset.get("kind").and_then(Value::as_str) != Some("image") {
+                continue;
+            }
+            let Some(id) = asset.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let path = ["originalPath", "projectAssetPath", "previewPath"]
+                .iter()
                 .filter_map(|key| asset.get(key).and_then(Value::as_str))
-                .map(PathBuf::from).find(|path| path.is_file());
+                .map(PathBuf::from)
+                .find(|path| path.is_file());
             let Some(path) = path else { continue };
-            let ext = path.extension().and_then(|value| value.to_str()).unwrap_or("png").to_ascii_lowercase();
-            if let Ok(image) = decode_preview(&path, &ext) { hashes.push((id.to_string(), average_hash(image))); }
+            let ext = path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or("png")
+                .to_ascii_lowercase();
+            if let Ok(image) = decode_preview(&path, &ext) {
+                hashes.push((id.to_string(), average_hash(image)));
+            }
         }
         let mut used = vec![false; hashes.len()];
         let mut groups = Vec::new();
         for index in 0..hashes.len() {
-            if used[index] { continue; }
+            if used[index] {
+                continue;
+            }
             let mut group = vec![hashes[index].0.clone()];
             for other in index + 1..hashes.len() {
                 if !used[other] && (hashes[index].1 ^ hashes[other].1).count_ones() <= 5 {
-                    used[other] = true; group.push(hashes[other].0.clone());
+                    used[other] = true;
+                    group.push(hashes[other].0.clone());
                 }
             }
-            if group.len() > 1 { groups.push(group); }
+            if group.len() > 1 {
+                groups.push(group);
+            }
         }
         Ok::<Vec<Vec<String>>, String>(groups)
-    }).await.map_err(|error| format!("视觉查重任务失败: {error}"))?
+    })
+    .await
+    .map_err(|error| format!("视觉查重任务失败: {error}"))?
 }
 
 #[tauri::command]
@@ -340,7 +375,7 @@ fn import_bytes_as_runtime_image(
         mime,
         bytes.clone(),
     );
-    
+
     let (preview_path, thumbnail_path) = if let Some(ref decoded) = decoded {
         let thumb_img = limit_thumbnail_size(decoded);
         let thumb_png = encode_png(thumb_img)?;
@@ -517,7 +552,7 @@ fn import_image_asset_sync(
     } else {
         let decoded = decode_preview(&source, &ext)?;
         let (width, height) = decoded.dimensions();
-        
+
         let thumb_img = limit_thumbnail_size(&decoded);
         let thumb_png = encode_png(thumb_img)?;
         let t_path = runtime_assets::register_memory_resource(
@@ -545,7 +580,9 @@ fn import_image_asset_sync(
     };
 
     let source_text = source.to_string_lossy().to_string();
-    let color_profile = fs::read(&source).ok().and_then(|bytes| detect_color_profile(&bytes));
+    let color_profile = fs::read(&source)
+        .ok()
+        .and_then(|bytes| detect_color_profile(&bytes));
     Ok(ImportedImage {
         id,
         kind: "image".to_string(),
@@ -572,7 +609,9 @@ fn decode_preview(path: &Path, ext: &str) -> anyhow::Result<DynamicImage> {
         let bytes = fs::read(path).with_context(|| "Read PSD/PSB file failed")?;
         return Ok(decode_psd_preview_or_placeholder(&bytes));
     }
-    let mut decoder = ImageReader::open(path)?.with_guessed_format()?.into_decoder()?;
+    let mut decoder = ImageReader::open(path)?
+        .with_guessed_format()?
+        .into_decoder()?;
     let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
     let mut img = DynamicImage::from_decoder(decoder)
         .with_context(|| format!("Image decode failed for preview: {}", path.display()))?;
@@ -584,9 +623,12 @@ fn decode_image_bytes_preview(bytes: &[u8], ext: &str) -> anyhow::Result<Dynamic
     if ext == "psd" || ext == "psb" {
         return Ok(decode_psd_preview_or_placeholder(bytes));
     }
-    let mut decoder = ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format()?.into_decoder()?;
+    let mut decoder = ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()?
+        .into_decoder()?;
     let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
-    let mut img = DynamicImage::from_decoder(decoder).map_err(|e| anyhow!("Image decode failed: {e}"))?;
+    let mut img =
+        DynamicImage::from_decoder(decoder).map_err(|e| anyhow!("Image decode failed: {e}"))?;
     img.apply_orientation(orientation);
     Ok(limit_preview_size(img))
 }
@@ -1084,8 +1126,10 @@ mod tests {
 
     #[test]
     fn perceptual_hash_groups_small_brightness_changes() {
-        let dark = DynamicImage::ImageLuma8(image::ImageBuffer::from_pixel(8, 8, image::Luma([40])));
-        let lighter = DynamicImage::ImageLuma8(image::ImageBuffer::from_pixel(8, 8, image::Luma([55])));
+        let dark =
+            DynamicImage::ImageLuma8(image::ImageBuffer::from_pixel(8, 8, image::Luma([40])));
+        let lighter =
+            DynamicImage::ImageLuma8(image::ImageBuffer::from_pixel(8, 8, image::Luma([55])));
         assert_eq!(average_hash(dark), average_hash(lighter));
     }
 }

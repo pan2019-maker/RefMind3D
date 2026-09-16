@@ -38,10 +38,11 @@ function shader(gl: WebGLRenderingContext, type: number, source: string) {
   return gl.getShaderParameter(value, gl.COMPILE_STATUS) ? value : null;
 }
 
-export const GpuImageLayer = memo(function GpuImageLayer({ items, width, height, onSupportChange }: {
+export const GpuImageLayer = memo(function GpuImageLayer({ items, width, height, textureLimit, onSupportChange }: {
   items: GpuImageItem[];
   width: number;
   height: number;
+  textureLimit: number;
   onSupportChange: (supported: boolean) => void;
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -130,7 +131,7 @@ export const GpuImageLayer = memo(function GpuImageLayer({ items, width, height,
         current.gl.texParameteri(current.gl.TEXTURE_2D, current.gl.TEXTURE_MIN_FILTER, current.gl.LINEAR); current.gl.texParameteri(current.gl.TEXTURE_2D, current.gl.TEXTURE_MAG_FILTER, current.gl.LINEAR);
         current.gl.texImage2D(current.gl.TEXTURE_2D, 0, current.gl.RGBA, current.gl.RGBA, current.gl.UNSIGNED_BYTE, image);
         current.textures.set(item.src, texture);
-        while (current.textures.size > 256) {
+        while (current.textures.size > textureLimit) {
           const oldest = current.textures.entries().next().value as [string, WebGLTexture] | undefined;
           if (!oldest) break;
           current.gl.deleteTexture(oldest[1]); current.textures.delete(oldest[0]);
@@ -141,6 +142,7 @@ export const GpuImageLayer = memo(function GpuImageLayer({ items, width, height,
       image.src = item.src;
     }
     redrawRef.current();
-  }, [height, items, width]);
-  return <canvas ref={canvasRef} className="gpu-image-layer" width={Math.max(1, Math.round(width))} height={Math.max(1, Math.round(height))} aria-hidden="true" />;
+  }, [height, items, textureLimit, width]);
+  const dpr = Math.min(3, Math.max(1, window.devicePixelRatio || 1));
+  return <canvas ref={canvasRef} className="gpu-image-layer" style={{ width, height }} width={Math.max(1, Math.round(width * dpr))} height={Math.max(1, Math.round(height * dpr))} aria-hidden="true" />;
 });

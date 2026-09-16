@@ -1,6 +1,6 @@
 import { SpatialGridIndex } from '../canvas/spatialIndex';
 
-export type BenchmarkResult = { nodeCount: number; buildMs: number; queryMs: number; transformMs: number; tileSelectionMs: number; estimatedPeakMb: number; averageHits: number };
+export type BenchmarkResult = { nodeCount: number; buildMs: number; queryMs: number; transformMs: number; tileSelectionMs: number; soakCycles: number; soakMs: number; estimatedPeakMb: number; averageHits: number };
 
 export async function runCanvasBenchmark(nodeCount = 10_000): Promise<BenchmarkResult> {
   await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
@@ -34,5 +34,12 @@ export async function runCanvasBenchmark(nodeCount = 10_000): Promise<BenchmarkR
     visibleTiles += Math.ceil((Math.min(8_192, tileX + 1_920) - tileX) / 1_024) * Math.ceil((Math.min(8_192, tileY + 1_080) - tileY) / 1_024);
   }
   const tileSelectionMs = performance.now() - tileStart;
-  return { nodeCount, buildMs: Math.round(buildMs * 10) / 10, queryMs: Math.round(queryMs * 10) / 10, transformMs: Math.round(transformMs * 10) / 10, tileSelectionMs: Math.round(tileSelectionMs * 10) / 10, estimatedPeakMb: Math.round((visibleTiles / 120 * 4 + Math.min(nodeCount, 2_000) * .02) * 10) / 10, averageHits: Math.round(hits / 200) };
+  const soakCycles = 80; const soakStart = performance.now();
+  for (let cycle = 0; cycle < soakCycles; cycle += 1) {
+    const probe = JSON.stringify({ cycle, nodes: nodes.slice(cycle, cycle + 250) });
+    JSON.parse(probe); index.query({ x: cycle * 70, y: cycle * 31, width: 2560, height: 1440 });
+    if (cycle % 8 === 0) await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  }
+  const soakMs = performance.now() - soakStart;
+  return { nodeCount, buildMs: Math.round(buildMs * 10) / 10, queryMs: Math.round(queryMs * 10) / 10, transformMs: Math.round(transformMs * 10) / 10, tileSelectionMs: Math.round(tileSelectionMs * 10) / 10, soakCycles, soakMs: Math.round(soakMs * 10) / 10, estimatedPeakMb: Math.round((visibleTiles / 120 * 4 + Math.min(nodeCount, 2_000) * .02) * 10) / 10, averageHits: Math.round(hits / 200) };
 }

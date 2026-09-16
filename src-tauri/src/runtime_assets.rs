@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::time::UNIX_EPOCH;
 use std::sync::{Mutex, OnceLock};
+use std::time::UNIX_EPOCH;
 
 use tauri::http;
 use zip::ZipArchive;
@@ -132,22 +132,36 @@ pub fn register_file_resource(
 ) -> String {
     resources().lock().unwrap().insert(
         key(asset_id, field),
-        RuntimeResource { file_name, mime, backing: ResourceBacking::File(path) },
+        RuntimeResource {
+            file_name,
+            mime,
+            backing: ResourceBacking::File(path),
+        },
     );
     resource_url(asset_id, field)
 }
 
 pub fn remove_resource_fields(asset_id: &str, field_prefix: &str) {
     let key_prefix = format!("{asset_id}::{field_prefix}");
-    resources().lock().unwrap().retain(|key, _| !key.starts_with(&key_prefix));
+    resources()
+        .lock()
+        .unwrap()
+        .retain(|key, _| !key.starts_with(&key_prefix));
 }
 
 pub fn resource_source_signature(value: &str) -> Option<(u64, u64)> {
     let (asset_id, field) = parse_resource_url(value)?;
-    let resource = resources().lock().ok()?.get(&key(&asset_id, &field)).cloned()?;
+    let resource = resources()
+        .lock()
+        .ok()?
+        .get(&key(&asset_id, &field))
+        .cloned()?;
     let metadata = match resource.backing {
         ResourceBacking::File(path) => std::fs::metadata(path).ok()?,
-        ResourceBacking::Packed { package_path, zip_path } => {
+        ResourceBacking::Packed {
+            package_path,
+            zip_path,
+        } => {
             // Use the ZIP entry's own stable fingerprint. Project saves and
             // renames change the package timestamp but not unchanged images.
             let file = File::open(package_path).ok()?;
@@ -157,7 +171,12 @@ pub fn resource_source_signature(value: &str) -> Option<(u64, u64)> {
         }
         ResourceBacking::Memory(bytes) => return Some((bytes.len() as u64, 0)),
     };
-    let modified = metadata.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_millis() as u64;
+    let modified = metadata
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_millis() as u64;
     Some((metadata.len(), modified))
 }
 
@@ -170,8 +189,9 @@ pub fn read_resource(asset_id: &str, field: &str) -> Result<(Vec<u8>, String, St
         .ok_or_else(|| "Resource is no longer available in this session".to_string())?;
     let bytes = match resource.backing {
         ResourceBacking::Memory(bytes) => bytes,
-        ResourceBacking::File(path) => std::fs::read(path)
-            .map_err(|e| format!("Read cached resource failed: {e}"))?,
+        ResourceBacking::File(path) => {
+            std::fs::read(path).map_err(|e| format!("Read cached resource failed: {e}"))?
+        }
         ResourceBacking::Packed {
             package_path,
             zip_path,
@@ -199,11 +219,23 @@ pub fn read_resource_url(value: &str) -> Result<(Vec<u8>, String, String), Strin
     read_resource(&asset_id, &field)
 }
 
-fn response(status: u16, content_type: &str, body: Vec<u8>, cacheable: bool) -> http::Response<Vec<u8>> {
+fn response(
+    status: u16,
+    content_type: &str,
+    body: Vec<u8>,
+    cacheable: bool,
+) -> http::Response<Vec<u8>> {
     http::Response::builder()
         .status(status)
         .header("Access-Control-Allow-Origin", "*")
-        .header("Cache-Control", if cacheable { "public, max-age=31536000, immutable" } else { "no-store" })
+        .header(
+            "Cache-Control",
+            if cacheable {
+                "public, max-age=31536000, immutable"
+            } else {
+                "no-store"
+            },
+        )
         .header("Content-Type", content_type)
         .body(body)
         .unwrap()
@@ -211,10 +243,19 @@ fn response(status: u16, content_type: &str, body: Vec<u8>, cacheable: bool) -> 
 
 pub fn protocol_response(request: http::Request<Vec<u8>>) -> http::Response<Vec<u8>> {
     let uri = request.uri().to_string();
-    let cacheable = parse_resource_url(&uri).map(|(_, field)| field.starts_with("cachePreview:") || field.starts_with("cacheThumbnail:")).unwrap_or(false);
+    let cacheable = parse_resource_url(&uri)
+        .map(|(_, field)| {
+            field.starts_with("cachePreview:") || field.starts_with("cacheThumbnail:")
+        })
+        .unwrap_or(false);
     match read_resource_url(&uri) {
         Ok((bytes, mime, _)) => response(200, &mime, bytes, cacheable),
-        Err(message) => response(404, "text/plain; charset=utf-8", message.into_bytes(), false),
+        Err(message) => response(
+            404,
+            "text/plain; charset=utf-8",
+            message.into_bytes(),
+            false,
+        ),
     }
 }
 
@@ -224,20 +265,34 @@ mod tests {
 
     #[test]
     fn file_backed_resources_stream_without_materializing_a_second_payload() {
-        let root = std::env::temp_dir().join(format!("refmind3d-stream-test-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("refmind3d-stream-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("resource.bin");
         let expected = vec![7_u8; 128 * 1024];
         std::fs::write(&path, &expected).unwrap();
-        register_file_resource("stream-test", "source", "resource.bin".into(), "application/octet-stream".into(), path);
+        register_file_resource(
+            "stream-test",
+            "source",
+            "resource.bin".into(),
+            "application/octet-stream".into(),
+            path,
+        );
         let mut streamed = Vec::new();
-        assert_eq!(copy_resource_to("stream-test", "source", &mut streamed).unwrap(), expected.len() as u64);
+        assert_eq!(
+            copy_resource_to("stream-test", "source", &mut streamed).unwrap(),
+            expected.len() as u64
+        );
         assert_eq!(streamed, expected);
         let _ = std::fs::remove_dir_all(root);
     }
 }
 
-pub fn copy_resource_to<W: Write>(asset_id: &str, field: &str, writer: &mut W) -> Result<u64, String> {
+pub fn copy_resource_to<W: Write>(
+    asset_id: &str,
+    field: &str,
+    writer: &mut W,
+) -> Result<u64, String> {
     let resource = resources()
         .lock()
         .unwrap()
@@ -246,18 +301,30 @@ pub fn copy_resource_to<W: Write>(asset_id: &str, field: &str, writer: &mut W) -
         .ok_or_else(|| "Resource is no longer available in this session".to_string())?;
     match resource.backing {
         ResourceBacking::Memory(bytes) => {
-            writer.write_all(&bytes).map_err(|e| format!("Write memory resource failed: {e}"))?;
+            writer
+                .write_all(&bytes)
+                .map_err(|e| format!("Write memory resource failed: {e}"))?;
             Ok(bytes.len() as u64)
         }
         ResourceBacking::File(path) => {
-            let mut file = File::open(path).map_err(|e| format!("Open cached resource failed: {e}"))?;
-            std::io::copy(&mut file, writer).map_err(|e| format!("Stream cached resource failed: {e}"))
+            let mut file =
+                File::open(path).map_err(|e| format!("Open cached resource failed: {e}"))?;
+            std::io::copy(&mut file, writer)
+                .map_err(|e| format!("Stream cached resource failed: {e}"))
         }
-        ResourceBacking::Packed { package_path, zip_path } => {
-            let file = File::open(package_path).map_err(|e| format!("Open project package failed: {e}"))?;
-            let mut archive = ZipArchive::new(file).map_err(|e| format!("Read project package failed: {e}"))?;
-            let mut entry = archive.by_name(&zip_path).map_err(|e| format!("Read packaged resource failed: {e}"))?;
-            std::io::copy(&mut entry, writer).map_err(|e| format!("Stream packaged resource failed: {e}"))
+        ResourceBacking::Packed {
+            package_path,
+            zip_path,
+        } => {
+            let file = File::open(package_path)
+                .map_err(|e| format!("Open project package failed: {e}"))?;
+            let mut archive =
+                ZipArchive::new(file).map_err(|e| format!("Read project package failed: {e}"))?;
+            let mut entry = archive
+                .by_name(&zip_path)
+                .map_err(|e| format!("Read packaged resource failed: {e}"))?;
+            std::io::copy(&mut entry, writer)
+                .map_err(|e| format!("Stream packaged resource failed: {e}"))
         }
     }
 }

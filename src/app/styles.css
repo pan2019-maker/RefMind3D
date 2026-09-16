@@ -2338,3 +2338,9 @@ h3 { font-size: 13px; color: #c8c8c8; margin-top: 16px; }
 .sync-log-row.sync-missing > span { color: #ff9d84; }
 .smart-collection-row { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
 .duplicate-candidate-row { grid-template-columns: minmax(0, 1fr) auto auto; }
+.task-center { position: fixed; right: 18px; bottom: 44px; z-index: 1200; width: min(390px, calc(100vw - 36px)); padding: 10px; border: 1px solid rgba(255,255,255,.16); border-radius: 10px; background: rgba(25,25,28,.94); box-shadow: 0 12px 38px rgba(0,0,0,.38); backdrop-filter: blur(12px); }
+.task-center > strong { display: block; margin-bottom: 7px; font-size: 12px; color: #ddd; }
+.task-center-item { display: grid; grid-template-columns: 58px 1fr auto; gap: 8px; align-items: center; min-height: 32px; padding: 5px 7px; border-radius: 6px; background: rgba(255,255,255,.05); }
+.task-center-item + .task-center-item { margin-top: 5px; }
+.task-center-item span { color: #7dc7ff; font-size: 11px; }.task-center-item.done span { color: #77d88a; }.task-center-item.failed span { color: #ff7777; }
+.task-center-item b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }.task-center-item small { grid-column: 2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #aaa; }.task-center-item button { grid-column: 3; grid-row: 1 / span 2; }

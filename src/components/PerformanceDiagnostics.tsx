@@ -3,6 +3,11 @@ import { invoke } from '@tauri-apps/api/core';
 import { save } from '@tauri-apps/plugin-dialog';
 import { performanceMetricsSnapshot, subscribePerformanceMetrics } from '../features/performance/performanceMetrics';
 import { runCanvasBenchmark, type BenchmarkResult } from '../features/performance/benchmark';
+import { errorJournalSnapshot } from '../features/diagnostics/errorJournal';
+import { useProjectStore } from '../stores/projectStore';
+
+type IntegrityReport = { valid: boolean; canvasCount: number; resourceCount: number; checkedEntries: number; sizeBytes: number };
+type UpdateInfo = { version: string; releaseUrl: string; installerUrl?: string; sha256?: string };
 
 function dataUrlFromText(text: string) {
   const bytes = new TextEncoder().encode(text);
@@ -11,10 +16,14 @@ function dataUrlFromText(text: string) {
   return `data:application/json;base64,${btoa(binary)}`;
 }
 
-export function PerformanceDiagnostics() {
+export function PerformanceDiagnostics({ projectPath }: { projectPath?: string }) {
   const [metrics, setMetrics] = useState(performanceMetricsSnapshot);
+  const project = useProjectStore((state) => state.project);
   const [benchmark, setBenchmark] = useState<BenchmarkResult | null>(null);
   const [benchmarking, setBenchmarking] = useState(false);
+  const [integrity, setIntegrity] = useState<IntegrityReport | null>(null);
+  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
+  const [checking, setChecking] = useState(false);
   useEffect(() => {
     const update = () => setMetrics(performanceMetricsSnapshot());
     const unsubscribe = subscribePerformanceMetrics(update);
@@ -30,13 +39,17 @@ export function PerformanceDiagnostics() {
     if (!path) return;
     const report = {
       generatedAt: new Date().toISOString(),
-      appVersion: '1.11.0',
+      appVersion: '1.12.0',
       platform: navigator.platform,
       hardwareConcurrency: navigator.hardwareConcurrency,
       deviceMemoryGb: (navigator as Navigator & { deviceMemory?: number }).deviceMemory,
+      devicePixelRatio: window.devicePixelRatio,
       metrics,
       cacheHitRate: hitRate,
-      benchmark
+      benchmark,
+      integrity,
+      projectSummary: { nodes: project.nodes.length, assets: project.assets.length, links: project.links.length, doodles: project.doodles?.length || 0 },
+      recentErrors: errorJournalSnapshot()
     };
     await invoke('save_data_url_to_path', { path, dataUrl: dataUrlFromText(JSON.stringify(report, null, 2)) });
   };
@@ -52,6 +65,8 @@ export function PerformanceDiagnostics() {
         <span>图片清晰度</span><code>缩略 {metrics.imageTierThumbnail} · 中等 {metrics.imageTierMedium} · 预览 {metrics.imageTierPreview} · 原图 {metrics.imageTierFull}</code>
         <span>纹理估算</span><code>{metrics.estimatedTextureMb} MB · 内存缓存 {metrics.imageMemoryEntries} 项</code>
         <span>GPU / 输入延迟</span><code>纹理 {metrics.gpuTextureCount} · P95 {metrics.inputLatencyP95Ms} ms</code>
+        <span>内存硬保护</span><code>{metrics.memoryPressure ? '已触发降载' : '正常'} · JS {metrics.jsHeapMb || '—'} MB · 共 {metrics.resourceProtectionActivations} 次</code>
+        <span>显示缩放</span><code>{Math.round(window.devicePixelRatio * 100)}%（DPR {window.devicePixelRatio}）</code>
         <span>缓存命中率</span><code>{hitRate}%（{requests} 次）</code>
         <span>源文件刷新</span><code>{metrics.sourceRefreshes} 次</code>
         <span>最近保存</span><code>{metrics.lastSaveMs === undefined ? '尚未记录' : `${metrics.lastSaveMs} ms`}</code>
@@ -63,7 +78,16 @@ export function PerformanceDiagnostics() {
           void runCanvasBenchmark().then(setBenchmark).finally(() => setBenchmarking(false));
         }}>{benchmarking ? '正在测试…' : '运行 10,000 节点基准'}</button>
         <button onClick={() => void exportReport()}>导出诊断报告</button>
-        {benchmark && <code>索引 {benchmark.buildMs} ms · 查询 {benchmark.queryMs} ms · 120 帧合成 {benchmark.transformMs} ms · 千张 8K 瓦片调度 {benchmark.tileSelectionMs} ms · 压力估算 {benchmark.estimatedPeakMb} MB</code>}
+        <button disabled={!projectPath || checking} onClick={() => {
+          if (!projectPath) return;
+          setChecking(true); void invoke<IntegrityReport>('validate_project_package', { path: projectPath }).then(setIntegrity).finally(() => setChecking(false));
+        }}>{checking ? '正在校验…' : '校验当前工程包'}</button>
+        <button disabled={checking} onClick={() => {
+          setChecking(true); void invoke<UpdateInfo>('check_for_update').then(setUpdateInfo).finally(() => setChecking(false));
+        }}>检查更新</button>
+        {integrity && <code>工程包完整：{integrity.canvasCount} 画布 · {integrity.resourceCount} 资源 · 已校验 {integrity.checkedEntries} 项</code>}
+        {updateInfo && <code>最新版本 {updateInfo.version} · <a href={updateInfo.releaseUrl} target="_blank" rel="noreferrer">打开官方下载页</a>{updateInfo.sha256 ? ` · SHA-256 ${updateInfo.sha256.slice(0, 12)}…` : ''}</code>}
+        {benchmark && <code>索引 {benchmark.buildMs} ms · 查询 {benchmark.queryMs} ms · 120 帧合成 {benchmark.transformMs} ms · 千张 8K 瓦片调度 {benchmark.tileSelectionMs} ms · {benchmark.soakCycles} 轮稳定性 {benchmark.soakMs} ms · 压力估算 {benchmark.estimatedPeakMb} MB</code>}
       </div>
     </section>
   );

@@ -24,6 +24,9 @@ export interface PerformanceMetrics {
   inputLatencyP95Ms: number;
   gpuTextureCount: number;
   projectOpenMs?: number;
+  jsHeapMb: number;
+  memoryPressure: boolean;
+  resourceProtectionActivations: number;
 }
 
 const metrics: PerformanceMetrics = {
@@ -32,7 +35,8 @@ const metrics: PerformanceMetrics = {
   imageCacheHits: 0, imageCacheMisses: 0, fps: 0, slowFrames: 0,
   frameTimeMs: 0, qualityTier: 'full', imageTierThumbnail: 0, imageTierMedium: 0,
   imageTierPreview: 0, imageTierFull: 0, estimatedTextureMb: 0, sourceRefreshes: 0,
-  inputLatencyP95Ms: 0, gpuTextureCount: 0
+  inputLatencyP95Ms: 0, gpuTextureCount: 0, jsHeapMb: 0, memoryPressure: false,
+  resourceProtectionActivations: 0
 };
 const inputLatencySamples: number[] = [];
 

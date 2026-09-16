@@ -39,6 +39,24 @@ describe('project history', () => {
     expect(useProjectStore.getState().clipboardNodes[0].title).toBe('image');
   });
 
+  it('pastes selected links, groups and missing assets as one detached graph', () => {
+    const asset: AssetRecord = { id: 'asset-1', kind: 'image', name: 'a.png', originalPath: 'D:\\a.png', projectAssetPath: '', fileSize: 42, format: 'png', importedAt: '' };
+    const group: CanvasNode = { id: 'group-1', type: 'group', title: 'group', x: 0, y: 0, width: 300, height: 200, rotation: 0, zIndex: 0, isGroupContainer: true };
+    const child = { ...node(), assetId: asset.id, groupId: group.id };
+    useProjectStore.getState().setProject({ ...emptyProject(), assets: [asset], nodes: [group, child], links: [{ id: 'link-1', fromNodeId: group.id, toNodeId: child.id, color: '#fff', width: 2 }] });
+    useProjectStore.getState().selectNodes([group.id, child.id]);
+    useProjectStore.getState().copySelected();
+    useProjectStore.getState().setProject(emptyProject());
+    useProjectStore.getState().pasteClipboard({ x: 500, y: 400 });
+    const state = useProjectStore.getState();
+    expect(state.project.assets).toHaveLength(1);
+    expect(state.project.links).toHaveLength(1);
+    const pastedGroup = state.project.nodes.find((item) => item.type === 'group')!;
+    const pastedChild = state.project.nodes.find((item) => item.type === 'image')!;
+    expect(pastedChild.groupId).toBe(pastedGroup.id);
+    expect(state.project.links[0]).toMatchObject({ fromNodeId: pastedGroup.id, toNodeId: pastedChild.id });
+  });
+
   it('reuses an existing asset when the same source is imported again', () => {
     const first: AssetRecord = { id: 'asset-1', kind: 'image', name: 'a.png', originalPath: 'D:\\a.png', projectAssetPath: '', fileSize: 42, format: 'png', importedAt: '' };
     const duplicate = { ...first, id: 'asset-2' };

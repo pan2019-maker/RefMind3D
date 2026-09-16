@@ -1,18 +1,18 @@
 use base64::Engine as _;
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{HashSet, hash_map::DefaultHasher};
+use std::collections::{hash_map::DefaultHasher, HashSet};
 use std::env;
 use std::fs;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
 use std::hash::{Hash, Hasher};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::runtime_assets::{self, PackedResourceRegistration};
 
@@ -66,7 +66,10 @@ struct PackedProjectFile {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct PackedCanvas { id: String, zip_path: String }
+struct PackedCanvas {
+    id: String,
+    zip_path: String,
+}
 
 enum ResourceSource {
     Path(PathBuf),
@@ -90,86 +93,255 @@ pub struct ProjectVersionInfo {
     asset_count: usize,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectIntegrityReport {
+    valid: bool,
+    canvas_count: usize,
+    resource_count: usize,
+    checked_entries: usize,
+    size_bytes: u64,
+}
+
+fn validate_packed_file(path: &Path) -> Result<ProjectIntegrityReport, String> {
+    let file = File::open(path).map_err(|e| format!("Open project package failed: {e}"))?;
+    let size_bytes = file.metadata().map(|value| value.len()).unwrap_or(0);
+    let mut archive =
+        ZipArchive::new(file).map_err(|e| format!("Project package parse failed: {e}"))?;
+    let mut manifest_bytes = Vec::new();
+    archive
+        .by_name("project.json")
+        .map_err(|e| format!("Project index is missing: {e}"))?
+        .read_to_end(&mut manifest_bytes)
+        .map_err(|e| format!("Read project index failed: {e}"))?;
+    let manifest: PackedProjectFile = serde_json::from_slice(&manifest_bytes)
+        .map_err(|e| format!("Project index is invalid: {e}"))?;
+    let entries = manifest
+        .canvases
+        .iter()
+        .map(|item| item.zip_path.as_str())
+        .chain(manifest.resources.iter().map(|item| item.zip_path.as_str()))
+        .collect::<Vec<_>>();
+    let mut scratch = Vec::new();
+    for entry in &entries {
+        scratch.clear();
+        archive
+            .by_name(entry)
+            .map_err(|e| format!("Project entry is missing ({entry}): {e}"))?
+            .read_to_end(&mut scratch)
+            .map_err(|e| format!("Project entry is damaged ({entry}): {e}"))?;
+    }
+    Ok(ProjectIntegrityReport {
+        valid: true,
+        canvas_count: manifest.canvases.len().max(1),
+        resource_count: manifest.resources.len(),
+        checked_entries: entries.len() + 1,
+        size_bytes,
+    })
+}
+
+#[tauri::command]
+pub async fn validate_project_package(path: String) -> Result<ProjectIntegrityReport, String> {
+    tauri::async_runtime::spawn_blocking(move || validate_packed_file(Path::new(&path)))
+        .await
+        .map_err(|e| format!("Project validation task failed: {e}"))?
+}
+
 fn version_counts(path: &Path) -> (usize, usize, usize) {
-    let Ok(file) = File::open(path) else { return (0, 0, 0) };
-    let Ok(mut archive) = ZipArchive::new(file) else { return (0, 0, 0) };
+    let Ok(file) = File::open(path) else {
+        return (0, 0, 0);
+    };
+    let Ok(mut archive) = ZipArchive::new(file) else {
+        return (0, 0, 0);
+    };
     let mut manifest_text = String::new();
-    match archive.by_name("project.json") { Ok(mut file) => { if file.read_to_string(&mut manifest_text).is_err() { return (0, 0, 0) } }, Err(_) => return (0, 0, 0) }
-    let Ok(manifest) = serde_json::from_str::<PackedProjectFile>(&manifest_text) else { return (0, 0, 0) };
-    let canvas_count = manifest.canvases.len().max(1); let mut nodes = 0; let mut assets = 0;
-    for canvas in &manifest.canvases { let mut text = String::new(); if let Ok(mut file) = archive.by_name(&canvas.zip_path) { if file.read_to_string(&mut text).is_ok() { if let Ok(value) = serde_json::from_str::<Value>(&text) { nodes += value.get("nodes").and_then(Value::as_array).map_or(0, Vec::len); assets += value.get("assets").and_then(Value::as_array).map_or(0, Vec::len); } } } }
+    match archive.by_name("project.json") {
+        Ok(mut file) => {
+            if file.read_to_string(&mut manifest_text).is_err() {
+                return (0, 0, 0);
+            }
+        }
+        Err(_) => return (0, 0, 0),
+    }
+    let Ok(manifest) = serde_json::from_str::<PackedProjectFile>(&manifest_text) else {
+        return (0, 0, 0);
+    };
+    let canvas_count = manifest.canvases.len().max(1);
+    let mut nodes = 0;
+    let mut assets = 0;
+    for canvas in &manifest.canvases {
+        let mut text = String::new();
+        if let Ok(mut file) = archive.by_name(&canvas.zip_path) {
+            if file.read_to_string(&mut text).is_ok() {
+                if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                    nodes += value
+                        .get("nodes")
+                        .and_then(Value::as_array)
+                        .map_or(0, Vec::len);
+                    assets += value
+                        .get("assets")
+                        .and_then(Value::as_array)
+                        .map_or(0, Vec::len);
+                }
+            }
+        }
+    }
     (canvas_count, nodes, assets)
 }
 
 #[tauri::command]
 pub fn scan_asset_folder(path: String) -> Result<Vec<String>, String> {
     let supported: HashSet<&'static str> = [
-        "png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff", "tga", "dds", "hdr", "exr", "avif", "qoi", "psd", "psb",
-        "obj", "fbx", "glb", "gltf", "mp4", "avi", "mov", "mkv", "webm", "m4v", "wmv", "pdf", "txt", "md", "rtf", "doc", "docx", "csv", "tsv", "xls", "xlsx"
-    ].into_iter().collect();
+        "png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff", "tga", "dds", "hdr", "exr",
+        "avif", "qoi", "psd", "psb", "obj", "fbx", "glb", "gltf", "mp4", "avi", "mov", "mkv",
+        "webm", "m4v", "wmv", "pdf", "txt", "md", "rtf", "doc", "docx", "csv", "tsv", "xls",
+        "xlsx",
+    ]
+    .into_iter()
+    .collect();
     let root = PathBuf::from(path);
-    if !root.is_dir() { return Err("监控路径不是可读取的文件夹".to_string()); }
-    let mut paths = walkdir::WalkDir::new(root).follow_links(false).into_iter()
+    if !root.is_dir() {
+        return Err("监控路径不是可读取的文件夹".to_string());
+    }
+    let mut paths = walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_file())
         .filter_map(|entry| {
             let ext = entry.path().extension()?.to_str()?.to_ascii_lowercase();
-            supported.contains(ext.as_str()).then(|| entry.path().to_string_lossy().to_string())
-        }).collect::<Vec<_>>();
+            supported
+                .contains(ext.as_str())
+                .then(|| entry.path().to_string_lossy().to_string())
+        })
+        .collect::<Vec<_>>();
     paths.sort_by_key(|path| path.to_lowercase());
     Ok(paths)
 }
 
 #[tauri::command]
-pub async fn wait_source_folder_changes(paths: Vec<String>, timeout_ms: Option<u64>) -> Result<Vec<String>, String> {
+pub async fn wait_source_folder_changes(
+    paths: Vec<String>,
+    timeout_ms: Option<u64>,
+) -> Result<Vec<String>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let (sender, receiver) = std::sync::mpsc::channel();
-        let mut watcher = RecommendedWatcher::new(move |event| { let _ = sender.send(event); }, notify::Config::default())
-            .map_err(|e| format!("启动原生文件监听失败: {e}"))?;
-        for path in paths { let root = PathBuf::from(path); if root.is_dir() { watcher.watch(&root, RecursiveMode::Recursive).map_err(|e| format!("监听文件夹失败: {e}"))?; } }
-        let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(15_000).clamp(1_000, 30_000));
+        let mut watcher = RecommendedWatcher::new(
+            move |event| {
+                let _ = sender.send(event);
+            },
+            notify::Config::default(),
+        )
+        .map_err(|e| format!("启动原生文件监听失败: {e}"))?;
+        for path in paths {
+            let root = PathBuf::from(path);
+            if root.is_dir() {
+                watcher
+                    .watch(&root, RecursiveMode::Recursive)
+                    .map_err(|e| format!("监听文件夹失败: {e}"))?;
+            }
+        }
+        let timeout =
+            std::time::Duration::from_millis(timeout_ms.unwrap_or(15_000).clamp(1_000, 30_000));
         let mut changed = HashSet::new();
-        if let Ok(Ok(event)) = receiver.recv_timeout(timeout) { for path in event.paths { changed.insert(path.to_string_lossy().to_string()); } }
-        while let Ok(Ok(event)) = receiver.try_recv() { for path in event.paths { changed.insert(path.to_string_lossy().to_string()); } }
+        if let Ok(Ok(event)) = receiver.recv_timeout(timeout) {
+            for path in event.paths {
+                changed.insert(path.to_string_lossy().to_string());
+            }
+        }
+        while let Ok(Ok(event)) = receiver.try_recv() {
+            for path in event.paths {
+                changed.insert(path.to_string_lossy().to_string());
+            }
+        }
         Ok::<Vec<String>, String>(changed.into_iter().collect())
-    }).await.map_err(|e| format!("文件监听任务失败: {e}"))?
+    })
+    .await
+    .map_err(|e| format!("文件监听任务失败: {e}"))?
 }
 
 fn version_directory(project_path: &str, cache_id: Option<&str>) -> PathBuf {
-    let identity = cache_id.filter(|value| !value.trim().is_empty()).map(str::to_string).unwrap_or_else(|| {
-        let mut hasher = DefaultHasher::new();
-        project_path.to_lowercase().hash(&mut hasher);
-        format!("{:016x}", hasher.finish())
-    });
-    recovery_directory().join("Versions").join(sanitize_file_name(&identity))
+    let identity = cache_id
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            let mut hasher = DefaultHasher::new();
+            project_path.to_lowercase().hash(&mut hasher);
+            format!("{:016x}", hasher.finish())
+        });
+    recovery_directory()
+        .join("Versions")
+        .join(sanitize_file_name(&identity))
 }
 
 fn snapshot_previous_version(project_path: &str, cache_id: Option<&str>) {
     let source = Path::new(project_path);
-    if !source.is_file() { return; }
+    if !source.is_file() {
+        return;
+    }
     let directory = version_directory(project_path, cache_id);
-    if fs::create_dir_all(&directory).is_err() { return; }
-    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map(|value| value.as_millis()).unwrap_or(0);
+    if fs::create_dir_all(&directory).is_err() {
+        return;
+    }
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_millis())
+        .unwrap_or(0);
     let target = directory.join(format!("{stamp}.refmind3d"));
-    if fs::copy(source, target).is_err() { return; }
-    let mut versions = fs::read_dir(&directory).ok().into_iter().flatten().filter_map(Result::ok)
-        .filter(|entry| entry.path().is_file()).collect::<Vec<_>>();
-    versions.sort_by_key(|entry| entry.metadata().and_then(|meta| meta.modified()).unwrap_or(UNIX_EPOCH));
+    if fs::copy(source, target).is_err() {
+        return;
+    }
+    let mut versions = fs::read_dir(&directory)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_file())
+        .collect::<Vec<_>>();
+    versions.sort_by_key(|entry| {
+        entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .unwrap_or(UNIX_EPOCH)
+    });
     let remove_count = versions.len().saturating_sub(12);
-    for entry in versions.into_iter().take(remove_count) { let _ = fs::remove_file(entry.path()); }
+    for entry in versions.into_iter().take(remove_count) {
+        let _ = fs::remove_file(entry.path());
+    }
 }
 
 #[tauri::command]
-pub fn list_project_versions(project_path: String, cache_id: Option<String>) -> Result<Vec<ProjectVersionInfo>, String> {
+pub fn list_project_versions(
+    project_path: String,
+    cache_id: Option<String>,
+) -> Result<Vec<ProjectVersionInfo>, String> {
     let directory = version_directory(&project_path, cache_id.as_deref());
-    if !directory.exists() { return Ok(Vec::new()); }
-    let mut versions = fs::read_dir(directory).map_err(|e| format!("读取版本历史失败: {e}"))?
-        .filter_map(Result::ok).filter_map(|entry| {
+    if !directory.exists() {
+        return Ok(Vec::new());
+    }
+    let mut versions = fs::read_dir(directory)
+        .map_err(|e| format!("读取版本历史失败: {e}"))?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
             let meta = entry.metadata().ok()?;
-            let modified_ms = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_millis() as u64;
-            let path = entry.path(); let (canvas_count, node_count, asset_count) = version_counts(&path);
-            Some(ProjectVersionInfo { path: path.to_string_lossy().to_string(), modified_ms, size_bytes: meta.len(), canvas_count, node_count, asset_count })
-        }).collect::<Vec<_>>();
+            let modified_ms = meta
+                .modified()
+                .ok()?
+                .duration_since(UNIX_EPOCH)
+                .ok()?
+                .as_millis() as u64;
+            let path = entry.path();
+            let (canvas_count, node_count, asset_count) = version_counts(&path);
+            Some(ProjectVersionInfo {
+                path: path.to_string_lossy().to_string(),
+                modified_ms,
+                size_bytes: meta.len(),
+                canvas_count,
+                node_count,
+                asset_count,
+            })
+        })
+        .collect::<Vec<_>>();
     versions.sort_by_key(|item| std::cmp::Reverse(item.modified_ms));
     Ok(versions)
 }
@@ -177,7 +349,9 @@ pub fn list_project_versions(project_path: String, cache_id: Option<String>) -> 
 #[tauri::command]
 pub fn restore_project_version(project_path: String, version_path: String) -> Result<(), String> {
     let source = PathBuf::from(version_path);
-    if !source.is_file() { return Err("所选历史版本不存在".to_string()); }
+    if !source.is_file() {
+        return Err("所选历史版本不存在".to_string());
+    }
     let destination = PathBuf::from(project_path);
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
     let temporary = parent.join(format!(".refmind3d-restore-{}.tmp", Uuid::new_v4()));
@@ -198,7 +372,8 @@ pub async fn save_project(
     _embed_resources: Option<bool>,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || save_packed_project(path, project))
-        .await.map_err(|e| format!("Project save task failed: {e}"))?
+        .await
+        .map_err(|e| format!("Project save task failed: {e}"))?
 }
 
 #[tauri::command]
@@ -211,9 +386,8 @@ pub fn load_project(path: String, _extract_root: Option<String>) -> Result<Value
         .map_err(|e| format!("Read project failed: {e}"))?;
 
     if magic == *b"PK" {
-        return load_packed_project(file, &path).or_else(|error| {
-            load_latest_index_backup(&path).map_err(|_| error)
-        });
+        return load_packed_project(file, &path)
+            .or_else(|error| load_latest_index_backup(&path).map_err(|_| error));
     }
 
     let mut bytes = Vec::new();
@@ -247,18 +421,40 @@ pub fn load_project_index(path: String) -> Result<Value, String> {
         Err(_) => return load_project(path, None),
     };
     let mut manifest_text = String::new();
-    archive.by_name("project.json").map_err(|e| format!("Project package misses project.json: {e}"))?
-        .read_to_string(&mut manifest_text).map_err(|e| format!("Read project index failed: {e}"))?;
-    let manifest: PackedProjectFile = serde_json::from_str(&manifest_text).map_err(|e| format!("Project index parse failed: {e}"))?;
-    if manifest.version < 3 || manifest.canvases.is_empty() { return load_project(path, None); }
+    archive
+        .by_name("project.json")
+        .map_err(|e| format!("Project package misses project.json: {e}"))?
+        .read_to_string(&mut manifest_text)
+        .map_err(|e| format!("Read project index failed: {e}"))?;
+    let manifest: PackedProjectFile = serde_json::from_str(&manifest_text)
+        .map_err(|e| format!("Project index parse failed: {e}"))?;
+    if manifest.version < 3 || manifest.canvases.is_empty() {
+        return load_project(path, None);
+    }
     let mut path_resources = Vec::new();
     for resource in &manifest.resources {
-        let out_path = runtime_assets::register_packed_resource(&path, &PackedResourceRegistration {
-            asset_id: resource.asset_id.clone(), field: resource.field.clone(), file_name: resource.file_name.clone(), mime: resource.mime.clone(), zip_path: resource.zip_path.clone()
+        let out_path = runtime_assets::register_packed_resource(
+            &path,
+            &PackedResourceRegistration {
+                asset_id: resource.asset_id.clone(),
+                field: resource.field.clone(),
+                file_name: resource.file_name.clone(),
+                mime: resource.mime.clone(),
+                zip_path: resource.zip_path.clone(),
+            },
+        );
+        path_resources.push(PathResource {
+            asset_id: resource.asset_id.clone(),
+            field: resource.field.clone(),
+            path: out_path,
         });
-        path_resources.push(PathResource { asset_id: resource.asset_id.clone(), field: resource.field.clone(), path: out_path });
     }
-    let active_id = manifest.project.get("activeCanvasId").and_then(Value::as_str).unwrap_or("").to_string();
+    let active_id = manifest
+        .project
+        .get("activeCanvasId")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     let mut project = manifest.project;
     if let Some(canvases) = project.get_mut("canvases").and_then(Value::as_array_mut) {
         for canvas in canvases {
@@ -266,14 +462,20 @@ pub fn load_project_index(path: String) -> Result<Value, String> {
             if id == active_id {
                 if let Some(meta) = manifest.canvases.iter().find(|item| item.id == id) {
                     let mut text = String::new();
-                    archive.by_name(&meta.zip_path).map_err(|e| format!("Canvas data missing {id}: {e}"))?
-                        .read_to_string(&mut text).map_err(|e| format!("Read canvas failed: {e}"))?;
-                    let mut value: Value = serde_json::from_str(&text).map_err(|e| format!("Parse canvas failed: {e}"))?;
+                    archive
+                        .by_name(&meta.zip_path)
+                        .map_err(|e| format!("Canvas data missing {id}: {e}"))?
+                        .read_to_string(&mut text)
+                        .map_err(|e| format!("Read canvas failed: {e}"))?;
+                    let mut value: Value = serde_json::from_str(&text)
+                        .map_err(|e| format!("Parse canvas failed: {e}"))?;
                     patch_path_resources(&mut value, &path_resources);
                     canvas["project"] = value;
                 }
             } else {
-                canvas.as_object_mut().map(|object| object.insert("lazy".into(), Value::Bool(true)));
+                canvas
+                    .as_object_mut()
+                    .map(|object| object.insert("lazy".into(), Value::Bool(true)));
             }
         }
     }
@@ -283,22 +485,47 @@ pub fn load_project_index(path: String) -> Result<Value, String> {
 #[tauri::command]
 pub fn load_project_canvas(path: String, canvas_id: String) -> Result<Value, String> {
     let file = File::open(&path).map_err(|e| format!("Read project failed: {e}"))?;
-    let mut archive = ZipArchive::new(file).map_err(|e| format!("Project package parse failed: {e}"))?;
+    let mut archive =
+        ZipArchive::new(file).map_err(|e| format!("Project package parse failed: {e}"))?;
     let mut manifest_text = String::new();
-    archive.by_name("project.json").map_err(|e| format!("Project package misses project.json: {e}"))?
-        .read_to_string(&mut manifest_text).map_err(|e| format!("Read project index failed: {e}"))?;
-    let manifest: PackedProjectFile = serde_json::from_str(&manifest_text).map_err(|e| format!("Project index parse failed: {e}"))?;
-    let meta = manifest.canvases.iter().find(|item| item.id == canvas_id).ok_or_else(|| format!("Canvas not found: {canvas_id}"))?;
+    archive
+        .by_name("project.json")
+        .map_err(|e| format!("Project package misses project.json: {e}"))?
+        .read_to_string(&mut manifest_text)
+        .map_err(|e| format!("Read project index failed: {e}"))?;
+    let manifest: PackedProjectFile = serde_json::from_str(&manifest_text)
+        .map_err(|e| format!("Project index parse failed: {e}"))?;
+    let meta = manifest
+        .canvases
+        .iter()
+        .find(|item| item.id == canvas_id)
+        .ok_or_else(|| format!("Canvas not found: {canvas_id}"))?;
     let mut text = String::new();
-    archive.by_name(&meta.zip_path).map_err(|e| format!("Canvas data missing {}: {e}", meta.id))?
-        .read_to_string(&mut text).map_err(|e| format!("Read canvas failed: {e}"))?;
-    let mut value: Value = serde_json::from_str(&text).map_err(|e| format!("Parse canvas failed: {e}"))?;
-    let resources = manifest.resources.iter().map(|resource| PathResource {
-        asset_id: resource.asset_id.clone(), field: resource.field.clone(),
-        path: runtime_assets::register_packed_resource(&path, &PackedResourceRegistration {
-            asset_id: resource.asset_id.clone(), field: resource.field.clone(), file_name: resource.file_name.clone(), mime: resource.mime.clone(), zip_path: resource.zip_path.clone()
+    archive
+        .by_name(&meta.zip_path)
+        .map_err(|e| format!("Canvas data missing {}: {e}", meta.id))?
+        .read_to_string(&mut text)
+        .map_err(|e| format!("Read canvas failed: {e}"))?;
+    let mut value: Value =
+        serde_json::from_str(&text).map_err(|e| format!("Parse canvas failed: {e}"))?;
+    let resources = manifest
+        .resources
+        .iter()
+        .map(|resource| PathResource {
+            asset_id: resource.asset_id.clone(),
+            field: resource.field.clone(),
+            path: runtime_assets::register_packed_resource(
+                &path,
+                &PackedResourceRegistration {
+                    asset_id: resource.asset_id.clone(),
+                    field: resource.field.clone(),
+                    file_name: resource.file_name.clone(),
+                    mime: resource.mime.clone(),
+                    zip_path: resource.zip_path.clone(),
+                },
+            ),
         })
-    }).collect::<Vec<_>>();
+        .collect::<Vec<_>>();
     patch_path_resources(&mut value, &resources);
     Ok(value)
 }
@@ -323,50 +550,87 @@ fn legacy_recovery_path(cache_id: &str) -> PathBuf {
 pub async fn save_recovery_project(cache_id: String, project: Value) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let directory = recovery_directory();
-        fs::create_dir_all(&directory).map_err(|e| format!("Create recovery directory failed: {e}"))?;
+        fs::create_dir_all(&directory)
+            .map_err(|e| format!("Create recovery directory failed: {e}"))?;
         let destination = recovery_path(&cache_id);
         let temporary = directory.join(format!(".recovery-{}.tmp", Uuid::new_v4()));
-        let bytes = serde_json::to_vec(&project).map_err(|e| format!("Serialize recovery snapshot failed: {e}"))?;
-        let journal_dir = directory.join("Journals").join(sanitize_file_name(&cache_id));
+        let bytes = serde_json::to_vec(&project)
+            .map_err(|e| format!("Serialize recovery snapshot failed: {e}"))?;
+        let journal_dir = directory
+            .join("Journals")
+            .join(sanitize_file_name(&cache_id));
         fs::create_dir_all(&journal_dir).map_err(|e| format!("Create edit journal failed: {e}"))?;
-        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map(|value| value.as_millis()).unwrap_or(0);
-        fs::write(journal_dir.join(format!("{stamp}.json")), &bytes).map_err(|e| format!("Append edit journal failed: {e}"))?;
-        let mut journal = fs::read_dir(&journal_dir).into_iter().flatten().filter_map(Result::ok).collect::<Vec<_>>();
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_millis())
+            .unwrap_or(0);
+        fs::write(journal_dir.join(format!("{stamp}.json")), &bytes)
+            .map_err(|e| format!("Append edit journal failed: {e}"))?;
+        let mut journal = fs::read_dir(&journal_dir)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
         journal.sort_by_key(|entry| entry.file_name());
         let remove_count = journal.len().saturating_sub(20);
-        for entry in journal.into_iter().take(remove_count) { let _ = fs::remove_file(entry.path()); }
-        let mut file = File::create(&temporary).map_err(|e| format!("Create recovery snapshot failed: {e}"))?;
-        file.write_all(&bytes).map_err(|e| format!("Write recovery snapshot failed: {e}"))?;
-        file.sync_all().map_err(|e| format!("Flush recovery snapshot failed: {e}"))?;
+        for entry in journal.into_iter().take(remove_count) {
+            let _ = fs::remove_file(entry.path());
+        }
+        let mut file = File::create(&temporary)
+            .map_err(|e| format!("Create recovery snapshot failed: {e}"))?;
+        file.write_all(&bytes)
+            .map_err(|e| format!("Write recovery snapshot failed: {e}"))?;
+        file.sync_all()
+            .map_err(|e| format!("Flush recovery snapshot failed: {e}"))?;
         replace_file_atomically(&temporary, &destination)?;
         let _ = fs::remove_file(legacy_recovery_path(&cache_id));
         Ok(())
-    }).await.map_err(|e| format!("Recovery task failed: {e}"))?
+    })
+    .await
+    .map_err(|e| format!("Recovery task failed: {e}"))?
 }
 
 #[tauri::command]
-pub async fn load_newer_recovery_project(cache_id: String, project_path: String) -> Result<Option<Value>, String> {
+pub async fn load_newer_recovery_project(
+    cache_id: String,
+    project_path: String,
+) -> Result<Option<Value>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let modern = recovery_path(&cache_id);
         let legacy = legacy_recovery_path(&cache_id);
         let recovery = if modern.is_file() { modern } else { legacy };
-        if !recovery.is_file() { return Ok(None); }
-        let recovery_modified = fs::metadata(&recovery).and_then(|value| value.modified()).unwrap_or(UNIX_EPOCH);
-        let project_modified = fs::metadata(&project_path).and_then(|value| value.modified()).unwrap_or(UNIX_EPOCH);
-        if recovery_modified <= project_modified { return Ok(None); }
+        if !recovery.is_file() {
+            return Ok(None);
+        }
+        let recovery_modified = fs::metadata(&recovery)
+            .and_then(|value| value.modified())
+            .unwrap_or(UNIX_EPOCH);
+        let project_modified = fs::metadata(&project_path)
+            .and_then(|value| value.modified())
+            .unwrap_or(UNIX_EPOCH);
+        if recovery_modified <= project_modified {
+            return Ok(None);
+        }
         if recovery.extension().and_then(|value| value.to_str()) == Some("json") {
-            let bytes = fs::read(&recovery).map_err(|e| format!("Read recovery snapshot failed: {e}"))?;
-            serde_json::from_slice(&bytes).map(Some).map_err(|e| format!("Parse recovery snapshot failed: {e}"))
+            let bytes =
+                fs::read(&recovery).map_err(|e| format!("Read recovery snapshot failed: {e}"))?;
+            serde_json::from_slice(&bytes)
+                .map(Some)
+                .map_err(|e| format!("Parse recovery snapshot failed: {e}"))
         } else {
             load_project(recovery.to_string_lossy().to_string(), None).map(Some)
         }
-    }).await.map_err(|e| format!("Read recovery task failed: {e}"))?
+    })
+    .await
+    .map_err(|e| format!("Read recovery task failed: {e}"))?
 }
 
 #[tauri::command]
 pub fn clear_recovery_project(cache_id: String) -> Result<(), String> {
     for path in [recovery_path(&cache_id), legacy_recovery_path(&cache_id)] {
-        if path.exists() { fs::remove_file(path).map_err(|e| format!("Clear recovery project failed: {e}"))?; }
+        if path.exists() {
+            fs::remove_file(path).map_err(|e| format!("Clear recovery project failed: {e}"))?;
+        }
     }
     Ok(())
 }
@@ -415,17 +679,30 @@ pub fn load_project_data_url(data_url: String, name_hint: Option<String>) -> Res
 }
 
 fn save_packed_project(path: String, mut project: Value) -> Result<(), String> {
-    let cache_id = project.get("cacheId").and_then(Value::as_str).map(str::to_string);
+    let cache_id = project
+        .get("cacheId")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let sources = collect_packed_resources(&mut project)?;
     write_index_backup(&path, &project);
     let mut canvas_payloads: Vec<(PackedCanvas, Value)> = Vec::new();
     if project.get("fileType").and_then(Value::as_str) == Some("refmind3d-workspace") {
         if let Some(canvases) = project.get_mut("canvases").and_then(Value::as_array_mut) {
             for canvas in canvases {
-                let id = canvas.get("id").and_then(Value::as_str).unwrap_or("canvas").to_string();
+                let id = canvas
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("canvas")
+                    .to_string();
                 if let Some(project_value) = canvas.get_mut("project") {
                     let payload = std::mem::replace(project_value, Value::Null);
-                    canvas_payloads.push((PackedCanvas { id: id.clone(), zip_path: format!("canvases/{}.json", sanitize_file_name(&id)) }, payload));
+                    canvas_payloads.push((
+                        PackedCanvas {
+                            id: id.clone(),
+                            zip_path: format!("canvases/{}.json", sanitize_file_name(&id)),
+                        },
+                        payload,
+                    ));
                 }
             }
         }
@@ -444,7 +721,13 @@ fn save_packed_project(path: String, mut project: Value) -> Result<(), String> {
         file_type: "refmind3d-packed-workspace".to_string(),
         project,
         resources,
-        canvases: canvas_payloads.iter().map(|(meta, _)| PackedCanvas { id: meta.id.clone(), zip_path: meta.zip_path.clone() }).collect(),
+        canvases: canvas_payloads
+            .iter()
+            .map(|(meta, _)| PackedCanvas {
+                id: meta.id.clone(),
+                zip_path: meta.zip_path.clone(),
+            })
+            .collect(),
         packed_at,
     };
 
@@ -452,7 +735,8 @@ fn save_packed_project(path: String, mut project: Value) -> Result<(), String> {
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).map_err(|e| format!("Create project directory failed: {e}"))?;
     let temporary = parent.join(format!(".refmind3d-save-{}.tmp", Uuid::new_v4()));
-    let file = fs::File::create(&temporary).map_err(|e| format!("Create temporary project file failed: {e}"))?;
+    let file = fs::File::create(&temporary)
+        .map_err(|e| format!("Create temporary project file failed: {e}"))?;
     let mut zip = ZipWriter::new(file);
     let deflated = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
 
@@ -464,9 +748,12 @@ fn save_packed_project(path: String, mut project: Value) -> Result<(), String> {
         .map_err(|e| format!("Write project index failed: {e}"))?;
 
     for (meta, canvas) in &canvas_payloads {
-        zip.start_file(&meta.zip_path, deflated).map_err(|e| format!("Write canvas index failed: {e}"))?;
-        let bytes = serde_json::to_vec(canvas).map_err(|e| format!("Serialize canvas failed: {e}"))?;
-        zip.write_all(&bytes).map_err(|e| format!("Write canvas failed: {e}"))?;
+        zip.start_file(&meta.zip_path, deflated)
+            .map_err(|e| format!("Write canvas index failed: {e}"))?;
+        let bytes =
+            serde_json::to_vec(canvas).map_err(|e| format!("Serialize canvas failed: {e}"))?;
+        zip.write_all(&bytes)
+            .map_err(|e| format!("Write canvas failed: {e}"))?;
     }
 
     for item in sources {
@@ -491,15 +778,29 @@ fn save_packed_project(path: String, mut project: Value) -> Result<(), String> {
             }
             ResourceSource::Runtime { asset_id, field } => {
                 runtime_assets::copy_resource_to(&asset_id, &field, &mut zip).map_err(|e| {
-                    format!("Stream runtime resource failed {}: {e}", item.meta.file_name)
+                    format!(
+                        "Stream runtime resource failed {}: {e}",
+                        item.meta.file_name
+                    )
                 })?;
             }
         }
     }
 
-    let finished = zip.finish()
+    let finished = zip
+        .finish()
         .map_err(|e| format!("Finish project package failed: {e}"))?;
-    finished.sync_all().map_err(|e| format!("Flush project package failed: {e}"))?;
+    finished
+        .sync_all()
+        .map_err(|e| format!("Flush project package failed: {e}"))?;
+
+    // Validate every central-directory entry and CRC before touching the last
+    // known-good destination. A partial or corrupt save therefore remains a
+    // disposable temporary file rather than replacing the user's project.
+    if let Err(error) = validate_packed_file(&temporary) {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!("Project package validation failed: {error}"));
+    }
 
     // Write to the same directory first, then replace the destination. A crash
     // or full disk can no longer leave the user's only project half-written.
@@ -510,27 +811,47 @@ fn save_packed_project(path: String, mut project: Value) -> Result<(), String> {
 fn index_backup_directory(project_path: &str) -> PathBuf {
     let mut hasher = DefaultHasher::new();
     project_path.to_lowercase().hash(&mut hasher);
-    recovery_directory().join("Indexes").join(format!("{:016x}", hasher.finish()))
+    recovery_directory()
+        .join("Indexes")
+        .join(format!("{:016x}", hasher.finish()))
 }
 
 fn write_index_backup(project_path: &str, project: &Value) {
     let directory = index_backup_directory(project_path);
-    if fs::create_dir_all(&directory).is_err() { return; }
-    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map(|value| value.as_millis()).unwrap_or(0);
-    if let Ok(bytes) = serde_json::to_vec(project) { let _ = fs::write(directory.join(format!("{stamp}.json")), bytes); }
-    let mut files = fs::read_dir(&directory).ok().into_iter().flatten().filter_map(Result::ok)
+    if fs::create_dir_all(&directory).is_err() {
+        return;
+    }
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_millis())
+        .unwrap_or(0);
+    if let Ok(bytes) = serde_json::to_vec(project) {
+        let _ = fs::write(directory.join(format!("{stamp}.json")), bytes);
+    }
+    let mut files = fs::read_dir(&directory)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
         .filter(|entry| entry.path().extension().and_then(|value| value.to_str()) == Some("json"))
         .collect::<Vec<_>>();
     files.sort_by_key(|entry| std::cmp::Reverse(entry.file_name()));
-    for old in files.into_iter().skip(3) { let _ = fs::remove_file(old.path()); }
+    for old in files.into_iter().skip(3) {
+        let _ = fs::remove_file(old.path());
+    }
 }
 
 fn load_latest_index_backup(project_path: &str) -> Result<Value, String> {
     let directory = index_backup_directory(project_path);
-    let mut files = fs::read_dir(&directory).map_err(|e| format!("No project index backup: {e}"))?
-        .filter_map(Result::ok).collect::<Vec<_>>();
+    let mut files = fs::read_dir(&directory)
+        .map_err(|e| format!("No project index backup: {e}"))?
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
     files.sort_by_key(|entry| std::cmp::Reverse(entry.file_name()));
-    let path = files.first().ok_or_else(|| "No project index backup".to_string())?.path();
+    let path = files
+        .first()
+        .ok_or_else(|| "No project index backup".to_string())?
+        .path();
     let bytes = fs::read(path).map_err(|e| format!("Read project index backup failed: {e}"))?;
     serde_json::from_slice(&bytes).map_err(|e| format!("Parse project index backup failed: {e}"))
 }
@@ -546,11 +867,15 @@ fn replace_file_atomically(temporary: &Path, destination: &Path) -> Result<(), S
         })?;
     }
     if let Err(error) = fs::rename(temporary, destination) {
-        if had_destination { let _ = fs::rename(&backup, destination); }
+        if had_destination {
+            let _ = fs::rename(&backup, destination);
+        }
         let _ = fs::remove_file(temporary);
         return Err(format!("Replace file failed: {error}"));
     }
-    if had_destination { let _ = fs::remove_file(backup); }
+    if had_destination {
+        let _ = fs::remove_file(backup);
+    }
     Ok(())
 }
 
@@ -594,10 +919,17 @@ fn load_packed_project(file: File, project_path: &str) -> Result<Value, String> 
     if let Some(canvases) = project.get_mut("canvases").and_then(Value::as_array_mut) {
         for canvas_meta in &manifest.canvases {
             let mut text = String::new();
-            archive.by_name(&canvas_meta.zip_path).map_err(|e| format!("Canvas data missing {}: {e}", canvas_meta.id))?
-                .read_to_string(&mut text).map_err(|e| format!("Read canvas failed: {e}"))?;
-            let canvas_project: Value = serde_json::from_str(&text).map_err(|e| format!("Parse canvas failed: {e}"))?;
-            if let Some(canvas) = canvases.iter_mut().find(|value| value.get("id").and_then(Value::as_str) == Some(&canvas_meta.id)) {
+            archive
+                .by_name(&canvas_meta.zip_path)
+                .map_err(|e| format!("Canvas data missing {}: {e}", canvas_meta.id))?
+                .read_to_string(&mut text)
+                .map_err(|e| format!("Read canvas failed: {e}"))?;
+            let canvas_project: Value =
+                serde_json::from_str(&text).map_err(|e| format!("Parse canvas failed: {e}"))?;
+            if let Some(canvas) = canvases
+                .iter_mut()
+                .find(|value| value.get("id").and_then(Value::as_str) == Some(&canvas_meta.id))
+            {
                 canvas["project"] = canvas_project;
             }
         }
@@ -638,7 +970,11 @@ fn collect_from_assets(
         // the absolute source path as the runtime path so reopening the project
         // does not depend on a transient refmind3d:// registration.
         if asset.get("storageMode").and_then(Value::as_str) == Some("linked") {
-            let source_path = asset.get("originalPath").and_then(Value::as_str).unwrap_or("").to_string();
+            let source_path = asset
+                .get("originalPath")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
             if let Some(object) = asset.as_object_mut() {
                 if !source_path.is_empty() {
                     object.insert("projectAssetPath".to_string(), Value::String(source_path));
@@ -1394,15 +1730,20 @@ mod tests {
         let root = env::temp_dir().join(format!("refmind3d-atomic-save-test-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let path = root.join("project.refmind3d");
-        let first = json!({ "version": 1, "name": "first", "assets": [], "nodes": [], "links": [] });
-        let second = json!({ "version": 1, "name": "second", "assets": [], "nodes": [], "links": [] });
+        let first =
+            json!({ "version": 1, "name": "first", "assets": [], "nodes": [], "links": [] });
+        let second =
+            json!({ "version": 1, "name": "second", "assets": [], "nodes": [], "links": [] });
 
         save_packed_project(path.to_string_lossy().to_string(), first).unwrap();
         save_packed_project(path.to_string_lossy().to_string(), second).unwrap();
         let loaded = load_project(path.to_string_lossy().to_string(), None).unwrap();
 
         assert_eq!(loaded.get("name").and_then(Value::as_str), Some("second"));
-        assert_eq!(fs::read_dir(&root).unwrap().filter_map(Result::ok).count(), 1);
+        assert_eq!(
+            fs::read_dir(&root).unwrap().filter_map(Result::ok).count(),
+            1
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1429,7 +1770,10 @@ mod tests {
         let index = load_project_index(path.to_string_lossy().to_string()).unwrap();
         assert!(index["canvases"][0]["project"].is_object());
         assert!(index["canvases"][1]["project"].is_null());
-        assert_eq!(load_project_canvas(path.to_string_lossy().to_string(), "b".into()).unwrap()["name"], "B");
+        assert_eq!(
+            load_project_canvas(path.to_string_lossy().to_string(), "b".into()).unwrap()["name"],
+            "B"
+        );
         let _ = fs::remove_dir_all(root);
     }
 }

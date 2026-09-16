@@ -39,6 +39,7 @@ pub fn run() {
             commands::model::register_runtime_model_asset,
             commands::model::convert_model_to_obj,
             commands::project::save_project,
+            commands::project::validate_project_package,
             commands::project::scan_asset_folder,
             commands::project::wait_source_folder_changes,
             commands::project::list_project_versions,
@@ -56,7 +57,8 @@ pub fn run() {
             commands::project::save_data_url_to_path,
             commands::project::copy_file_to_path,
             commands::project::export_files_to_folder,
-            commands::window::set_window_opacity
+            commands::window::set_window_opacity,
+            commands::update::check_for_update
         ])
         .run(tauri::generate_context!())
         .expect("error while running RefMind3D");

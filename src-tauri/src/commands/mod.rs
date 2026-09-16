@@ -5,5 +5,6 @@ pub mod model;
 pub mod project;
 
 pub mod document;
+pub mod update;
 pub mod video;
 pub mod window;

@@ -783,6 +783,7 @@ export function CanvasView({
   const [pageVisible, setPageVisible] = useState(() => document.visibilityState !== 'hidden');
   const [imageCacheEpoch, setImageCacheEpoch] = useState(0);
   const [resourceBudget, setResourceBudget] = useState(() => adaptiveResourceBudget(project.nodes.length, (navigator as Navigator & { deviceMemory?: number }).deviceMemory || 8));
+  const [memoryPressure, setMemoryPressure] = useState(false);
   const [qualityTier, setQualityTier] = useState<'full' | 'balanced' | 'responsive'>('full');
   const [snapGuides, setSnapGuides] = useState<SnapGuide[]>([]);
   const [gpuSupported, setGpuSupported] = useState(true);
@@ -892,11 +893,23 @@ export function CanvasView({
     ));
     update();
     const timer = window.setInterval(() => {
-      const fps = performanceMetricsSnapshot().fps;
+      const snapshot = performanceMetricsSnapshot();
+      const fps = snapshot.fps;
       const memory = (navigator as Navigator & { deviceMemory?: number }).deviceMemory || 8;
+      const heap = (performance as Performance & { memory?: { usedJSHeapSize: number; jsHeapSizeLimit: number } }).memory;
+      const heapRatio = heap?.jsHeapSizeLimit ? heap.usedJSHeapSize / heap.jsHeapSizeLimit : 0;
+      const pressured = heapRatio >= .82;
+      const nextPressure = pressured || (snapshot.memoryPressure && heapRatio >= .65);
+      if (nextPressure && !snapshot.memoryPressure) preparedImageCache.clear();
+      setMemoryPressure(nextPressure);
       imageLoadScheduler.setConcurrency(adaptiveImageConcurrency(memory, fps));
       setQualityTier(fps > 0 && fps < 42 ? 'responsive' : fps > 0 && fps < 54 ? 'balanced' : 'full');
-      update();
+      if (nextPressure) setResourceBudget({ models: 0, videos: 1, fullImages: 0 }); else update();
+      updatePerformanceMetrics({
+        jsHeapMb: heap ? Math.round(heap.usedJSHeapSize / 1024 / 1024) : 0,
+        memoryPressure: nextPressure,
+        resourceProtectionActivations: snapshot.resourceProtectionActivations + (nextPressure && !snapshot.memoryPressure ? 1 : 0)
+      });
     }, 2_000);
     return () => window.clearInterval(timer);
   }, [project.nodes.length]);
@@ -1217,9 +1230,11 @@ export function CanvasView({
     const observer = new ResizeObserver(updateSize);
     observer.observe(element);
     window.addEventListener('resize', updateSize);
+    window.visualViewport?.addEventListener('resize', updateSize);
     return () => {
       observer.disconnect();
       window.removeEventListener('resize', updateSize);
+      window.visualViewport?.removeEventListener('resize', updateSize);
     };
   }, []);
 
@@ -2468,7 +2483,7 @@ export function CanvasView({
         className="canvas-world screen-space-renderer"
       >
         {showGrid && !lowZoom && <div className="canvas-grid" />}
-        {gpuImageItems.length > 0 && <GpuImageLayer items={gpuImageItems} width={viewportSize.width} height={viewportSize.height} onSupportChange={handleGpuSupport} />}
+        {gpuImageItems.length > 0 && <GpuImageLayer items={gpuImageItems} width={viewportSize.width} height={viewportSize.height} textureLimit={memoryPressure ? 48 : 192} onSupportChange={handleGpuSupport} />}
         <svg className="mindmap-layer" width={viewportSize.width} height={viewportSize.height} viewBox={`0 0 ${viewportSize.width} ${viewportSize.height}`}>
           {renderedLinks.map((link) => {
             const fromNode = nodesById.get(link.fromNodeId);

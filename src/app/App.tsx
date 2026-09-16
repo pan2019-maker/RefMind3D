@@ -10,6 +10,7 @@ import { InspectorPanel } from '../components/InspectorPanel';
 import { HierarchyPanel } from '../components/HierarchyPanel';
 import { PerformanceDiagnostics } from '../components/PerformanceDiagnostics';
 import { ProjectHealthPanel } from '../components/ProjectHealthPanel';
+import { TaskCenter } from '../components/TaskCenter';
 import { WorkspaceSearch } from '../components/WorkspaceSearch';
 import { CanvasView } from '../features/canvas/CanvasView';
 import { documentExtensions, imageExtensions, importFileDataCandidatesToProject, importImageCandidatesToProject, importPathsToProject, modelExtensions, videoExtensions, type FileDataImportCandidate, type ImageImportCandidate, type ImportLayoutDirection } from '../features/assets/importController';
@@ -21,6 +22,7 @@ import type { AssetRecord, CanvasNode, CanvasWorkspaceRecord, DoodleTool, Import
 import { exportProjectToPng, exportSelectedNodesToPng } from '../features/export/exportCanvas';
 import { clearImageCache, confirmDefaultImageCacheDirectory, getImageCacheStatus, migrateImageCache, setImageCacheDirectory, type ImageCacheStatus } from '../features/assets/imageCache';
 import { recordProjectOpen, recordProjectSave } from '../features/performance/performanceMetrics';
+import { runBackgroundTask } from '../features/tasks/taskCenter';
 
 const LazyModelViewer = lazy(() => import('../features/model-viewer/ModelViewer').then((module) => ({ default: module.ModelViewer })));
 
@@ -1560,8 +1562,8 @@ export function App() {
   // committed in order, so a slow older write cannot finish after a newer one.
   const saveWorkspaceToPath = (path: string) => {
     const queued = saveQueueRef.current.then(
-      () => writeWorkspaceToPath(path),
-      () => writeWorkspaceToPath(path)
+      () => runBackgroundTask('保存并校验工程', () => writeWorkspaceToPath(path)),
+      () => runBackgroundTask('保存并校验工程', () => writeWorkspaceToPath(path))
     );
     saveQueueRef.current = queued.then(() => undefined, () => undefined);
     return queued;
@@ -2687,18 +2689,18 @@ export function App() {
       closeMenu();
       return;
     }
-    const bounds = boundsForNodes(nodes);
+    const anchor = nodes.find((node) => node.id === selectedNodeIds[selectedNodeIds.length - 1]) || nodes[nodes.length - 1];
     const updates = nodes.map((node) => {
       let patch: Partial<CanvasNode> = {};
-      if (mode === 'left') patch = { x: Math.round(bounds.left) };
-      if (mode === 'centerX') patch = { x: Math.round(bounds.centerX - node.width / 2) };
-      if (mode === 'right') patch = { x: Math.round(bounds.right - node.width) };
-      if (mode === 'top') patch = { y: Math.round(bounds.top) };
-      if (mode === 'centerY') patch = { y: Math.round(bounds.centerY - node.height / 2) };
-      if (mode === 'bottom') patch = { y: Math.round(bounds.bottom - node.height) };
+      if (mode === 'left') patch = { x: Math.round(anchor.x) };
+      if (mode === 'centerX') patch = { x: Math.round(anchor.x + anchor.width / 2 - node.width / 2) };
+      if (mode === 'right') patch = { x: Math.round(anchor.x + anchor.width - node.width) };
+      if (mode === 'top') patch = { y: Math.round(anchor.y) };
+      if (mode === 'centerY') patch = { y: Math.round(anchor.y + anchor.height / 2 - node.height / 2) };
+      if (mode === 'bottom') patch = { y: Math.round(anchor.y + anchor.height - node.height) };
       return { id: node.id, patch };
     });
-    applyLayoutUpdates(updates, '已对齐选中对象');
+    applyLayoutUpdates(updates, '已按最后选中对象对齐');
   };
 
   const distributeSelected = (axis: 'horizontal' | 'vertical') => {
@@ -2732,7 +2734,7 @@ export function App() {
       closeMenu();
       return;
     }
-    const anchor = nodes.find((node) => node.id === selectedNodeIds[0]) || nodes[0];
+    const anchor = nodes.find((node) => node.id === selectedNodeIds[selectedNodeIds.length - 1]) || nodes[nodes.length - 1];
     const updates = nodes.filter((node) => node.id !== anchor.id).map((node) => {
       const centerX = node.x + node.width / 2;
       const centerY = node.y + node.height / 2;
@@ -3973,7 +3975,7 @@ export function App() {
               <div className="settings-section-title"><strong>工程版本时间线</strong><span>{currentProjectPath ? `最近 ${projectVersions.length} 个保存版本` : '请先保存工程'}</span></div>
               {projectVersions.length === 0 ? <p className="muted">每次覆盖保存前会自动保留旧版本，最多 12 个，关闭软件后仍可恢复。</p> : projectVersions.map((version) => <div className="recovery-item" key={version.path}><b>{new Date(version.modifiedMs).toLocaleString()}</b><span>{version.canvasCount} 画布 · {version.nodeCount} 节点 · {version.assetCount} 资源 · {(version.sizeBytes / 1024 / 1024).toFixed(1)} MB</span><button disabled={!selectedNodeIds.length} onClick={() => void restoreSelectionFromVersion(version)}>恢复选中节点</button><button onClick={() => void restoreCanvasFromVersion(version)}>恢复当前画布</button><button onClick={() => void restoreProjectVersion(version)}>恢复整个工程</button></div>)}
             </section>
-            <PerformanceDiagnostics />
+            <PerformanceDiagnostics projectPath={currentProjectPath || undefined} />
             <ProjectHealthPanel project={project} />
             <section className="ai-settings-section">
               {!API_ONLY_EDITION && <section className="ai-local-model-manager">
@@ -4152,6 +4154,7 @@ export function App() {
       )}
 
       {workspaceSearchOpen && <WorkspaceSearch storageKey={`refmind3d.search-index.${workspaceCacheId}`} canvases={canvases.map((canvas) => ({ id: canvas.id, name: canvas.name, project: canvas.id === activeCanvasId ? project : canvasProject(canvas) }))} onClose={() => setWorkspaceSearchOpen(false)} onOpenHit={(hit) => void openWorkspaceSearchHit(hit)} />}
+      <TaskCenter />
     </div>
   );
 }
