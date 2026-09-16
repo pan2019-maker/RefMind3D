@@ -20,7 +20,7 @@ import { useProjectStore } from '../stores/projectStore';
 import type { AssetRecord, CanvasNode, CanvasWorkspaceRecord, DoodleTool, ImportedModel, RefMindProject, RefMindProjectFile, RefMindWorkspaceFile } from '../shared/types';
 import { exportProjectToPng, exportSelectedNodesToPng } from '../features/export/exportCanvas';
 import { clearImageCache, confirmDefaultImageCacheDirectory, getImageCacheStatus, migrateImageCache, setImageCacheDirectory, type ImageCacheStatus } from '../features/assets/imageCache';
-import { recordProjectSave } from '../features/performance/performanceMetrics';
+import { recordProjectOpen, recordProjectSave } from '../features/performance/performanceMetrics';
 
 const LazyModelViewer = lazy(() => import('../features/model-viewer/ModelViewer').then((module) => ({ default: module.ModelViewer })));
 
@@ -83,7 +83,7 @@ const WINDOW_OPACITY_STORAGE_KEY = 'refmind3d.window-opacity';
 const RECENT_PROJECTS_STORAGE_KEY = 'refmind3d.recent-projects';
 const RECOVERY_HISTORY_STORAGE_KEY = 'refmind3d.recovery-history';
 interface RecoveryHistoryItem { cacheId: string; projectPath: string; name: string; savedAt: string }
-interface ProjectVersionInfo { path: string; modifiedMs: number; sizeBytes: number }
+interface ProjectVersionInfo { path: string; modifiedMs: number; sizeBytes: number; canvasCount: number; nodeCount: number; assetCount: number }
 
 function readRecentProjects(): string[] {
   try { return JSON.parse(localStorage.getItem(RECENT_PROJECTS_STORAGE_KEY) || '[]').filter((item: unknown) => typeof item === 'string').slice(0, 10); }
@@ -1636,7 +1636,7 @@ export function App() {
         }))
         .catch((error) => console.warn('写入自动恢复副本失败', error))
         .finally(() => { recoverySaveBusyRef.current = false; });
-    }, 45_000);
+    }, 3_000);
     return () => window.clearTimeout(timer);
   }, [activeCanvasId, canvases, currentProjectPath, currentWorkspaceSignature, hasUnsavedChanges, project, workspaceCacheDirectory, workspaceCacheId]);
 
@@ -1679,8 +1679,19 @@ export function App() {
       } finally { sourceFolderScanBusyRef.current = false; }
     };
     void scan();
-    const timer = window.setInterval(() => void scan(), 15_000);
-    return () => { disposed = true; window.clearInterval(timer); };
+    const watch = async () => {
+      while (!disposed) {
+        try {
+          const changed = await invoke<string[]>('wait_source_folder_changes', { paths: project.sourceFolders || [], timeoutMs: 15_000 });
+          if (!disposed && changed.length) await scan();
+        } catch (error) {
+          if (!disposed) setStatus(`原生文件监听失败：${String(error)}`);
+          return;
+        }
+      }
+    };
+    void watch();
+    return () => { disposed = true; };
   }, [currentProjectPath, project.sourceFolders, project.sourceSyncMode, settings.importLayoutDirection]);
 
   const restoreProjectVersion = async (version: ProjectVersionInfo) => {
@@ -1703,6 +1714,19 @@ export function App() {
     setCanvases((current) => current.map((canvas) => canvas.id === activeCanvasId ? liveCanvas(canvas.id, canvas.name, restored) : canvas));
     setSettingsOpen(false);
     setStatus(`已从 ${new Date(version.modifiedMs).toLocaleString()} 恢复当前画布，保存后生效`);
+  };
+
+  const restoreSelectionFromVersion = async (version: ProjectVersionInfo) => {
+    if (!selectedNodeIds.length) { setStatus('请先选择需要从历史版本恢复的节点'); return; }
+    const archived = await loadProjectFile(version.path);
+    const archivedCanvas = isWorkspaceFile(archived) ? archived.canvases.find((canvas) => canvas.id === activeCanvasId)?.project : activeCanvasId === 'main-canvas' ? archived : undefined;
+    if (!archivedCanvas) return;
+    const wanted = new Set(selectedNodeIds); const restoredNodes = archivedCanvas.nodes.filter((node) => wanted.has(node.id));
+    if (!restoredNodes.length) { setStatus('该历史版本中没有选中的节点'); return; }
+    const assetIds = new Set(restoredNodes.flatMap((node) => node.assetId ? [node.assetId] : []));
+    const restoredAssets = archivedCanvas.assets.filter((asset) => assetIds.has(asset.id));
+    setProject({ ...project, nodes: [...project.nodes.filter((node) => !wanted.has(node.id)), ...restoredNodes], assets: [...project.assets.filter((asset) => !assetIds.has(asset.id)), ...restoredAssets], updatedAt: new Date().toISOString() });
+    setSettingsOpen(false); setStatus(`已从历史版本恢复 ${restoredNodes.length} 个节点`);
   };
 
   const scanVisualDuplicates = async () => {
@@ -1731,6 +1755,7 @@ export function App() {
   };
 
   const loadProjectFromPath = async (path: string) => {
+    const openStartedAt = performance.now();
     let original = await loadProjectIndex(path);
     persistedAssetIdsRef.current = projectAssetIds(original);
     recoveryBaselineRef.current = isWorkspaceFile(original)
@@ -1773,6 +1798,7 @@ export function App() {
       setSavedWorkspaceSignature(restoredRecovery ? '__recovered__' : workspaceContentSignature(canvasState, nextActiveId, active.project));
       setCurrentProjectPath(path);
       setStatus(`多画布工程已打开：${path}`);
+      recordProjectOpen(performance.now() - openStartedAt);
       return;
     }
 
@@ -1786,6 +1812,7 @@ export function App() {
     setSavedWorkspaceSignature(restoredRecovery ? '__recovered__' : workspaceContentSignature([legacyCanvas], legacyCanvas.id, useProjectStore.getState().project));
     setCurrentProjectPath(path);
     setStatus(`旧版单画布工程已打开：${path}`);
+    recordProjectOpen(performance.now() - openStartedAt);
   };
 
   useEffect(() => {
@@ -3944,7 +3971,7 @@ export function App() {
             </section>
             <section className="recovery-center">
               <div className="settings-section-title"><strong>工程版本时间线</strong><span>{currentProjectPath ? `最近 ${projectVersions.length} 个保存版本` : '请先保存工程'}</span></div>
-              {projectVersions.length === 0 ? <p className="muted">每次覆盖保存前会自动保留旧版本，最多 12 个，关闭软件后仍可恢复。</p> : projectVersions.map((version) => <div className="recovery-item" key={version.path}><b>{new Date(version.modifiedMs).toLocaleString()}</b><span>{(version.sizeBytes / 1024 / 1024).toFixed(1)} MB</span><button onClick={() => void restoreCanvasFromVersion(version)}>恢复当前画布</button><button onClick={() => void restoreProjectVersion(version)}>恢复整个工程</button></div>)}
+              {projectVersions.length === 0 ? <p className="muted">每次覆盖保存前会自动保留旧版本，最多 12 个，关闭软件后仍可恢复。</p> : projectVersions.map((version) => <div className="recovery-item" key={version.path}><b>{new Date(version.modifiedMs).toLocaleString()}</b><span>{version.canvasCount} 画布 · {version.nodeCount} 节点 · {version.assetCount} 资源 · {(version.sizeBytes / 1024 / 1024).toFixed(1)} MB</span><button disabled={!selectedNodeIds.length} onClick={() => void restoreSelectionFromVersion(version)}>恢复选中节点</button><button onClick={() => void restoreCanvasFromVersion(version)}>恢复当前画布</button><button onClick={() => void restoreProjectVersion(version)}>恢复整个工程</button></div>)}
             </section>
             <PerformanceDiagnostics />
             <ProjectHealthPanel project={project} />
@@ -4124,7 +4151,7 @@ export function App() {
         </div>
       )}
 
-      {workspaceSearchOpen && <WorkspaceSearch canvases={canvases.map((canvas) => ({ id: canvas.id, name: canvas.name, project: canvas.id === activeCanvasId ? project : canvasProject(canvas) }))} onClose={() => setWorkspaceSearchOpen(false)} onOpenHit={(hit) => void openWorkspaceSearchHit(hit)} />}
+      {workspaceSearchOpen && <WorkspaceSearch storageKey={`refmind3d.search-index.${workspaceCacheId}`} canvases={canvases.map((canvas) => ({ id: canvas.id, name: canvas.name, project: canvas.id === activeCanvasId ? project : canvasProject(canvas) }))} onClose={() => setWorkspaceSearchOpen(false)} onOpenHit={(hit) => void openWorkspaceSearchHit(hit)} />}
     </div>
   );
 }

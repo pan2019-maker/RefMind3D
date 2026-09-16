@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context};
 use base64::Engine;
-use image::{DynamicImage, GenericImageView, ImageDecoder, ImageFormat, ImageReader, metadata::Orientation};
+use image::{DynamicImage, GenericImageView, ImageDecoder, ImageEncoder, ImageReader, metadata::Orientation};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
@@ -216,14 +216,14 @@ fn prepare_sync(project_id: &str, cache_directory: Option<&str>, asset: &Value) 
         SourceLocation::Runtime(url) => runtime_assets::read_resource_url(&url).map_err(|e| anyhow!(e))?.0,
         SourceLocation::Memory(bytes) => bytes,
     };
-    let image = decode(&bytes, &source.extension)?;
+    let (image, icc_profile) = decode(&bytes, &source.extension)?;
     let preview = dir.join("decoded-preview.png");
     let medium = dir.join("medium-preview.png");
     let thumb = dir.join("thumbnail.png");
     let (source_width, source_height) = image.dimensions();
-    write_png(&preview, resize(image.clone(), 2400))?;
-    write_png(&medium, resize(image.clone(), 1200))?;
-    write_png(&thumb, resize(image.clone(), 512))?;
+    write_png(&preview, resize(image.clone(), 2400), icc_profile.as_deref())?;
+    write_png(&medium, resize(image.clone(), 1200), icc_profile.as_deref())?;
+    write_png(&thumb, resize(image.clone(), 512), icc_profile.as_deref())?;
     let tile_size = 1024;
     let tiled = source_width.max(source_height) > 4096;
     let pyramid = if tiled { resize(image, 8192) } else { DynamicImage::new_rgba8(1, 1) };
@@ -235,7 +235,7 @@ fn prepare_sync(project_id: &str, cache_directory: Option<&str>, asset: &Value) 
         let x = column * tile_size; let y = row * tile_size;
         let width = tile_size.min(image_width - x); let height = tile_size.min(image_height - y);
         let file = format!("tile-{row}-{column}.png");
-        write_png(&dir.join(&file), pyramid.crop_imm(x, y, width, height))?;
+        write_png(&dir.join(&file), pyramid.crop_imm(x, y, width, height), icc_profile.as_deref())?;
         tile_files.push(file);
     }}
     let manifest = CacheManifest { source_size: size, source_modified_ms: modified, source_hash: hash, preview_file: "decoded-preview.png".into(), medium_file: Some("medium-preview.png".into()), thumbnail_file: "thumbnail.png".into(), tile_files: tile_files.clone(), tile_size, tile_columns, image_width, image_height, last_accessed_ms: now_ms() };
@@ -271,21 +271,22 @@ fn describe_source(asset: &Value) -> anyhow::Result<SourceDescriptor> {
 fn extension(name: &str, asset: &Value) -> String {
     Path::new(name).extension().and_then(|v| v.to_str()).or_else(|| asset.get("format").and_then(Value::as_str)).unwrap_or("png").to_ascii_lowercase()
 }
-fn decode(bytes: &[u8], ext: &str) -> anyhow::Result<DynamicImage> {
+fn decode(bytes: &[u8], ext: &str) -> anyhow::Result<(DynamicImage, Option<Vec<u8>>)> {
     if matches!(ext, "psd" | "psb") {
         let psd = psd::Psd::from_bytes(bytes).map_err(|e| anyhow!("PSD 解码失败：{e}"))?;
         let rgba = image::ImageBuffer::from_raw(psd.width(), psd.height(), psd.rgba()).ok_or_else(|| anyhow!("PSD 像素数据无效"))?;
-        Ok(DynamicImage::ImageRgba8(rgba))
+        Ok((DynamicImage::ImageRgba8(rgba), None))
     } else {
         let mut decoder = ImageReader::new(Cursor::new(bytes)).with_guessed_format()?.into_decoder()?;
+        let icc_profile = decoder.icc_profile().ok().flatten();
         let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
         let mut image = DynamicImage::from_decoder(decoder)?;
         image.apply_orientation(orientation);
-        Ok(image)
+        Ok((image, icc_profile))
     }
 }
 fn resize(image: DynamicImage, max: u32) -> DynamicImage { let (w,h) = image.dimensions(); if w.max(h) <= max { image } else { image.thumbnail(max,max) } }
-fn write_png(path: &Path, image: DynamicImage) -> anyhow::Result<()> { let mut out = Cursor::new(Vec::new()); image.write_to(&mut out, ImageFormat::Png)?; fs::write(path, out.into_inner()).with_context(|| format!("写入缓存失败：{}", path.display())) }
+fn write_png(path: &Path, image: DynamicImage, icc_profile: Option<&[u8]>) -> anyhow::Result<()> { let rgba = image.to_rgba8(); let (width, height) = rgba.dimensions(); let mut bytes = Vec::new(); { let mut encoder = image::codecs::png::PngEncoder::new(&mut bytes); if let Some(profile) = icc_profile { encoder.set_icc_profile(profile.to_vec())?; } encoder.write_image(rgba.as_raw(), width, height, image::ExtendedColorType::Rgba8)?; } fs::write(path, bytes).with_context(|| format!("写入缓存失败：{}", path.display())) }
 fn register(asset_id: &str, project_id: &str, preview: &Path, medium: Option<&Path>, thumb: &Path, tiles: &[PathBuf], tile_size: u32, tile_columns: u32, image_width: u32, image_height: u32, generation: &str, hit: bool) -> PreparedImageCache {
     let suffix = safe(project_id);
     // A regenerated image gets fingerprinted URLs. Drop older registrations for

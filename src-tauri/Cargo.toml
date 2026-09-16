@@ -1,6 +1,6 @@
 [package]
 name = "refmind3d"
-version = "1.10.0"
+version = "1.11.0"
 description = "High-performance image and 3D reference board"
 authors = ["RefMind3D Team"]
 edition = "2021"
@@ -27,6 +27,7 @@ psd = "0.3"
 infer = "0.16"
 gltf = "1.4"
 walkdir = "2"
+notify = "7"
 time = "=0.3.36"
 
 base64 = "0.22"

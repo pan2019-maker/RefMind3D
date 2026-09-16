@@ -12,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::runtime_assets::{self, PackedResourceRegistration};
 
@@ -84,6 +85,20 @@ pub struct ProjectVersionInfo {
     path: String,
     modified_ms: u64,
     size_bytes: u64,
+    canvas_count: usize,
+    node_count: usize,
+    asset_count: usize,
+}
+
+fn version_counts(path: &Path) -> (usize, usize, usize) {
+    let Ok(file) = File::open(path) else { return (0, 0, 0) };
+    let Ok(mut archive) = ZipArchive::new(file) else { return (0, 0, 0) };
+    let mut manifest_text = String::new();
+    match archive.by_name("project.json") { Ok(mut file) => { if file.read_to_string(&mut manifest_text).is_err() { return (0, 0, 0) } }, Err(_) => return (0, 0, 0) }
+    let Ok(manifest) = serde_json::from_str::<PackedProjectFile>(&manifest_text) else { return (0, 0, 0) };
+    let canvas_count = manifest.canvases.len().max(1); let mut nodes = 0; let mut assets = 0;
+    for canvas in &manifest.canvases { let mut text = String::new(); if let Ok(mut file) = archive.by_name(&canvas.zip_path) { if file.read_to_string(&mut text).is_ok() { if let Ok(value) = serde_json::from_str::<Value>(&text) { nodes += value.get("nodes").and_then(Value::as_array).map_or(0, Vec::len); assets += value.get("assets").and_then(Value::as_array).map_or(0, Vec::len); } } } }
+    (canvas_count, nodes, assets)
 }
 
 #[tauri::command]
@@ -103,6 +118,21 @@ pub fn scan_asset_folder(path: String) -> Result<Vec<String>, String> {
         }).collect::<Vec<_>>();
     paths.sort_by_key(|path| path.to_lowercase());
     Ok(paths)
+}
+
+#[tauri::command]
+pub async fn wait_source_folder_changes(paths: Vec<String>, timeout_ms: Option<u64>) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut watcher = RecommendedWatcher::new(move |event| { let _ = sender.send(event); }, notify::Config::default())
+            .map_err(|e| format!("启动原生文件监听失败: {e}"))?;
+        for path in paths { let root = PathBuf::from(path); if root.is_dir() { watcher.watch(&root, RecursiveMode::Recursive).map_err(|e| format!("监听文件夹失败: {e}"))?; } }
+        let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(15_000).clamp(1_000, 30_000));
+        let mut changed = HashSet::new();
+        if let Ok(Ok(event)) = receiver.recv_timeout(timeout) { for path in event.paths { changed.insert(path.to_string_lossy().to_string()); } }
+        while let Ok(Ok(event)) = receiver.try_recv() { for path in event.paths { changed.insert(path.to_string_lossy().to_string()); } }
+        Ok::<Vec<String>, String>(changed.into_iter().collect())
+    }).await.map_err(|e| format!("文件监听任务失败: {e}"))?
 }
 
 fn version_directory(project_path: &str, cache_id: Option<&str>) -> PathBuf {
@@ -137,7 +167,8 @@ pub fn list_project_versions(project_path: String, cache_id: Option<String>) -> 
         .filter_map(Result::ok).filter_map(|entry| {
             let meta = entry.metadata().ok()?;
             let modified_ms = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_millis() as u64;
-            Some(ProjectVersionInfo { path: entry.path().to_string_lossy().to_string(), modified_ms, size_bytes: meta.len() })
+            let path = entry.path(); let (canvas_count, node_count, asset_count) = version_counts(&path);
+            Some(ProjectVersionInfo { path: path.to_string_lossy().to_string(), modified_ms, size_bytes: meta.len(), canvas_count, node_count, asset_count })
         }).collect::<Vec<_>>();
     versions.sort_by_key(|item| std::cmp::Reverse(item.modified_ms));
     Ok(versions)
@@ -296,6 +327,14 @@ pub async fn save_recovery_project(cache_id: String, project: Value) -> Result<(
         let destination = recovery_path(&cache_id);
         let temporary = directory.join(format!(".recovery-{}.tmp", Uuid::new_v4()));
         let bytes = serde_json::to_vec(&project).map_err(|e| format!("Serialize recovery snapshot failed: {e}"))?;
+        let journal_dir = directory.join("Journals").join(sanitize_file_name(&cache_id));
+        fs::create_dir_all(&journal_dir).map_err(|e| format!("Create edit journal failed: {e}"))?;
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map(|value| value.as_millis()).unwrap_or(0);
+        fs::write(journal_dir.join(format!("{stamp}.json")), &bytes).map_err(|e| format!("Append edit journal failed: {e}"))?;
+        let mut journal = fs::read_dir(&journal_dir).into_iter().flatten().filter_map(Result::ok).collect::<Vec<_>>();
+        journal.sort_by_key(|entry| entry.file_name());
+        let remove_count = journal.len().saturating_sub(20);
+        for entry in journal.into_iter().take(remove_count) { let _ = fs::remove_file(entry.path()); }
         let mut file = File::create(&temporary).map_err(|e| format!("Create recovery snapshot failed: {e}"))?;
         file.write_all(&bytes).map_err(|e| format!("Write recovery snapshot failed: {e}"))?;
         file.sync_all().map_err(|e| format!("Flush recovery snapshot failed: {e}"))?;

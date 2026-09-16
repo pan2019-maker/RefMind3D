@@ -23,6 +23,7 @@ export interface PerformanceMetrics {
   lastSaveMs?: number;
   inputLatencyP95Ms: number;
   gpuTextureCount: number;
+  projectOpenMs?: number;
 }
 
 const metrics: PerformanceMetrics = {
@@ -50,6 +51,7 @@ export function recordImageCacheResult(hit: boolean) {
 export function recordProjectSave(milliseconds: number) {
   updatePerformanceMetrics({ lastSaveMs: Math.round(milliseconds) });
 }
+export function recordProjectOpen(milliseconds: number) { updatePerformanceMetrics({ projectOpenMs: Math.round(milliseconds) }); }
 
 export function recordSourceRefresh() {
   metrics.sourceRefreshes += 1;

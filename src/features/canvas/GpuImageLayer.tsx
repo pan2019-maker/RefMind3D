@@ -13,6 +13,7 @@ export interface GpuImageItem {
   flipX: boolean;
   flipY: boolean;
   grayscale: boolean;
+  u0: number; v0: number; u1: number; v1: number;
 }
 
 const vertexSource = `
@@ -96,8 +97,8 @@ export const GpuImageLayer = memo(function GpuImageLayer({ items, width, height,
         runtime.gl.bindBuffer(runtime.gl.ARRAY_BUFFER, runtime.positionBuffer);
         runtime.gl.bufferData(runtime.gl.ARRAY_BUFFER, new Float32Array([...tl, ...tr, ...bl, ...bl, ...tr, ...br]), runtime.gl.STREAM_DRAW);
         runtime.gl.enableVertexAttribArray(runtime.positionLocation); runtime.gl.vertexAttribPointer(runtime.positionLocation, 2, runtime.gl.FLOAT, false, 0, 0);
-      const leftU = item.flipX ? 1 : 0; const rightU = item.flipX ? 0 : 1;
-      const topV = item.flipY ? 1 : 0; const bottomV = item.flipY ? 0 : 1;
+      const leftU = item.flipX ? item.u1 : item.u0; const rightU = item.flipX ? item.u0 : item.u1;
+      const topV = item.flipY ? item.v1 : item.v0; const bottomV = item.flipY ? item.v0 : item.v1;
         runtime.gl.bindBuffer(runtime.gl.ARRAY_BUFFER, runtime.textureBuffer);
         runtime.gl.bufferData(runtime.gl.ARRAY_BUFFER, new Float32Array([leftU, topV, rightU, topV, leftU, bottomV, leftU, bottomV, rightU, topV, rightU, bottomV]), runtime.gl.STREAM_DRAW);
         runtime.gl.enableVertexAttribArray(runtime.textureLocation); runtime.gl.vertexAttribPointer(runtime.textureLocation, 2, runtime.gl.FLOAT, false, 0, 0);

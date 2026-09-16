@@ -1,6 +1,6 @@
 import { SpatialGridIndex } from '../canvas/spatialIndex';
 
-export type BenchmarkResult = { nodeCount: number; buildMs: number; queryMs: number; transformMs: number; averageHits: number };
+export type BenchmarkResult = { nodeCount: number; buildMs: number; queryMs: number; transformMs: number; tileSelectionMs: number; estimatedPeakMb: number; averageHits: number };
 
 export async function runCanvasBenchmark(nodeCount = 10_000): Promise<BenchmarkResult> {
   await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
@@ -27,5 +27,12 @@ export async function runCanvasBenchmark(nodeCount = 10_000): Promise<BenchmarkR
     for (let frame = 0; frame < 120; frame += 1) surface.style.transform = `translate3d(${frame * 7}px,${frame * 3}px,0) scale(${1 + frame / 1000})`;
     surface.replaceChildren();
   }
-  return { nodeCount, buildMs: Math.round(buildMs * 10) / 10, queryMs: Math.round(queryMs * 10) / 10, transformMs: Math.round((performance.now() - transformStart) * 10) / 10, averageHits: Math.round(hits / 200) };
+  const transformMs = performance.now() - transformStart;
+  const tileStart = performance.now(); let visibleTiles = 0;
+  for (let frame = 0; frame < 120; frame += 1) for (let image = 0; image < 1_000; image += 1) {
+    const tileX = (frame * 173 + image * 997) % 8_192; const tileY = (frame * 89 + image * 313) % 8_192;
+    visibleTiles += Math.ceil((Math.min(8_192, tileX + 1_920) - tileX) / 1_024) * Math.ceil((Math.min(8_192, tileY + 1_080) - tileY) / 1_024);
+  }
+  const tileSelectionMs = performance.now() - tileStart;
+  return { nodeCount, buildMs: Math.round(buildMs * 10) / 10, queryMs: Math.round(queryMs * 10) / 10, transformMs: Math.round(transformMs * 10) / 10, tileSelectionMs: Math.round(tileSelectionMs * 10) / 10, estimatedPeakMb: Math.round((visibleTiles / 120 * 4 + Math.min(nodeCount, 2_000) * .02) * 10) / 10, averageHits: Math.round(hits / 200) };
 }

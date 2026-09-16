@@ -40,6 +40,7 @@ pub fn run() {
             commands::model::convert_model_to_obj,
             commands::project::save_project,
             commands::project::scan_asset_folder,
+            commands::project::wait_source_folder_changes,
             commands::project::list_project_versions,
             commands::project::restore_project_version,
             commands::project::save_recovery_project,

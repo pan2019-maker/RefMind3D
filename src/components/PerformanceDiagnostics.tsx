@@ -30,7 +30,7 @@ export function PerformanceDiagnostics() {
     if (!path) return;
     const report = {
       generatedAt: new Date().toISOString(),
-      appVersion: '1.10.0',
+      appVersion: '1.11.0',
       platform: navigator.platform,
       hardwareConcurrency: navigator.hardwareConcurrency,
       deviceMemoryGb: (navigator as Navigator & { deviceMemory?: number }).deviceMemory,
@@ -55,6 +55,7 @@ export function PerformanceDiagnostics() {
         <span>缓存命中率</span><code>{hitRate}%（{requests} 次）</code>
         <span>源文件刷新</span><code>{metrics.sourceRefreshes} 次</code>
         <span>最近保存</span><code>{metrics.lastSaveMs === undefined ? '尚未记录' : `${metrics.lastSaveMs} ms`}</code>
+        <span>最近工程打开</span><code>{metrics.projectOpenMs === undefined ? '尚未记录' : `${metrics.projectOpenMs} ms（索引与当前画布）`}</code>
       </div>
       <div className="performance-benchmark-row">
         <button disabled={benchmarking} onClick={() => {
@@ -62,7 +63,7 @@ export function PerformanceDiagnostics() {
           void runCanvasBenchmark().then(setBenchmark).finally(() => setBenchmarking(false));
         }}>{benchmarking ? '正在测试…' : '运行 10,000 节点基准'}</button>
         <button onClick={() => void exportReport()}>导出诊断报告</button>
-        {benchmark && <code>索引 {benchmark.buildMs} ms · 查询 {benchmark.queryMs} ms · 120 帧合成 {benchmark.transformMs} ms · 平均 {benchmark.averageHits} 节点</code>}
+        {benchmark && <code>索引 {benchmark.buildMs} ms · 查询 {benchmark.queryMs} ms · 120 帧合成 {benchmark.transformMs} ms · 千张 8K 瓦片调度 {benchmark.tileSelectionMs} ms · 压力估算 {benchmark.estimatedPeakMb} MB</code>}
       </div>
     </section>
   );

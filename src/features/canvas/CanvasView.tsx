@@ -502,7 +502,7 @@ function cloneWorkbook(workbook: SpreadsheetWorkbook): SpreadsheetWorkbook {
   return JSON.parse(JSON.stringify(workbook)) as SpreadsheetWorkbook;
 }
 
-const CanvasImage = memo(function CanvasImage({ asset, node, canvasGrayscale, projectCacheId, cacheDirectory, cacheEpoch, lowZoom, displaySize, visible, loadPriority, loadEnabled, allowFullResolution, alt, selected, title }: {
+const CanvasImage = memo(function CanvasImage({ asset, node, canvasGrayscale, projectCacheId, cacheDirectory, cacheEpoch, lowZoom, displaySize, screenRect, viewportSize, visible, loadPriority, loadEnabled, allowFullResolution, alt, selected, title }: {
   asset: AssetRecord;
   node: CanvasNode;
   canvasGrayscale: boolean;
@@ -511,6 +511,8 @@ const CanvasImage = memo(function CanvasImage({ asset, node, canvasGrayscale, pr
   cacheEpoch: number;
   lowZoom: boolean;
   displaySize: number;
+  screenRect: { x: number; y: number; width: number; height: number };
+  viewportSize: { width: number; height: number };
   visible: boolean;
   loadPriority: 0 | 1 | 2;
   loadEnabled: boolean;
@@ -592,6 +594,22 @@ const CanvasImage = memo(function CanvasImage({ asset, node, canvasGrayscale, pr
     `scaleY(${node.flipY ? -1 : 1})`
   ].join(' ');
   const useTiles = Boolean(cached?.tileUrls.length && cached.tileColumns > 0 && displaySize > 1800 && visible && !node.cropEnabled);
+  const visibleTileIndexes = useMemo(() => {
+    if (!useTiles || !cached) return new Set<number>();
+    const scale = Math.min(screenRect.width / cached.imageWidth, screenRect.height / cached.imageHeight);
+    const renderWidth = cached.imageWidth * scale; const renderHeight = cached.imageHeight * scale;
+    const left = screenRect.x + (screenRect.width - renderWidth) / 2; const top = screenRect.y + (screenRect.height - renderHeight) / 2;
+    const x0 = Math.max(0, (Math.max(0, left) - left) / scale - cached.tileSize);
+    const y0 = Math.max(0, (Math.max(0, top) - top) / scale - cached.tileSize);
+    const x1 = Math.min(cached.imageWidth, (Math.min(viewportSize.width, left + renderWidth) - left) / scale + cached.tileSize);
+    const y1 = Math.min(cached.imageHeight, (Math.min(viewportSize.height, top + renderHeight) - top) / scale + cached.tileSize);
+    const indexes = new Set<number>(); const rows = Math.ceil(cached.imageHeight / cached.tileSize);
+    for (let row = 0; row < rows; row += 1) for (let column = 0; column < cached.tileColumns; column += 1) {
+      const tx = column * cached.tileSize; const ty = row * cached.tileSize;
+      if (tx < x1 && tx + cached.tileSize > x0 && ty < y1 && ty + cached.tileSize > y0) indexes.add(row * cached.tileColumns + column);
+    }
+    return indexes;
+  }, [cached, screenRect, useTiles, viewportSize]);
 
   return (
     <>
@@ -602,6 +620,7 @@ const CanvasImage = memo(function CanvasImage({ asset, node, canvasGrayscale, pr
         opacity: node.opacity ?? 1,
         filter: canvasGrayscale || node.grayscale ? 'grayscale(1)' : undefined
       }}>{cached.tileUrls.map((url, index) => {
+        if (!visibleTileIndexes.has(index)) return null;
         const column = index % cached.tileColumns; const row = Math.floor(index / cached.tileColumns);
         const x = column * cached.tileSize; const y = row * cached.tileSize;
         const tileWidth = Math.min(cached.tileSize, cached.imageWidth - x); const tileHeight = Math.min(cached.tileSize, cached.imageHeight - y);
@@ -1062,9 +1081,21 @@ export function CanvasView({
     if (!gpuSupported || images.length < 30 || (view.scale >= 0.32 && project.nodes.length < 2_000)) return [] as GpuImageItem[];
     return images.flatMap((node) => {
       const asset = node.assetId ? assetsById.get(node.assetId) : undefined;
-      if (!asset || selectedNodeIdSet.has(node.id) || node.cropEnabled) return [];
+      if (!asset || selectedNodeIdSet.has(node.id)) return [];
       const screen = worldToScreen(node, view, worldOrigin);
-      return [{ id: node.id, src: assetUrl(asset, true), x: screen.x, y: screen.y, width: node.width * view.scale, height: node.height * view.scale, opacity: node.opacity ?? 1, rotation: node.rotation || 0, flipX: Boolean(node.flipX), flipY: Boolean(node.flipY), grayscale: Boolean(node.grayscale || project.canvasGrayscale) }];
+      const naturalWidth = Number((asset as AssetRecord & { width?: number }).width) || node.width;
+      const naturalHeight = Number((asset as AssetRecord & { height?: number }).height) || node.height;
+      let x = screen.x; let y = screen.y; let width = node.width * view.scale; let height = node.height * view.scale;
+      let u0 = 0; let v0 = 0; let u1 = 1; let v1 = 1;
+      const sourceAspect = naturalWidth / Math.max(1, naturalHeight); const targetAspect = node.width / Math.max(1, node.height);
+      if (node.cropEnabled) {
+        if (sourceAspect > targetAspect) { const visible = targetAspect / sourceAspect / (node.imageScale || 1); u0 = .5 - visible / 2 - (node.imagePanX || 0) / 200; u1 = u0 + visible; }
+        else { const visible = sourceAspect / targetAspect / (node.imageScale || 1); v0 = .5 - visible / 2 - (node.imagePanY || 0) / 200; v1 = v0 + visible; }
+        u0 = Math.max(0, u0); v0 = Math.max(0, v0); u1 = Math.min(1, u1); v1 = Math.min(1, v1);
+      } else if (sourceAspect > targetAspect) {
+        height = width / sourceAspect; y += (node.height * view.scale - height) / 2;
+      } else { width = height * sourceAspect; x += (node.width * view.scale - width) / 2; }
+      return [{ id: node.id, src: assetUrl(asset, true), x, y, width, height, opacity: node.opacity ?? 1, rotation: node.rotation || 0, flipX: Boolean(node.flipX), flipY: Boolean(node.flipY), grayscale: Boolean(node.grayscale || project.canvasGrayscale), u0, v0, u1, v1 }];
     });
   }, [assetsById, gpuSupported, project.canvasGrayscale, project.nodes.length, renderedNodes, selectedNodeIdSet, view, worldOrigin]);
   const gpuImageIds = useMemo(() => new Set(gpuImageItems.map((item) => item.id)), [gpuImageItems]);
@@ -2553,6 +2584,8 @@ export function CanvasView({
                     cacheEpoch={imageCacheEpoch}
                     lowZoom={lowZoom}
                     displaySize={Math.max(screenRect.width, screenRect.height)}
+                    screenRect={screenRect}
+                    viewportSize={viewportSize}
                     visible={resourceVisible}
                     loadPriority={resourceVisible ? 0 : (predictedPrefetchIds.has(node.id) ? 1 : 2)}
                     loadEnabled={pageVisible}
