@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { open } from '@tauri-apps/plugin-dialog';
 import { exists, stat } from '@tauri-apps/plugin-fs';
 import { useProjectStore } from '../stores/projectStore';
-import type { CanvasNode, ImportedModel } from '../shared/types';
+import type { CanvasNode, ImportedImage, ImportedModel } from '../shared/types';
 
 function numberValue(value: string, fallback: number) {
   const parsed = Number(value);
@@ -134,6 +134,7 @@ export function InspectorPanel() {
       {asset && <div className="asset-detail">
         <div className="panel-heading"><h3>资源</h3><span>{asset.format.toUpperCase()}</span></div>
         <p>{(asset.fileSize / 1024 / 1024).toFixed(2)} MB</p>
+        {asset.kind === 'image' && <p>色彩配置：{(asset as ImportedImage).colorProfile || '旧资源，重新导入后检测'}</p>}
         <p className="path-text">{asset.originalPath || asset.projectAssetPath}</p>
         <label>资源标签<input value={(asset.tags || []).join(', ')} placeholder="人物, 配色, 建筑" onChange={(event) => updateAsset(asset.id, { tags: event.currentTarget.value.split(/[,，]/).map((tag) => tag.trim()).filter(Boolean) })} /></label>
         {linkedMissing && <p className="asset-missing-warning">链接文件已失联，请重新定位。</p>}

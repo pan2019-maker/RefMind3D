@@ -48,6 +48,7 @@ export interface ImportedImage extends AssetRecord {
   width: number;
   height: number;
   channels?: number;
+  colorProfile?: string;
 }
 
 export interface ImportedDocument extends AssetRecord {
@@ -208,6 +209,8 @@ export interface RefMindProject {
   cacheDirectory?: string;
   /** Folders watched for newly added supported assets. */
   sourceFolders?: string[];
+  sourceSyncMode?: 'auto' | 'notify' | 'off';
+  sourceSyncLog?: Array<{ id: string; kind: 'added' | 'missing' | 'error'; path: string; at: string }>;
   name: string;
   rootPath?: string;
   assets: AssetRecord[];

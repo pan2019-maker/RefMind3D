@@ -30,7 +30,7 @@ export function PerformanceDiagnostics() {
     if (!path) return;
     const report = {
       generatedAt: new Date().toISOString(),
-      appVersion: '1.8.0',
+      appVersion: '1.10.0',
       platform: navigator.platform,
       hardwareConcurrency: navigator.hardwareConcurrency,
       deviceMemoryGb: (navigator as Navigator & { deviceMemory?: number }).deviceMemory,
@@ -51,6 +51,7 @@ export function PerformanceDiagnostics() {
         <span>图片队列</span><code>活动 {metrics.imageLoadsActive} · 等待 {metrics.imageLoadsQueued} · 并发 {metrics.imageLoadConcurrency}</code>
         <span>图片清晰度</span><code>缩略 {metrics.imageTierThumbnail} · 中等 {metrics.imageTierMedium} · 预览 {metrics.imageTierPreview} · 原图 {metrics.imageTierFull}</code>
         <span>纹理估算</span><code>{metrics.estimatedTextureMb} MB · 内存缓存 {metrics.imageMemoryEntries} 项</code>
+        <span>GPU / 输入延迟</span><code>纹理 {metrics.gpuTextureCount} · P95 {metrics.inputLatencyP95Ms} ms</code>
         <span>缓存命中率</span><code>{hitRate}%（{requests} 次）</code>
         <span>源文件刷新</span><code>{metrics.sourceRefreshes} 次</code>
         <span>最近保存</span><code>{metrics.lastSaveMs === undefined ? '尚未记录' : `${metrics.lastSaveMs} ms`}</code>

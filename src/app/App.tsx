@@ -902,6 +902,7 @@ export function App() {
     deleteSelected,
     selectedNodeIds,
     selectNode,
+    selectNodes,
     undo,
     redo,
     copySelected,
@@ -983,6 +984,8 @@ export function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [workspaceSearchOpen, setWorkspaceSearchOpen] = useState(false);
   const [projectVersions, setProjectVersions] = useState<ProjectVersionInfo[]>([]);
+  const [visualDuplicateGroups, setVisualDuplicateGroups] = useState<string[][]>([]);
+  const [visualDuplicateBusy, setVisualDuplicateBusy] = useState(false);
   const sourceFolderScanBusyRef = useRef(false);
   const [exportCenterOpen, setExportCenterOpen] = useState(false);
   useEffect(() => {
@@ -1644,7 +1647,7 @@ export function App() {
   }, [settingsOpen, currentProjectPath, workspaceCacheId, savedWorkspaceSignature]);
 
   useEffect(() => {
-    if (!currentProjectPath || !(project.sourceFolders || []).length) return;
+    if (!currentProjectPath || !(project.sourceFolders || []).length || project.sourceSyncMode === 'off') return;
     let disposed = false;
     const scan = async () => {
       if (sourceFolderScanBusyRef.current) return;
@@ -1652,11 +1655,24 @@ export function App() {
       try {
         const batches = await Promise.all((project.sourceFolders || []).map((folder) => invoke<string[]>('scan_asset_folder', { path: folder })));
         if (disposed) return;
-        const known = new Set(useProjectStore.getState().project.assets.flatMap((asset) => [asset.originalPath, asset.projectAssetPath]).filter(Boolean).map((path) => path.toLowerCase()));
-        const added = [...new Set(batches.flat())].filter((path) => !known.has(path.toLowerCase()));
+        const current = useProjectStore.getState().project;
+        const scanned = [...new Set(batches.flat())];
+        const scannedSet = new Set(scanned.map((path) => path.toLowerCase()));
+        const known = new Set(current.assets.flatMap((asset) => [asset.originalPath, asset.projectAssetPath]).filter(Boolean).map((path) => path.toLowerCase()));
+        const added = scanned.filter((path) => !known.has(path.toLowerCase()));
+        const roots = (current.sourceFolders || []).map((folder) => folder.toLowerCase());
+        const missing = current.assets.filter((asset) => asset.originalPath && roots.some((root) => asset.originalPath.toLowerCase().startsWith(root)) && !scannedSet.has(asset.originalPath.toLowerCase()));
+        const previousKeys = new Set((current.sourceSyncLog || []).map((item) => `${item.kind}:${item.path.toLowerCase()}`));
+        const logEntries = [
+          ...added.filter((path) => !previousKeys.has(`added:${path.toLowerCase()}`)).map((path) => ({ id: crypto.randomUUID(), kind: 'added' as const, path, at: new Date().toISOString() })),
+          ...missing.filter((asset) => !previousKeys.has(`missing:${asset.originalPath.toLowerCase()}`)).map((asset) => ({ id: crypto.randomUUID(), kind: 'missing' as const, path: asset.originalPath, at: new Date().toISOString() }))
+        ];
+        if (logEntries.length) useProjectStore.getState().updateProjectOptions({ sourceSyncLog: [...logEntries, ...(current.sourceSyncLog || [])].slice(0, 100) });
         if (added.length) {
-          const result = await importPathsToProject(added, lastCanvasPointRef.current, settings.importLayoutDirection);
-          setStatus(`监控文件夹自动导入 ${result.imported} 个新资源`);
+          if ((current.sourceSyncMode || 'auto') === 'auto') {
+            const result = await importPathsToProject(added, lastCanvasPointRef.current, settings.importLayoutDirection);
+            setStatus(`监控文件夹自动导入 ${result.imported} 个新资源`);
+          } else setStatus(`监控文件夹发现 ${added.length} 个新资源，等待确认`);
         }
       } catch (error) {
         if (!disposed) setStatus(`监控文件夹读取失败：${String(error)}`);
@@ -1665,7 +1681,7 @@ export function App() {
     void scan();
     const timer = window.setInterval(() => void scan(), 15_000);
     return () => { disposed = true; window.clearInterval(timer); };
-  }, [currentProjectPath, project.sourceFolders, settings.importLayoutDirection]);
+  }, [currentProjectPath, project.sourceFolders, project.sourceSyncMode, settings.importLayoutDirection]);
 
   const restoreProjectVersion = async (version: ProjectVersionInfo) => {
     if (!currentProjectPath || !confirm(`恢复 ${new Date(version.modifiedMs).toLocaleString()} 的工程版本？当前文件会先在下一次保存时进入时间线。`)) return;
@@ -1673,6 +1689,45 @@ export function App() {
     await loadProjectFromPath(currentProjectPath);
     setSettingsOpen(false);
     setStatus('历史版本已恢复');
+  };
+
+  const restoreCanvasFromVersion = async (version: ProjectVersionInfo) => {
+    const archived = await loadProjectFile(version.path);
+    const archivedCanvas = isWorkspaceFile(archived)
+      ? archived.canvases.find((canvas) => canvas.id === activeCanvasId)?.project
+      : activeCanvasId === 'main-canvas' ? archived : undefined;
+    if (!archivedCanvas) { setStatus('该历史版本中没有当前画布'); return; }
+    if (!confirm(`只恢复当前画布“${project.name}”？其他画布保持不变。`)) return;
+    const restored = cloneProjectSnapshot(archivedCanvas);
+    setProject(restored);
+    setCanvases((current) => current.map((canvas) => canvas.id === activeCanvasId ? liveCanvas(canvas.id, canvas.name, restored) : canvas));
+    setSettingsOpen(false);
+    setStatus(`已从 ${new Date(version.modifiedMs).toLocaleString()} 恢复当前画布，保存后生效`);
+  };
+
+  const scanVisualDuplicates = async () => {
+    setVisualDuplicateBusy(true);
+    try {
+      const groups = await invoke<string[][]>('find_visual_duplicates', { assets: project.assets });
+      setVisualDuplicateGroups(groups);
+      setStatus(groups.length ? `发现 ${groups.length} 组视觉相似图片候选` : '没有发现视觉相似图片');
+    } finally { setVisualDuplicateBusy(false); }
+  };
+
+  const selectCollection = (kind: 'images' | 'tagged' | 'missing' | 'large' | 'recent') => {
+    const assetById = new Map(project.assets.map((asset) => [asset.id, asset]));
+    const recentCutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    const ids = project.nodes.filter((node) => {
+      const asset = node.assetId ? assetById.get(node.assetId) : undefined;
+      if (kind === 'images') return node.type === 'image';
+      if (kind === 'tagged') return Boolean(node.tags?.length || asset?.tags?.length);
+      if (kind === 'missing') return Boolean(asset?.storageMode === 'linked' && (project.sourceSyncLog || []).some((item) => item.kind === 'missing' && item.path.toLowerCase() === asset.originalPath.toLowerCase()));
+      if (kind === 'large') return Boolean(asset && asset.fileSize >= 100 * 1024 * 1024);
+      return Boolean(asset && Date.parse(asset.importedAt) >= recentCutoff);
+    }).map((node) => node.id);
+    selectNodes(ids);
+    if (ids.length) dispatchFocusNodeIds(ids);
+    setStatus(`智能集合已选择 ${ids.length} 个节点`);
   };
 
   const loadProjectFromPath = async (path: string) => {
@@ -3842,12 +3897,17 @@ export function App() {
             <section className="workflow-settings">
               <div className="settings-section-title"><strong>检索与资源治理</strong><button onClick={() => { setSettingsOpen(false); setWorkspaceSearchOpen(true); }}>全工程搜索</button></div>
               <p className="muted">Ctrl+Shift+P 搜索全部画布的标题、正文、文件名、路径与标签。</p>
-              <div className="cache-actions"><button onClick={() => { const count = mergeDuplicateAssets(); setStatus(count ? `已合并 ${count} 个精确重复资源` : '未发现可安全合并的精确重复资源'); }}>合并精确重复资源</button></div>
+              <div className="cache-actions"><button onClick={() => { const count = mergeDuplicateAssets(); setStatus(count ? `已合并 ${count} 个精确重复资源` : '未发现可安全合并的精确重复资源'); }}>合并精确重复资源</button><button disabled={visualDuplicateBusy} onClick={() => void scanVisualDuplicates()}>{visualDuplicateBusy ? '分析中…' : '扫描视觉相似图片'}</button></div>
               <p className="muted">只合并内容哈希一致或同一路径且大小一致的资源，节点引用会自动迁移，不使用容易误判的文件名相似度。</p>
+              <div className="smart-collection-row"><button onClick={() => selectCollection('images')}>全部图片</button><button onClick={() => selectCollection('tagged')}>已加标签</button><button onClick={() => selectCollection('recent')}>最近 7 天</button><button onClick={() => selectCollection('large')}>超大资源</button><button onClick={() => selectCollection('missing')}>失联资源</button></div>
+              {visualDuplicateGroups.slice(0, 8).map((group, index) => <div className="duplicate-candidate-row" key={group.join(':')}><span>相似组 {index + 1}</span><code>{group.length} 张</code><button onClick={() => { const assetIds = new Set(group); const ids = project.nodes.filter((node) => node.assetId && assetIds.has(node.assetId)).map((node) => node.id); selectNodes(ids); dispatchFocusNodeIds(ids); }}>在画布中选择</button></div>)}
             </section>
             <section className="workflow-settings">
               <div className="settings-section-title"><strong>工程监控文件夹</strong><button onClick={async () => { const folder = await open({ directory: true, multiple: false, title: '选择当前工程的资源监控文件夹' }); if (typeof folder === 'string') updateSourceFolders([...(project.sourceFolders || []), folder]); }}>添加文件夹</button></div>
+              <label className="setting-select-row"><span>同步策略</span><select value={project.sourceSyncMode || 'auto'} onChange={(event) => updateProjectOptions({ sourceSyncMode: event.currentTarget.value as RefMindProject['sourceSyncMode'] })}><option value="auto">自动导入新增文件</option><option value="notify">仅提醒</option><option value="off">暂停监控</option></select></label>
               {(project.sourceFolders || []).length === 0 ? <p className="muted">尚未添加。添加后将定期发现新文件并导入当前画布。</p> : (project.sourceFolders || []).map((folder) => <div className="source-folder-row" key={folder}><code>{folder}</code><button onClick={() => updateSourceFolders((project.sourceFolders || []).filter((item) => item !== folder))}>移除</button></div>)}
+              {(project.sourceSyncLog || []).slice(0, 8).map((item) => <div className={`sync-log-row sync-${item.kind}`} key={item.id}><span>{item.kind === 'added' ? '新增' : item.kind === 'missing' ? '失联' : '错误'}</span><code>{item.path}</code><small>{new Date(item.at).toLocaleTimeString()}</small>{item.kind === 'added' && project.sourceSyncMode === 'notify' && <button onClick={() => void importPathsToProject([item.path], lastCanvasPointRef.current, settings.importLayoutDirection)}>导入</button>}</div>)}
+              {(project.sourceSyncLog || []).length > 0 && <button onClick={() => updateProjectOptions({ sourceSyncLog: [] })}>清空同步记录</button>}
             </section>
             <section className="storage-settings">
               <div className="settings-section-title">
@@ -3884,7 +3944,7 @@ export function App() {
             </section>
             <section className="recovery-center">
               <div className="settings-section-title"><strong>工程版本时间线</strong><span>{currentProjectPath ? `最近 ${projectVersions.length} 个保存版本` : '请先保存工程'}</span></div>
-              {projectVersions.length === 0 ? <p className="muted">每次覆盖保存前会自动保留旧版本，最多 12 个，关闭软件后仍可恢复。</p> : projectVersions.map((version) => <div className="recovery-item" key={version.path}><b>{new Date(version.modifiedMs).toLocaleString()}</b><span>{(version.sizeBytes / 1024 / 1024).toFixed(1)} MB</span><button onClick={() => void restoreProjectVersion(version)}>恢复</button></div>)}
+              {projectVersions.length === 0 ? <p className="muted">每次覆盖保存前会自动保留旧版本，最多 12 个，关闭软件后仍可恢复。</p> : projectVersions.map((version) => <div className="recovery-item" key={version.path}><b>{new Date(version.modifiedMs).toLocaleString()}</b><span>{(version.sizeBytes / 1024 / 1024).toFixed(1)} MB</span><button onClick={() => void restoreCanvasFromVersion(version)}>恢复当前画布</button><button onClick={() => void restoreProjectVersion(version)}>恢复整个工程</button></div>)}
             </section>
             <PerformanceDiagnostics />
             <ProjectHealthPanel project={project} />

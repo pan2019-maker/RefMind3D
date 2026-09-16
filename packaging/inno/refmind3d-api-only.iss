@@ -1,5 +1,5 @@
 #define AppName "RefMind3D"
-#define AppVersion "1.9.0"
+#define AppVersion "1.10.0"
 #define Publisher "RefMind3D Team"
 #define StagingDir "..\..\release\api-only-staging"
 
@@ -20,7 +20,7 @@ ArchitecturesInstallIn64BitMode=x64
 DisableProgramGroupPage=yes
 DisableDirPage=no
 SetupIconFile=..\..\src-tauri\icons\icon.ico
-UninstallDisplayIcon={app}\RefMind3D-App-1.9.0.ico
+UninstallDisplayIcon={app}\RefMind3D-App-1.10.0.ico
 ChangesAssociations=yes
 
 [Languages]
@@ -42,12 +42,12 @@ Source: "{#StagingDir}\redist\VC_redist.x64.exe"; DestDir: "{tmp}"; Flags: ignor
 Root: HKCR; Subkey: ".refmind3d"; ValueType: string; ValueName: ""; ValueData: "RefMind3D.Project"; Flags: uninsdeletevalue
 Root: HKCR; Subkey: ".refmind"; ValueType: string; ValueName: ""; ValueData: "RefMind3D.Project"; Flags: uninsdeletevalue
 Root: HKCR; Subkey: "RefMind3D.Project"; ValueType: string; ValueName: ""; ValueData: "RefMind3D Project"; Flags: uninsdeletekeyifempty
-Root: HKCR; Subkey: "RefMind3D.Project\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\RefMind3D-Project-1.9.0.ico,0"; Flags: uninsdeletekeyifempty
+Root: HKCR; Subkey: "RefMind3D.Project\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\RefMind3D-Project-1.10.0.ico,0"; Flags: uninsdeletekeyifempty
 Root: HKCR; Subkey: "RefMind3D.Project\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\refmind3d.exe"" ""%1"""; Flags: uninsdeletekeyifempty
 
 [Icons]
-Name: "{autoprograms}\RefMind3D"; Filename: "{app}\refmind3d.exe"; IconFilename: "{app}\RefMind3D-App-1.9.0.ico"
-Name: "{autodesktop}\RefMind3D"; Filename: "{app}\refmind3d.exe"; IconFilename: "{app}\RefMind3D-App-1.9.0.ico"; Tasks: desktopicon
+Name: "{autoprograms}\RefMind3D"; Filename: "{app}\refmind3d.exe"; IconFilename: "{app}\RefMind3D-App-1.10.0.ico"
+Name: "{autodesktop}\RefMind3D"; Filename: "{app}\refmind3d.exe"; IconFilename: "{app}\RefMind3D-App-1.10.0.ico"; Tasks: desktopicon
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts"

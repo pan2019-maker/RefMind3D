@@ -21,6 +21,8 @@ export interface PerformanceMetrics {
   estimatedTextureMb: number;
   sourceRefreshes: number;
   lastSaveMs?: number;
+  inputLatencyP95Ms: number;
+  gpuTextureCount: number;
 }
 
 const metrics: PerformanceMetrics = {
@@ -28,8 +30,10 @@ const metrics: PerformanceMetrics = {
   imageMemoryEntries: 0, imageLoadsActive: 0, imageLoadsQueued: 0, imageLoadConcurrency: 3,
   imageCacheHits: 0, imageCacheMisses: 0, fps: 0, slowFrames: 0,
   frameTimeMs: 0, qualityTier: 'full', imageTierThumbnail: 0, imageTierMedium: 0,
-  imageTierPreview: 0, imageTierFull: 0, estimatedTextureMb: 0, sourceRefreshes: 0
+  imageTierPreview: 0, imageTierFull: 0, estimatedTextureMb: 0, sourceRefreshes: 0,
+  inputLatencyP95Ms: 0, gpuTextureCount: 0
 };
+const inputLatencySamples: number[] = [];
 
 const EVENT_NAME = 'refmind3d-performance-metrics';
 
@@ -49,6 +53,14 @@ export function recordProjectSave(milliseconds: number) {
 
 export function recordSourceRefresh() {
   metrics.sourceRefreshes += 1;
+}
+
+export function recordInputLatency(milliseconds: number) {
+  if (!Number.isFinite(milliseconds) || milliseconds < 0 || milliseconds > 1000) return;
+  inputLatencySamples.push(milliseconds);
+  if (inputLatencySamples.length > 120) inputLatencySamples.shift();
+  const ordered = inputLatencySamples.slice().sort((a, b) => a - b);
+  metrics.inputLatencyP95Ms = Math.round((ordered[Math.floor((ordered.length - 1) * .95)] || 0) * 10) / 10;
 }
 
 export function performanceMetricsSnapshot(): PerformanceMetrics {

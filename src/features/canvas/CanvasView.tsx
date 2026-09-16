@@ -10,7 +10,7 @@ import { LruCache } from '../assets/lruCache';
 import { getModelCover, modelCoverKey, setModelCover } from '../assets/modelCoverCache';
 import { closestNodeIds, nextImagePreviewTier } from '../assets/previewPolicy';
 import { linkedAssetsToWatch, sourceSignatureKey } from '../assets/sourceWatch';
-import { performanceMetricsSnapshot, recordImageCacheResult, recordSourceRefresh, updatePerformanceMetrics } from '../performance/performanceMetrics';
+import { performanceMetricsSnapshot, recordImageCacheResult, recordInputLatency, recordSourceRefresh, updatePerformanceMetrics } from '../performance/performanceMetrics';
 import { adaptiveImageConcurrency, adaptiveResourceBudget } from '../performance/resourceBudget';
 import { FREE_TEXT_FONT_FAMILY, FREE_TEXT_PLACEHOLDER, freeTextNodeSize } from '../../shared/freeText';
 import { DoodleCanvas, type DoodleCanvasHandle } from './DoodleCanvas';
@@ -591,11 +591,23 @@ const CanvasImage = memo(function CanvasImage({ asset, node, canvasGrayscale, pr
     `scaleX(${node.flipX ? -1 : 1})`,
     `scaleY(${node.flipY ? -1 : 1})`
   ].join(' ');
+  const useTiles = Boolean(cached?.tileUrls.length && cached.tileColumns > 0 && displaySize > 1800 && visible && !node.cropEnabled);
 
   return (
     <>
       <span className="image-node-fallback">{title || '图片预览'}</span>
-      <img
+      {useTiles && cached && <div className="image-tile-pyramid" style={{
+        aspectRatio: `${cached.imageWidth} / ${cached.imageHeight}`,
+        transform: imageTransform,
+        opacity: node.opacity ?? 1,
+        filter: canvasGrayscale || node.grayscale ? 'grayscale(1)' : undefined
+      }}>{cached.tileUrls.map((url, index) => {
+        const column = index % cached.tileColumns; const row = Math.floor(index / cached.tileColumns);
+        const x = column * cached.tileSize; const y = row * cached.tileSize;
+        const tileWidth = Math.min(cached.tileSize, cached.imageWidth - x); const tileHeight = Math.min(cached.tileSize, cached.imageHeight - y);
+        return <img key={url} src={url} draggable={false} decoding="async" alt="" style={{ left: `${x / cached.imageWidth * 100}%`, top: `${y / cached.imageHeight * 100}%`, width: `${tileWidth / cached.imageWidth * 100}%`, height: `${tileHeight / cached.imageHeight * 100}%` }} />;
+      })}</div>}
+      {!useTiles && <img
         className="image-node"
         src={resolvedSrc}
         data-preview-tier={previewTier}
@@ -620,7 +632,7 @@ const CanvasImage = memo(function CanvasImage({ asset, node, canvasGrayscale, pr
           image.style.opacity = '0';
           image.alt = `图片预览加载失败：${asset.previewPath || asset.projectAssetPath}`;
         }}
-      />
+      />}
     </>
   );
 });
@@ -1050,9 +1062,9 @@ export function CanvasView({
     if (!gpuSupported || images.length < 30 || (view.scale >= 0.32 && project.nodes.length < 2_000)) return [] as GpuImageItem[];
     return images.flatMap((node) => {
       const asset = node.assetId ? assetsById.get(node.assetId) : undefined;
-      if (!asset || selectedNodeIdSet.has(node.id) || node.cropEnabled || node.rotation || node.flipX || node.flipY || node.grayscale || project.canvasGrayscale) return [];
+      if (!asset || selectedNodeIdSet.has(node.id) || node.cropEnabled) return [];
       const screen = worldToScreen(node, view, worldOrigin);
-      return [{ id: node.id, src: assetUrl(asset, true), x: screen.x, y: screen.y, width: node.width * view.scale, height: node.height * view.scale, opacity: node.opacity ?? 1 }];
+      return [{ id: node.id, src: assetUrl(asset, true), x: screen.x, y: screen.y, width: node.width * view.scale, height: node.height * view.scale, opacity: node.opacity ?? 1, rotation: node.rotation || 0, flipX: Boolean(node.flipX), flipY: Boolean(node.flipY), grayscale: Boolean(node.grayscale || project.canvasGrayscale) }];
     });
   }, [assetsById, gpuSupported, project.canvasGrayscale, project.nodes.length, renderedNodes, selectedNodeIdSet, view, worldOrigin]);
   const gpuImageIds = useMemo(() => new Set(gpuImageItems.map((item) => item.id)), [gpuImageItems]);
@@ -1761,6 +1773,7 @@ export function CanvasView({
   };
 
   const onMouseMove = (event: ReactMouseEvent) => {
+    recordInputLatency(performance.now() - event.timeStamp);
     if (drag?.pan) {
       const dx = event.clientX - drag.startX;
       const dy = event.clientY - drag.startY;

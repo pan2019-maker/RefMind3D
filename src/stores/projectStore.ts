@@ -21,7 +21,7 @@ interface ProjectState {
   clearSelection: () => void;
   setProject: (project: RefMindProject) => void;
   setProjectRoot: (rootPath: string) => void;
-  updateProjectOptions: (patch: Pick<Partial<RefMindProject>, 'canvasLocked' | 'canvasGrayscale'>) => void;
+  updateProjectOptions: (patch: Pick<Partial<RefMindProject>, 'canvasLocked' | 'canvasGrayscale' | 'sourceSyncMode' | 'sourceSyncLog'>) => void;
   updateSourceFolders: (folders: string[]) => void;
   mergeDuplicateAssets: () => number;
   newProject: () => void;
@@ -84,9 +84,9 @@ function cloneNodes(nodes: CanvasNode[]): CanvasNode[] {
 // the immutable project root directly and share unchanged assets, document
 // payloads and doodle points instead of serializing the entire project on every
 // edit. Clipboard data still uses cloneProject because it is detached data.
-type PatchField = 'name' | 'rootPath' | 'assets' | 'nodes' | 'links' | 'doodles' | 'canvasLocked' | 'canvasGrayscale' | 'sourceFolders';
+type PatchField = 'name' | 'rootPath' | 'assets' | 'nodes' | 'links' | 'doodles' | 'canvasLocked' | 'canvasGrayscale' | 'sourceFolders' | 'sourceSyncMode' | 'sourceSyncLog';
 type ProjectPatch = { fields: PatchField[]; values: Partial<RefMindProject>; updatedAt: string };
-const ALL_PATCH_FIELDS: PatchField[] = ['name', 'rootPath', 'assets', 'nodes', 'links', 'doodles', 'canvasLocked', 'canvasGrayscale', 'sourceFolders'];
+const ALL_PATCH_FIELDS: PatchField[] = ['name', 'rootPath', 'assets', 'nodes', 'links', 'doodles', 'canvasLocked', 'canvasGrayscale', 'sourceFolders', 'sourceSyncMode', 'sourceSyncLog'];
 
 function historySnapshot(project: RefMindProject, fields: PatchField[] = ALL_PATCH_FIELDS): ProjectPatch {
   const values: Partial<RefMindProject> = {};

@@ -32,6 +32,7 @@ pub struct ImportedImage {
     pub width: u32,
     pub height: u32,
     pub channels: Option<u8>,
+    pub color_profile: Option<String>,
 }
 
 const DIRECT_WEB_FORMATS: &[&str] = &[
@@ -43,6 +44,50 @@ const IMAGE_FORMATS: &[&str] = &[
 ];
 const PREVIEW_MAX_SIDE: u32 = 2400;
 const MAX_REMOTE_IMAGE_BYTES: u64 = 200 * 1024 * 1024;
+
+fn detect_color_profile(bytes: &[u8]) -> Option<String> {
+    let mut decoder = ImageReader::new(Cursor::new(bytes)).with_guessed_format().ok()?.into_decoder().ok()?;
+    match decoder.icc_profile() {
+        Ok(Some(profile)) if !profile.is_empty() => Some(format!("Embedded ICC ({} KB)", (profile.len() + 1023) / 1024)),
+        _ => Some("sRGB / 未嵌入 ICC".to_string()),
+    }
+}
+
+fn average_hash(image: DynamicImage) -> u64 {
+    let pixels = image.resize_exact(8, 8, image::imageops::FilterType::Triangle).to_luma8();
+    let average = pixels.pixels().map(|pixel| pixel.0[0] as u32).sum::<u32>() / 64;
+    pixels.pixels().enumerate().fold(0u64, |hash, (index, pixel)| hash | (((pixel.0[0] as u32 >= average) as u64) << index))
+}
+
+#[tauri::command]
+pub async fn find_visual_duplicates(assets: Vec<Value>) -> Result<Vec<Vec<String>>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut hashes = Vec::<(String, u64)>::new();
+        for asset in assets.into_iter().take(2000) {
+            if asset.get("kind").and_then(Value::as_str) != Some("image") { continue; }
+            let Some(id) = asset.get("id").and_then(Value::as_str) else { continue };
+            let path = ["originalPath", "projectAssetPath", "previewPath"].iter()
+                .filter_map(|key| asset.get(key).and_then(Value::as_str))
+                .map(PathBuf::from).find(|path| path.is_file());
+            let Some(path) = path else { continue };
+            let ext = path.extension().and_then(|value| value.to_str()).unwrap_or("png").to_ascii_lowercase();
+            if let Ok(image) = decode_preview(&path, &ext) { hashes.push((id.to_string(), average_hash(image))); }
+        }
+        let mut used = vec![false; hashes.len()];
+        let mut groups = Vec::new();
+        for index in 0..hashes.len() {
+            if used[index] { continue; }
+            let mut group = vec![hashes[index].0.clone()];
+            for other in index + 1..hashes.len() {
+                if !used[other] && (hashes[index].1 ^ hashes[other].1).count_ones() <= 5 {
+                    used[other] = true; group.push(hashes[other].0.clone());
+                }
+            }
+            if group.len() > 1 { groups.push(group); }
+        }
+        Ok::<Vec<Vec<String>>, String>(groups)
+    }).await.map_err(|error| format!("视觉查重任务失败: {error}"))?
+}
 
 #[tauri::command]
 pub async fn import_clipboard_image_data_url(
@@ -341,6 +386,7 @@ fn import_bytes_as_runtime_image(
         width,
         height,
         channels: Some(4),
+        color_profile: detect_color_profile(&bytes),
     })
 }
 
@@ -499,6 +545,7 @@ fn import_image_asset_sync(
     };
 
     let source_text = source.to_string_lossy().to_string();
+    let color_profile = fs::read(&source).ok().and_then(|bytes| detect_color_profile(&bytes));
     Ok(ImportedImage {
         id,
         kind: "image".to_string(),
@@ -516,6 +563,7 @@ fn import_image_asset_sync(
         width,
         height,
         channels,
+        color_profile,
     })
 }
 
@@ -1032,5 +1080,12 @@ mod tests {
             attr_values(html, "src"),
             vec!["https://example.test/image.webp"],
         );
+    }
+
+    #[test]
+    fn perceptual_hash_groups_small_brightness_changes() {
+        let dark = DynamicImage::ImageLuma8(image::ImageBuffer::from_pixel(8, 8, image::Luma([40])));
+        let lighter = DynamicImage::ImageLuma8(image::ImageBuffer::from_pixel(8, 8, image::Luma([55])));
+        assert_eq!(average_hash(dark), average_hash(lighter));
     }
 }

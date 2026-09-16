@@ -36,7 +36,7 @@ pub struct CacheStatus {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct PreparedImageCache { preview_url: String, medium_url: String, thumbnail_url: String, cache_hit: bool }
+pub struct PreparedImageCache { preview_url: String, medium_url: String, thumbnail_url: String, tile_urls: Vec<String>, tile_size: u32, tile_columns: u32, image_width: u32, image_height: u32, cache_hit: bool }
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -48,6 +48,11 @@ struct CacheManifest {
     #[serde(default)]
     medium_file: Option<String>,
     thumbnail_file: String,
+    #[serde(default)] tile_files: Vec<String>,
+    #[serde(default)] tile_size: u32,
+    #[serde(default)] tile_columns: u32,
+    #[serde(default)] image_width: u32,
+    #[serde(default)] image_height: u32,
     last_accessed_ms: u64,
 }
 
@@ -196,7 +201,8 @@ fn prepare_sync(project_id: &str, cache_directory: Option<&str>, asset: &Value) 
                     manifest.last_accessed_ms = now_ms();
                     let _ = fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?);
                 }
-                return Ok(register(&asset_id, project_id, &preview, medium.as_deref(), &thumb, &format!("{}-{}-{}", size, modified, hash), true));
+                let tiles = manifest.tile_files.iter().map(|file| dir.join(file)).filter(|path| path.is_file()).collect::<Vec<_>>();
+                return Ok(register(&asset_id, project_id, &preview, medium.as_deref(), &thumb, &tiles, manifest.tile_size, manifest.tile_columns, manifest.image_width, manifest.image_height, &format!("{}-{}-{}", size, modified, hash), true));
             }
         }
     }
@@ -214,13 +220,29 @@ fn prepare_sync(project_id: &str, cache_directory: Option<&str>, asset: &Value) 
     let preview = dir.join("decoded-preview.png");
     let medium = dir.join("medium-preview.png");
     let thumb = dir.join("thumbnail.png");
+    let (source_width, source_height) = image.dimensions();
     write_png(&preview, resize(image.clone(), 2400))?;
     write_png(&medium, resize(image.clone(), 1200))?;
-    write_png(&thumb, resize(image, 512))?;
-    let manifest = CacheManifest { source_size: size, source_modified_ms: modified, source_hash: hash, preview_file: "decoded-preview.png".into(), medium_file: Some("medium-preview.png".into()), thumbnail_file: "thumbnail.png".into(), last_accessed_ms: now_ms() };
+    write_png(&thumb, resize(image.clone(), 512))?;
+    let tile_size = 1024;
+    let tiled = source_width.max(source_height) > 4096;
+    let pyramid = if tiled { resize(image, 8192) } else { DynamicImage::new_rgba8(1, 1) };
+    let (image_width, image_height) = if tiled { pyramid.dimensions() } else { (0, 0) };
+    let tile_columns = if tiled { image_width.div_ceil(tile_size) } else { 0 };
+    let tile_rows = if tiled { image_height.div_ceil(tile_size) } else { 0 };
+    let mut tile_files = Vec::new();
+    for row in 0..tile_rows { for column in 0..tile_columns {
+        let x = column * tile_size; let y = row * tile_size;
+        let width = tile_size.min(image_width - x); let height = tile_size.min(image_height - y);
+        let file = format!("tile-{row}-{column}.png");
+        write_png(&dir.join(&file), pyramid.crop_imm(x, y, width, height))?;
+        tile_files.push(file);
+    }}
+    let manifest = CacheManifest { source_size: size, source_modified_ms: modified, source_hash: hash, preview_file: "decoded-preview.png".into(), medium_file: Some("medium-preview.png".into()), thumbnail_file: "thumbnail.png".into(), tile_files: tile_files.clone(), tile_size, tile_columns, image_width, image_height, last_accessed_ms: now_ms() };
     fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
     enforce_limit_in_background(&root, DEFAULT_LIMIT_BYTES);
-    Ok(register(&asset_id, project_id, &preview, Some(&medium), &thumb, &format!("{}-{}-{}", size, modified, hash), false))
+    let tiles = tile_files.iter().map(|file| dir.join(file)).collect::<Vec<_>>();
+    Ok(register(&asset_id, project_id, &preview, Some(&medium), &thumb, &tiles, tile_size, tile_columns, image_width, image_height, &format!("{}-{}-{}", size, modified, hash), false))
 }
 
 fn describe_source(asset: &Value) -> anyhow::Result<SourceDescriptor> {
@@ -264,7 +286,7 @@ fn decode(bytes: &[u8], ext: &str) -> anyhow::Result<DynamicImage> {
 }
 fn resize(image: DynamicImage, max: u32) -> DynamicImage { let (w,h) = image.dimensions(); if w.max(h) <= max { image } else { image.thumbnail(max,max) } }
 fn write_png(path: &Path, image: DynamicImage) -> anyhow::Result<()> { let mut out = Cursor::new(Vec::new()); image.write_to(&mut out, ImageFormat::Png)?; fs::write(path, out.into_inner()).with_context(|| format!("写入缓存失败：{}", path.display())) }
-fn register(asset_id: &str, project_id: &str, preview: &Path, medium: Option<&Path>, thumb: &Path, generation: &str, hit: bool) -> PreparedImageCache {
+fn register(asset_id: &str, project_id: &str, preview: &Path, medium: Option<&Path>, thumb: &Path, tiles: &[PathBuf], tile_size: u32, tile_columns: u32, image_width: u32, image_height: u32, generation: &str, hit: bool) -> PreparedImageCache {
     let suffix = safe(project_id);
     // A regenerated image gets fingerprinted URLs. Drop older registrations for
     // this project/asset so long sessions do not retain stale cache entries.
@@ -274,7 +296,9 @@ fn register(asset_id: &str, project_id: &str, preview: &Path, medium: Option<&Pa
     PreparedImageCache {
         preview_url: runtime_assets::register_file_resource(asset_id, &format!("cachePreview:{suffix}:{generation}"), "decoded-preview.png".into(), "image/png".into(), preview.to_path_buf()),
         medium_url: runtime_assets::register_file_resource(asset_id, &format!("cacheMedium:{suffix}:{generation}"), "medium-preview.png".into(), "image/png".into(), medium.unwrap_or(preview).to_path_buf()),
-        thumbnail_url: runtime_assets::register_file_resource(asset_id, &format!("cacheThumbnail:{suffix}:{generation}"), "thumbnail.png".into(), "image/png".into(), thumb.to_path_buf()), cache_hit: hit
+        thumbnail_url: runtime_assets::register_file_resource(asset_id, &format!("cacheThumbnail:{suffix}:{generation}"), "thumbnail.png".into(), "image/png".into(), thumb.to_path_buf()),
+        tile_urls: tiles.iter().enumerate().map(|(index, path)| runtime_assets::register_file_resource(asset_id, &format!("cacheTile:{suffix}:{generation}:{index}"), format!("tile-{index}.png"), "image/png".into(), path.clone())).collect(),
+        tile_size, tile_columns, image_width, image_height, cache_hit: hit
     }
 }
 fn enforce_limit(root: &Path, limit: u64) {
@@ -444,6 +468,17 @@ mod tests {
     }
 
     #[test]
+    fn large_image_cache_is_split_into_tiles() {
+        let root = env::temp_dir().join(format!("refmind3d-cache-tile-test-{}", uuid::Uuid::new_v4()));
+        let source = root.join("wide.png"); let cache = root.join("project-cache");
+        fs::create_dir_all(&root).unwrap(); DynamicImage::new_rgba8(4100, 2).save(&source).unwrap();
+        let asset = serde_json::json!({ "id": "wide", "format": "png", "originalPath": source.to_string_lossy() });
+        let prepared = prepare_sync("project-tiles", Some(cache.to_string_lossy().as_ref()), &asset).unwrap();
+        assert_eq!(prepared.tile_columns, 5); assert_eq!(prepared.tile_urls.len(), 5);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn cache_limit_removes_complete_oldest_asset_directory() {
         let root = env::temp_dir().join(format!("refmind3d-cache-limit-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
@@ -458,6 +493,11 @@ mod tests {
                 preview_file: "payload.bin".into(),
                 medium_file: None,
                 thumbnail_file: "payload.bin".into(),
+                tile_files: Vec::new(),
+                tile_size: 0,
+                tile_columns: 0,
+                image_width: 0,
+                image_height: 0,
                 last_accessed_ms: accessed,
             };
             fs::write(directory.join("manifest.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();

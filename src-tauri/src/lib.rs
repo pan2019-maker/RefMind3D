@@ -21,6 +21,7 @@ pub fn run() {
             commands::image::register_runtime_asset,
             commands::image::image_asset_to_data_url,
             commands::image::copy_image_asset_to_clipboard,
+            commands::image::find_visual_duplicates,
             commands::cache::image_cache_status,
             commands::cache::set_image_cache_directory,
             commands::cache::migrate_image_cache,

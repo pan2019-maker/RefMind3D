@@ -15,6 +15,11 @@ export interface PreparedImageCache {
   previewUrl: string;
   mediumUrl: string;
   thumbnailUrl: string;
+  tileUrls: string[];
+  tileSize: number;
+  tileColumns: number;
+  imageWidth: number;
+  imageHeight: number;
   cacheHit: boolean;
 }
 
