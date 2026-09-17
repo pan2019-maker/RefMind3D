@@ -26,7 +26,7 @@ pub struct UpdateInfo {
 pub async fn check_for_update() -> Result<UpdateInfo, String> {
     let release = reqwest::Client::new()
         .get("https://api.github.com/repos/pan2019-maker/RefMind3D/releases/latest")
-        .header("User-Agent", "RefMind3D-update-check/1.12")
+        .header("User-Agent", "RefMind3D-update-check/1.12.1")
         .send()
         .await
         .map_err(|e| format!("Check update failed: {e}"))?
