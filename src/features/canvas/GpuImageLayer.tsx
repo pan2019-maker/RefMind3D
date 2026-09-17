@@ -38,12 +38,13 @@ function shader(gl: WebGLRenderingContext, type: number, source: string) {
   return gl.getShaderParameter(value, gl.COMPILE_STATUS) ? value : null;
 }
 
-export const GpuImageLayer = memo(function GpuImageLayer({ items, width, height, textureLimit, onSupportChange }: {
+export const GpuImageLayer = memo(function GpuImageLayer({ items, width, height, textureLimit, onSupportChange, onCompositedIdsChange }: {
   items: GpuImageItem[];
   width: number;
   height: number;
   textureLimit: number;
   onSupportChange: (supported: boolean) => void;
+  onCompositedIdsChange: (ids: ReadonlySet<string>) => void;
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const itemsRef = useRef(items);
@@ -108,15 +109,25 @@ export const GpuImageLayer = memo(function GpuImageLayer({ items, width, height,
     };
     redrawRef.current();
     return () => {
+      onCompositedIdsChange(new Set());
       textures.forEach((texture) => gl.deleteTexture(texture));
       gl.deleteBuffer(positionBuffer); gl.deleteBuffer(textureBuffer); gl.deleteProgram(program); gl.deleteShader(vertex); gl.deleteShader(fragment);
       runtimeRef.current = null; updatePerformanceMetrics({ gpuTextureCount: 0 });
     };
-  }, [onSupportChange]);
+  }, [onCompositedIdsChange, onSupportChange]);
 
   useEffect(() => {
     itemsRef.current = items; sizeRef.current = { width, height };
     const runtime = runtimeRef.current; if (!runtime) return;
+    const activeSources = new Set(items.map((item) => item.src));
+    for (const [src, texture] of [...runtime.textures]) {
+      if (activeSources.has(src)) continue;
+      runtime.gl.deleteTexture(texture); runtime.textures.delete(src);
+    }
+    const publishCompositedIds = () => onCompositedIdsChange(new Set(
+      itemsRef.current.filter((item) => runtimeRef.current?.textures.has(item.src)).map((item) => item.id)
+    ));
+    publishCompositedIds();
     for (const item of items) {
       if (runtime.textures.has(item.src) || runtime.loading.has(item.src)) continue;
       runtime.loading.add(item.src);
@@ -124,6 +135,9 @@ export const GpuImageLayer = memo(function GpuImageLayer({ items, width, height,
       image.onload = () => {
         const current = runtimeRef.current; if (!current) return;
         current.loading.delete(item.src);
+        // The camera may have moved while the image was decoding. Do not let a
+        // late result from an old viewport evict a texture that is still live.
+        if (!itemsRef.current.some((candidate) => candidate.src === item.src)) return;
         const texture = current.gl.createTexture();
         if (!texture) return;
         current.gl.bindTexture(current.gl.TEXTURE_2D, texture);
@@ -136,13 +150,13 @@ export const GpuImageLayer = memo(function GpuImageLayer({ items, width, height,
           if (!oldest) break;
           current.gl.deleteTexture(oldest[1]); current.textures.delete(oldest[0]);
         }
-        updatePerformanceMetrics({ gpuTextureCount: current.textures.size }); redrawRef.current();
+        updatePerformanceMetrics({ gpuTextureCount: current.textures.size }); publishCompositedIds(); redrawRef.current();
       };
-      image.onerror = () => runtimeRef.current?.loading.delete(item.src);
+      image.onerror = () => { runtimeRef.current?.loading.delete(item.src); publishCompositedIds(); };
       image.src = item.src;
     }
     redrawRef.current();
-  }, [height, items, textureLimit, width]);
+  }, [height, items, onCompositedIdsChange, textureLimit, width]);
   const dpr = Math.min(3, Math.max(1, window.devicePixelRatio || 1));
   return <canvas ref={canvasRef} className="gpu-image-layer" style={{ width, height }} width={Math.max(1, Math.round(width * dpr))} height={Math.max(1, Math.round(height * dpr))} aria-hidden="true" />;
 });

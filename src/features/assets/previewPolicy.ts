@@ -34,3 +34,14 @@ export function closestNodeIds<T extends { id: string; x: number; y: number; wid
     return ad - bd;
   }).slice(0, limit).map((node) => node.id));
 }
+
+/**
+ * Keeps GPU composition bounded. Nodes outside the GPU budget deliberately
+ * remain on the normal thumbnail path, so zooming out can never hide them just
+ * because more images became visible than the texture pool can hold.
+ */
+export function boundedGpuNodeIds<T extends { id: string; x: number; y: number; width: number; height: number }>(
+  nodes: T[], center: { x: number; y: number }, limit: number, excludedIds: ReadonlySet<string>
+) {
+  return closestNodeIds(nodes.filter((node) => !excludedIds.has(node.id)), center, Math.max(0, limit));
+}

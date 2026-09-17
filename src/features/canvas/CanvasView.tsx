@@ -8,7 +8,7 @@ import { prepareImageCache, type PreparedImageCache } from '../assets/imageCache
 import { ImageLoadCancelledError, imageLoadScheduler } from '../assets/imageLoadScheduler';
 import { LruCache } from '../assets/lruCache';
 import { getModelCover, modelCoverKey, setModelCover } from '../assets/modelCoverCache';
-import { closestNodeIds, nextImagePreviewTier } from '../assets/previewPolicy';
+import { boundedGpuNodeIds, closestNodeIds, nextImagePreviewTier } from '../assets/previewPolicy';
 import { linkedAssetsToWatch, sourceSignatureKey } from '../assets/sourceWatch';
 import { performanceMetricsSnapshot, recordImageCacheResult, recordInputLatency, recordSourceRefresh, updatePerformanceMetrics } from '../performance/performanceMetrics';
 import { adaptiveImageConcurrency, adaptiveResourceBudget } from '../performance/resourceBudget';
@@ -787,6 +787,7 @@ export function CanvasView({
   const [qualityTier, setQualityTier] = useState<'full' | 'balanced' | 'responsive'>('full');
   const [snapGuides, setSnapGuides] = useState<SnapGuide[]>([]);
   const [gpuSupported, setGpuSupported] = useState(true);
+  const [gpuCompositedIds, setGpuCompositedIds] = useState<ReadonlySet<string>>(() => new Set());
   const [drag, setDrag] = useState<{
     ids?: string[];
     startX: number;
@@ -1089,12 +1090,14 @@ export function CanvasView({
   const liveModelIds = useMemo(() => closestNodeIds(visibleNodes.filter((node) => node.type === 'model'), viewportWorldCenter, resourceBudget.models), [resourceBudget.models, viewportWorldCenter, visibleNodes]);
   const liveVideoIds = useMemo(() => closestNodeIds(visibleNodes.filter((node) => node.type === 'video'), viewportWorldCenter, resourceBudget.videos), [resourceBudget.videos, viewportWorldCenter, visibleNodes]);
   const fullResolutionImageIds = useMemo(() => closestNodeIds(visibleNodes.filter((node) => node.type === 'image'), viewportWorldCenter, resourceBudget.fullImages), [resourceBudget.fullImages, viewportWorldCenter, visibleNodes]);
+  const gpuTextureLimit = memoryPressure ? 48 : 192;
   const gpuImageItems = useMemo(() => {
     const images = renderedNodes.filter((node) => node.type === 'image');
     if (!gpuSupported || images.length < 30 || (view.scale >= 0.32 && project.nodes.length < 2_000)) return [] as GpuImageItem[];
+    const candidates = boundedGpuNodeIds(images, viewportWorldCenter, gpuTextureLimit, selectedNodeIdSet);
     return images.flatMap((node) => {
       const asset = node.assetId ? assetsById.get(node.assetId) : undefined;
-      if (!asset || selectedNodeIdSet.has(node.id)) return [];
+      if (!asset || !candidates.has(node.id)) return [];
       const screen = worldToScreen(node, view, worldOrigin);
       const naturalWidth = Number((asset as AssetRecord & { width?: number }).width) || node.width;
       const naturalHeight = Number((asset as AssetRecord & { height?: number }).height) || node.height;
@@ -1110,9 +1113,13 @@ export function CanvasView({
       } else { width = height * sourceAspect; x += (node.width * view.scale - width) / 2; }
       return [{ id: node.id, src: assetUrl(asset, true), x, y, width, height, opacity: node.opacity ?? 1, rotation: node.rotation || 0, flipX: Boolean(node.flipX), flipY: Boolean(node.flipY), grayscale: Boolean(node.grayscale || project.canvasGrayscale), u0, v0, u1, v1 }];
     });
-  }, [assetsById, gpuSupported, project.canvasGrayscale, project.nodes.length, renderedNodes, selectedNodeIdSet, view, worldOrigin]);
-  const gpuImageIds = useMemo(() => new Set(gpuImageItems.map((item) => item.id)), [gpuImageItems]);
+  }, [assetsById, gpuSupported, gpuTextureLimit, project.canvasGrayscale, project.nodes.length, renderedNodes, selectedNodeIdSet, view, viewportWorldCenter, worldOrigin]);
+  const gpuImageIds = gpuCompositedIds;
   const handleGpuSupport = useCallback((supported: boolean) => setGpuSupported((current) => current === supported ? current : supported), []);
+  const handleGpuCompositedIds = useCallback((ids: ReadonlySet<string>) => setGpuCompositedIds((current) => {
+    if (current.size === ids.size && [...current].every((id) => ids.has(id))) return current;
+    return ids;
+  }), []);
   const predictedPrefetchIds = useMemo(() => {
     const direction = panDirectionRef.current;
     if (direction.x === 0 && direction.y === 0) return new Set<string>();
@@ -2483,7 +2490,7 @@ export function CanvasView({
         className="canvas-world screen-space-renderer"
       >
         {showGrid && !lowZoom && <div className="canvas-grid" />}
-        {gpuImageItems.length > 0 && <GpuImageLayer items={gpuImageItems} width={viewportSize.width} height={viewportSize.height} textureLimit={memoryPressure ? 48 : 192} onSupportChange={handleGpuSupport} />}
+        {gpuImageItems.length > 0 && <GpuImageLayer items={gpuImageItems} width={viewportSize.width} height={viewportSize.height} textureLimit={gpuTextureLimit} onSupportChange={handleGpuSupport} onCompositedIdsChange={handleGpuCompositedIds} />}
         <svg className="mindmap-layer" width={viewportSize.width} height={viewportSize.height} viewBox={`0 0 ${viewportSize.width} ${viewportSize.height}`}>
           {renderedLinks.map((link) => {
             const fromNode = nodesById.get(link.fromNodeId);
