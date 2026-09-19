@@ -8,7 +8,7 @@ import { prepareImageCache, type PreparedImageCache } from '../assets/imageCache
 import { ImageLoadCancelledError, imageLoadScheduler } from '../assets/imageLoadScheduler';
 import { LruCache } from '../assets/lruCache';
 import { getModelCover, modelCoverKey, setModelCover } from '../assets/modelCoverCache';
-import { boundedGpuNodeIds, closestNodeIds, nextImagePreviewTier, shouldUseOverviewRenderer } from '../assets/previewPolicy';
+import { boundedGpuNodeIds, closestNodeIds, imagePreviewSource, nextImagePreviewTier, shouldUseOverviewRenderer } from '../assets/previewPolicy';
 import { linkedAssetsToWatch, sourceSignatureKey } from '../assets/sourceWatch';
 import { performanceMetricsSnapshot, recordImageCacheResult, recordInputLatency, recordSourceRefresh, updatePerformanceMetrics } from '../performance/performanceMetrics';
 import { adaptiveImageConcurrency, adaptiveResourceBudget, nextQualityTier } from '../performance/resourceBudget';
@@ -571,9 +571,12 @@ const CanvasImage = memo(function CanvasImage({ asset, node, canvasGrayscale, pr
   }, [asset, cacheDirectory, cacheEpoch, cacheKey, loadEnabled, loadPriority, projectCacheId]);
 
   const src = cached
-    ? (previewTier === 'thumbnail' ? cached.thumbnailUrl
-      : previewTier === 'medium' ? cached.mediumUrl
-        : previewTier === 'full' ? fullResolutionAssetUrl(asset) : cached.previewUrl)
+    ? imagePreviewSource(previewTier, {
+      thumbnail: cached.thumbnailUrl,
+      medium: cached.mediumUrl,
+      preview: cached.previewUrl,
+      full: fullResolutionAssetUrl(asset)
+    })
     : assetUrl(asset, true);
   const baseSrc = cached?.thumbnailUrl || assetUrl(asset, true);
   const [resolvedSrc, setResolvedSrc] = useState(src);
@@ -801,6 +804,7 @@ export function CanvasView({
   const [view, setView] = useState<ViewState>({ x: 0, y: 0, scale: 1 });
   const [pageVisible, setPageVisible] = useState(() => document.visibilityState !== 'hidden');
   const [imageCacheEpoch, setImageCacheEpoch] = useState(0);
+  const [preparedImageRevision, setPreparedImageRevision] = useState(0);
   const [resourceBudget, setResourceBudget] = useState(() => adaptiveResourceBudget(project.nodes.length, (navigator as Navigator & { deviceMemory?: number }).deviceMemory || 8));
   const [memoryPressure, setMemoryPressure] = useState(false);
   const [qualityTier, setQualityTier] = useState<'full' | 'balanced' | 'responsive'>('full');
@@ -1157,8 +1161,10 @@ export function CanvasView({
   const liveModelIds = useMemo(() => closestNodeIds(visibleNodes.filter((node) => node.type === 'model'), viewportWorldCenter, resourceBudget.models), [resourceBudget.models, viewportWorldCenter, visibleNodes]);
   const liveVideoIds = useMemo(() => closestNodeIds(visibleNodes.filter((node) => node.type === 'video'), viewportWorldCenter, resourceBudget.videos), [resourceBudget.videos, viewportWorldCenter, visibleNodes]);
   const fullResolutionImageIds = useMemo(() => closestNodeIds(visibleNodes.filter((node) => node.type === 'image'), viewportWorldCenter, resourceBudget.fullImages), [resourceBudget.fullImages, viewportWorldCenter, visibleNodes]);
+  const lowZoom = view.scale < 0.35;
   const gpuTextureLimit = memoryPressure ? 48 : 192;
   const allImageRenderItems = useMemo(() => {
+    const displayPixelRatio = Math.min(3, Math.max(1, window.devicePixelRatio || 1));
     const images = renderedNodes.filter((node) => node.type === 'image');
     return images.flatMap((node) => {
       const asset = node.assetId ? assetsById.get(node.assetId) : undefined;
@@ -1176,15 +1182,54 @@ export function CanvasView({
       } else if (sourceAspect > targetAspect) {
         height = width / sourceAspect; y += (node.height * view.scale - height) / 2;
       } else { width = height * sourceAspect; x += (node.width * view.scale - width) / 2; }
-      return [{ id: node.id, src: assetUrl(asset, true), x, y, width, height, opacity: node.opacity ?? 1, rotation: node.rotation || 0, flipX: Boolean(node.flipX), flipY: Boolean(node.flipY), grayscale: Boolean(node.grayscale || project.canvasGrayscale), u0, v0, u1, v1 }];
+      const cacheKey = `${projectCacheId}:${cacheDirectory || 'default'}:${asset.id}`;
+      const cached = preparedImageCache.get(cacheKey)?.value;
+      const tier = nextImagePreviewTier(undefined, Math.max(width, height), lowZoom, fullResolutionImageIds.has(node.id), displayPixelRatio);
+      const src = cached
+        ? imagePreviewSource(tier, {
+          thumbnail: cached.thumbnailUrl,
+          medium: cached.mediumUrl,
+          preview: cached.previewUrl,
+          full: fullResolutionAssetUrl(asset)
+        })
+        : assetUrl(asset, true);
+      return [{ id: node.id, src, x, y, width, height, opacity: node.opacity ?? 1, rotation: node.rotation || 0, flipX: Boolean(node.flipX), flipY: Boolean(node.flipY), grayscale: Boolean(node.grayscale || project.canvasGrayscale), u0, v0, u1, v1 }];
     });
-  }, [assetsById, project.canvasGrayscale, renderedNodes, selectedNodeIdSet, view, worldOrigin]);
+  }, [assetsById, cacheDirectory, fullResolutionImageIds, lowZoom, preparedImageRevision, project.canvasGrayscale, projectCacheId, renderedNodes, selectedNodeIdSet, view, worldOrigin]);
   const overviewMode = shouldUseOverviewRenderer(view.scale, allImageRenderItems.length);
   const gpuImageItems = useMemo(() => {
     if (overviewMode || !gpuSupported || allImageRenderItems.length < 30 || (view.scale >= 0.32 && project.nodes.length < 2_000)) return [] as GpuImageItem[];
     const candidateIds = boundedGpuNodeIds(allImageRenderItems, { x: viewportSize.width / 2, y: viewportSize.height / 2 }, gpuTextureLimit, new Set());
     return allImageRenderItems.filter((item) => candidateIds.has(item.id));
   }, [allImageRenderItems, gpuSupported, gpuTextureLimit, overviewMode, project.nodes.length, view.scale, viewportSize]);
+  useEffect(() => {
+    if (!pageVisible || gpuImageItems.length === 0) return;
+    let cancelled = false;
+    const scheduledKeys = new Set<string>();
+    for (const item of gpuImageItems) {
+      const node = nodesById.get(item.id);
+      const asset = node?.assetId ? assetsById.get(node.assetId) : undefined;
+      if (!node || !asset) continue;
+      const cacheKey = `${projectCacheId}:${cacheDirectory || 'default'}:${asset.id}`;
+      if (preparedImageCache.get(cacheKey)) continue;
+      scheduledKeys.add(cacheKey);
+      const priority = visibleNodeIds.has(node.id) ? 0 : 1;
+      void imageLoadScheduler.schedule(cacheKey, priority, () => prepareImageCache(projectCacheId, cacheDirectory, asset))
+        .then((value) => {
+          preparedImageCache.set(cacheKey, { value, checkedAt: Date.now() });
+          if (!cancelled) setPreparedImageRevision((current) => current + 1);
+        })
+        .catch((error) => {
+          if (!(error instanceof ImageLoadCancelledError)) {
+            window.dispatchEvent(new CustomEvent('refmind3d-image-cache-error', { detail: String(error) }));
+          }
+        });
+    }
+    return () => {
+      cancelled = true;
+      scheduledKeys.forEach((key) => imageLoadScheduler.release(key));
+    };
+  }, [assetsById, cacheDirectory, gpuImageItems, imageCacheEpoch, nodesById, pageVisible, projectCacheId, visibleNodeIds]);
   const gpuImageIds = overviewMode ? overviewCompositedIds : gpuCompositedIds;
   const handleGpuSupport = useCallback((supported: boolean) => setGpuSupported((current) => current === supported ? current : supported), []);
   useEffect(() => {
@@ -2274,7 +2319,6 @@ export function CanvasView({
 
   const selectionRect = selection ? normalizeRect(selection.startX, selection.startY, selection.endX, selection.endY) : null;
   const activeDrawRect = drawRect ? normalizeRect(drawRect.startX, drawRect.startY, drawRect.endX, drawRect.endY) : null;
-  const lowZoom = view.scale < 0.35;
   const largeCanvasMode = project.nodes.length >= 5000 || renderedNodes.length >= 1200;
   const selectedTextNode = selectedNodeIds.length === 1
     ? project.nodes.find((node) => selectedNodeIds[0] === node.id && isTextNode(node))

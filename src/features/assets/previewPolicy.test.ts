@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { boundedGpuNodeIds, closestNodeIds, nextImagePreviewTier, shouldUseOverviewRenderer } from './previewPolicy';
+import { boundedGpuNodeIds, closestNodeIds, imagePreviewSource, nextImagePreviewTier, shouldUseOverviewRenderer } from './previewPolicy';
 
 describe('preview policy', () => {
   it('uses hysteresis around image tier boundaries', () => {
-    expect(nextImagePreviewTier('thumbnail', 500, false, false)).toBe('thumbnail');
+    expect(nextImagePreviewTier('thumbnail', 400, false, false)).toBe('thumbnail');
     expect(nextImagePreviewTier('thumbnail', 700, false, false)).toBe('medium');
     expect(nextImagePreviewTier('medium', 500, false, false)).toBe('medium');
     expect(nextImagePreviewTier('medium', 300, false, false)).toBe('thumbnail');
@@ -16,8 +16,22 @@ describe('preview policy', () => {
     expect(nextImagePreviewTier('medium', 900, false, false, 2)).toBe('preview');
   });
 
+  it('does not force a visible large node to thumbnail at low canvas zoom', () => {
+    expect(nextImagePreviewTier(undefined, 390, true, false, 1.25)).toBe('medium');
+    expect(nextImagePreviewTier('thumbnail', 390, true, false, 1.25)).toBe('medium');
+    expect(nextImagePreviewTier(undefined, 240, true, false, 1.25)).toBe('thumbnail');
+  });
+
+  it('maps DOM and GPU tiers to the same prepared image sources', () => {
+    const sources = { thumbnail: '512', medium: '1200', preview: '2400', full: 'original' };
+    expect(imagePreviewSource('thumbnail', sources)).toBe('512');
+    expect(imagePreviewSource('medium', sources)).toBe('1200');
+    expect(imagePreviewSource('preview', sources)).toBe('2400');
+    expect(imagePreviewSource('full', sources)).toBe('original');
+  });
+
   it('promotes nearby or selected large images to full resolution with hysteresis', () => {
-    expect(nextImagePreviewTier('preview', 1200, false, true, 2)).toBe('full');
+    expect(nextImagePreviewTier('preview', 1100, false, true, 2)).toBe('full');
     expect(nextImagePreviewTier('full', 1000, false, true, 2)).toBe('full');
     expect(nextImagePreviewTier('full', 800, false, true, 2)).toBe('preview');
     expect(nextImagePreviewTier('full', 1600, false, false, 2)).toBe('preview');
