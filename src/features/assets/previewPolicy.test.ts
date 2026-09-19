@@ -3,11 +3,24 @@ import { boundedGpuNodeIds, closestNodeIds, nextImagePreviewTier, shouldUseOverv
 
 describe('preview policy', () => {
   it('uses hysteresis around image tier boundaries', () => {
-    expect(nextImagePreviewTier('thumbnail', 580, false, false)).toBe('thumbnail');
+    expect(nextImagePreviewTier('thumbnail', 500, false, false)).toBe('thumbnail');
     expect(nextImagePreviewTier('thumbnail', 700, false, false)).toBe('medium');
     expect(nextImagePreviewTier('medium', 500, false, false)).toBe('medium');
-    expect(nextImagePreviewTier('medium', 400, false, false)).toBe('thumbnail');
-    expect(nextImagePreviewTier('preview', 1300, false, false)).toBe('preview');
+    expect(nextImagePreviewTier('medium', 300, false, false)).toBe('thumbnail');
+    expect(nextImagePreviewTier('preview', 900, false, false)).toBe('preview');
+  });
+
+  it('selects cache tiers using physical pixels on scaled displays', () => {
+    expect(nextImagePreviewTier(undefined, 900, false, false, 1)).toBe('medium');
+    expect(nextImagePreviewTier(undefined, 900, false, false, 2)).toBe('preview');
+    expect(nextImagePreviewTier('medium', 900, false, false, 2)).toBe('preview');
+  });
+
+  it('promotes nearby or selected large images to full resolution with hysteresis', () => {
+    expect(nextImagePreviewTier('preview', 1200, false, true, 2)).toBe('full');
+    expect(nextImagePreviewTier('full', 1000, false, true, 2)).toBe('full');
+    expect(nextImagePreviewTier('full', 800, false, true, 2)).toBe('preview');
+    expect(nextImagePreviewTier('full', 1600, false, false, 2)).toBe('preview');
   });
 
   it('keeps only the closest heavy resources inside a budget', () => {

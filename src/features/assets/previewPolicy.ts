@@ -8,25 +8,31 @@ export function nextImagePreviewTier(
   current: ImagePreviewTier | undefined,
   displaySize: number,
   lowZoom: boolean,
-  allowFullResolution: boolean
+  allowFullResolution: boolean,
+  devicePixelRatio = 1
 ): ImagePreviewTier {
   if (lowZoom) return 'thumbnail';
+  // Cache tiers are sized in physical pixels, while layout measurements are
+  // CSS pixels. Ignoring display scaling kept a 1200 px cache stretched over
+  // much larger HiDPI surfaces and made images visibly soft after zooming in.
+  const physicalSize = displaySize * Math.min(3, Math.max(1, devicePixelRatio));
   if (!current) {
-    if (displaySize <= 520) return 'thumbnail';
-    if (displaySize <= 1400) return 'medium';
-    if (allowFullResolution && displaySize > 2400) return 'full';
+    if (physicalSize <= 440) return 'thumbnail';
+    if (physicalSize <= 960) return 'medium';
+    if (allowFullResolution && physicalSize > 2000) return 'full';
     return 'preview';
   }
-  if (current === 'thumbnail') return displaySize > 620 ? 'medium' : 'thumbnail';
+  if (current === 'thumbnail') return physicalSize > 520 ? 'medium' : 'thumbnail';
   if (current === 'medium') {
-    if (displaySize < 440) return 'thumbnail';
-    return displaySize > 1600 ? (allowFullResolution && displaySize > 2800 ? 'full' : 'preview') : 'medium';
+    if (physicalSize < 360) return 'thumbnail';
+    if (physicalSize > 1080) return allowFullResolution && physicalSize > 2200 ? 'full' : 'preview';
+    return 'medium';
   }
   if (current === 'preview') {
-    if (displaySize < 1200) return 'medium';
-    return allowFullResolution && displaySize > 2800 ? 'full' : 'preview';
+    if (physicalSize < 820) return 'medium';
+    return allowFullResolution && physicalSize > 2200 ? 'full' : 'preview';
   }
-  return !allowFullResolution || displaySize < 2200 ? 'preview' : 'full';
+  return !allowFullResolution || physicalSize < 1800 ? 'preview' : 'full';
 }
 
 export function closestNodeIds<T extends { id: string; x: number; y: number; width: number; height: number }>(

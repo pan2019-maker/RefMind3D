@@ -523,15 +523,16 @@ const CanvasImage = memo(function CanvasImage({ asset, node, canvasGrayscale, pr
   title?: string;
 }) {
   const cacheKey = `${projectCacheId}:${cacheDirectory || 'default'}:${asset.id}`;
+  const displayPixelRatio = Math.min(3, Math.max(1, window.devicePixelRatio || 1));
   const [cached, setCached] = useState<PreparedImageCache | null>(() => preparedImageCache.get(cacheKey)?.value || null);
-  const [previewTier, setPreviewTier] = useState(() => nextImagePreviewTier(undefined, displaySize, lowZoom, allowFullResolution));
+  const [previewTier, setPreviewTier] = useState(() => nextImagePreviewTier(undefined, displaySize, lowZoom, allowFullResolution, displayPixelRatio));
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
-      setPreviewTier((current) => nextImagePreviewTier(current, displaySize, lowZoom, allowFullResolution));
-    }, 120);
+      setPreviewTier((current) => nextImagePreviewTier(current, displaySize, lowZoom, allowFullResolution, displayPixelRatio));
+    }, selected ? 40 : 100);
     return () => window.clearTimeout(timer);
-  }, [allowFullResolution, displaySize, lowZoom]);
+  }, [allowFullResolution, displayPixelRatio, displaySize, lowZoom, selected]);
 
   useEffect(() => {
     let cancelled = false;
@@ -595,7 +596,7 @@ const CanvasImage = memo(function CanvasImage({ asset, node, canvasGrayscale, pr
     `scaleX(${node.flipX ? -1 : 1})`,
     `scaleY(${node.flipY ? -1 : 1})`
   ].join(' ');
-  const useTiles = Boolean(cached?.tileUrls.length && cached.tileColumns > 0 && displaySize > 1800 && visible && !node.cropEnabled);
+  const useTiles = Boolean(cached?.tileUrls.length && cached.tileColumns > 0 && displaySize * displayPixelRatio > 1600 && visible && !node.cropEnabled);
   const visibleTileIndexes = useMemo(() => {
     if (!useTiles || !cached) return new Set<number>();
     const scale = Math.min(screenRect.width / cached.imageWidth, screenRect.height / cached.imageHeight);
