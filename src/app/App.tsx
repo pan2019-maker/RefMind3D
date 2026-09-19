@@ -12,6 +12,7 @@ import { PerformanceDiagnostics } from '../components/PerformanceDiagnostics';
 import { ProjectHealthPanel } from '../components/ProjectHealthPanel';
 import { TaskCenter } from '../components/TaskCenter';
 import { WorkspaceSearch } from '../components/WorkspaceSearch';
+import { ImageCompareModal, type CompareImageItem } from '../components/ImageCompareModal';
 import { CanvasView } from '../features/canvas/CanvasView';
 import { documentExtensions, imageExtensions, importFileDataCandidatesToProject, importImageCandidatesToProject, importPathsToProject, modelExtensions, videoExtensions, type FileDataImportCandidate, type ImageImportCandidate, type ImportLayoutDirection } from '../features/assets/importController';
 import { exportEditableDocumentAsset, importClipboardImageDataUrl } from '../features/assets/assetImport';
@@ -19,7 +20,7 @@ import { AI_VISION_MODELS, type AiModelManifest } from '../features/ai/modelMani
 import { clearRecoveryProject, createLightweightRecoverySnapshot, loadNewerRecoveryProject, loadProjectCanvas, loadProjectDataUrl, loadProjectFile, loadProjectIndex, mergeRecoveryResources, projectAssetIds, saveProjectFile, saveRecoveryProject } from '../features/project/projectIO';
 import { useProjectStore } from '../stores/projectStore';
 import type { AssetRecord, CanvasNode, CanvasWorkspaceRecord, DoodleTool, ImportedModel, RefMindProject, RefMindProjectFile, RefMindWorkspaceFile } from '../shared/types';
-import { exportProjectToPng, exportSelectedNodesToPng } from '../features/export/exportCanvas';
+import { exportProjectToPng, exportProjectToPngTiles, exportSelectedNodesToPng } from '../features/export/exportCanvas';
 import { clearImageCache, confirmDefaultImageCacheDirectory, getImageCacheStatus, migrateImageCache, setImageCacheDirectory, type ImageCacheStatus } from '../features/assets/imageCache';
 import { recordProjectOpen, recordProjectSave } from '../features/performance/performanceMetrics';
 import { runBackgroundTask } from '../features/tasks/taskCenter';
@@ -990,6 +991,8 @@ export function App() {
   const [visualDuplicateBusy, setVisualDuplicateBusy] = useState(false);
   const sourceFolderScanBusyRef = useRef(false);
   const [exportCenterOpen, setExportCenterOpen] = useState(false);
+  const [imageCompareOpen, setImageCompareOpen] = useState(false);
+  const lastLayoutCommandRef = useRef<'horizontal' | 'vertical' | 'grid' | 'overlap' | null>(null);
   useEffect(() => {
     if (currentProjectPath) setRecentProjects(persistRecentProject(currentProjectPath));
   }, [currentProjectPath]);
@@ -2577,6 +2580,7 @@ export function App() {
   };
 
   const arrangeSelectedLine = (axis: 'horizontal' | 'vertical') => {
+    lastLayoutCommandRef.current = axis;
     const nodes = visualOrder(selectedLayoutNodes());
     if (nodes.length < 2) {
       setStatus('请至少选中两个对象');
@@ -2597,6 +2601,7 @@ export function App() {
   };
 
   const arrangeSelectedGrid = () => {
+    lastLayoutCommandRef.current = 'grid';
     const nodes = visualOrder(selectedLayoutNodes());
     if (nodes.length < 2) {
       setStatus('请至少选中两个对象');
@@ -2620,6 +2625,54 @@ export function App() {
       };
     });
     applyLayoutUpdates(updates, '已整理为网格');
+  };
+
+  const arrangeOverlappingOnly = () => {
+    lastLayoutCommandRef.current = 'overlap';
+    const nodes = visualOrder(selectedLayoutNodes());
+    const intersects = (a: CanvasNode, b: CanvasNode) => a.x < b.x + b.width && a.x + a.width > b.x
+      && a.y < b.y + b.height && a.y + a.height > b.y;
+    const overlapping = nodes.filter((node, index) => nodes.some((other, otherIndex) => index !== otherIndex && intersects(node, other)));
+    const movable = overlapping.filter((node) => !node.locked);
+    if (movable.length < 2) {
+      setStatus('没有需要整理的重叠对象，锁定对象保持原位');
+      closeMenu();
+      return;
+    }
+    const bounds = boundsForNodes(overlapping);
+    const columns = Math.ceil(Math.sqrt(movable.length));
+    const gap = settings.alignmentPadding;
+    const cellWidth = Math.max(...movable.map((node) => node.width)) + gap;
+    const cellHeight = Math.max(...movable.map((node) => node.height)) + gap;
+    applyLayoutUpdates(movable.map((node, index) => ({
+      id: node.id,
+      patch: {
+        x: Math.round(bounds.left + (index % columns) * cellWidth),
+        y: Math.round(bounds.top + Math.floor(index / columns) * cellHeight)
+      }
+    })), '已整理重叠对象，锁定对象保持原位');
+  };
+
+  const exportCanvasTiles = async () => {
+    closeMenu();
+    const selected = await open({ directory: true, multiple: false, title: '选择超大画布分块导出目录' });
+    if (!selected || Array.isArray(selected)) return;
+    setStatus('正在以低内存方式分块导出...');
+    try {
+      const result = await exportProjectToPngTiles(project, selected);
+      setStatus(`分块导出完成：${result.written} 张 PNG（${result.columns} × ${result.rows}）`);
+    } catch (error) {
+      setStatus('分块导出失败');
+      alert(`分块导出失败：${String(error)}`);
+    }
+  };
+
+  const repeatLastLayout = () => {
+    const command = lastLayoutCommandRef.current;
+    if (command === 'horizontal' || command === 'vertical') arrangeSelectedLine(command);
+    else if (command === 'grid') arrangeSelectedGrid();
+    else if (command === 'overlap') arrangeOverlappingOnly();
+    else setStatus('还没有可重复的布局操作');
   };
 
   const arrangeSelectedByName = () => {
@@ -3294,6 +3347,11 @@ export function App() {
     !settings.showAssetPanel ? 'hide-assets' : '',
     !settings.showInspectorPanel ? 'hide-inspector' : ''
   ].join(' ');
+  const compareItems = selectedNodeIds.flatMap((id) => {
+    const node = project.nodes.find((candidate) => candidate.id === id);
+    const asset = node?.assetId ? project.assets.find((candidate) => candidate.id === node.assetId) : undefined;
+    return node?.type === 'image' && asset ? [{ node, asset }] : [];
+  }).slice(0, 2) as CompareImageItem[];
 
   const renderLocalModelCard = (model: AiModelManifest) => {
     const selected = settings.ai.localVisionModelId === model.id;
@@ -3395,8 +3453,10 @@ export function App() {
           <div className="panel-heading"><div><h2>导出中心</h2><p className="muted">集中导出画布、选区和原始资源。</p></div><button onClick={() => setExportCenterOpen(false)}>关闭</button></div>
           <div className="export-center-grid">
             <button onClick={() => void exportCanvasImage()}><b>整张画布 PNG</b><span>导出全部可见节点，不包含涂鸦层</span></button>
+            <button onClick={() => void exportCanvasTiles()}><b>超大画布分块 PNG</b><span>按 2048px 流式导出，避免占满内存</span></button>
             <button disabled={selectedNodeIds.length === 0} onClick={() => void exportSelectedAsPng()}><b>选区 PNG</b><span>保留当前排版和图片调整效果</span></button>
             <button disabled={selectedNodeIds.length === 0} onClick={() => void exportSelectedOriginalFormat()}><b>选中原始资源</b><span>按源格式复制到目标目录</span></button>
+            <button disabled={compareItems.length !== 2} onClick={() => setImageCompareOpen(true)}><b>图片 A/B 对比</b><span>选择两张图片后进行滑动或闪烁检查</span></button>
             <button onClick={() => void saveProjectAs()}><b>便携工程副本</b><span>另存完整工程和嵌入资源</span></button>
           </div>
         </section>
@@ -3432,6 +3492,8 @@ export function App() {
             <button disabled={selectedNodeIds.length < 2} onClick={arrangeSelectedByName}>按名称智能排列</button>
             <button disabled={selectedNodeIds.length < 2} onClick={normalizeSelectedArea}>统一视觉面积</button>
             <button disabled={selectedNodeIds.length < 2} onClick={arrangeSelectedOptimal}>紧凑智能装箱</button>
+            <button disabled={selectedNodeIds.length < 2} onClick={arrangeOverlappingOnly}>仅整理重叠对象</button>
+            <button disabled={!lastLayoutCommandRef.current} onClick={repeatLastLayout}>重复上次布局</button>
             <button disabled={selectedNodeIds.length < 2} onClick={() => arrangeSelectedByAsset('path')}>按资源路径排列</button>
             <button disabled={selectedNodeIds.length < 2} onClick={() => arrangeSelectedByAsset('addition')}>按添加顺序排列</button>
             <button disabled={selectedNodeIds.length < 2} onClick={() => arrangeSelectedByAsset('order')}>按层级顺序排列</button>
@@ -3759,6 +3821,8 @@ export function App() {
               <button onClick={runMenuAction(() => arrangeSelectedLine('horizontal'))} disabled={selectedNodeIds.length < 2}>横向排列</button>
               <button onClick={runMenuAction(() => arrangeSelectedLine('vertical'))} disabled={selectedNodeIds.length < 2}>纵向排列</button>
               <button onClick={runMenuAction(arrangeSelectedGrid)} disabled={selectedNodeIds.length < 2}>网格排列</button>
+              <button onClick={runMenuAction(arrangeOverlappingOnly)} disabled={selectedNodeIds.length < 2}>仅整理重叠对象</button>
+              <button onClick={runMenuAction(repeatLastLayout)} disabled={!lastLayoutCommandRef.current}>重复上次布局</button>
               <button onClick={runMenuAction(() => distributeSelected('horizontal'))} disabled={selectedNodeIds.length < 3}>水平分布</button>
               <button onClick={runMenuAction(() => distributeSelected('vertical'))} disabled={selectedNodeIds.length < 3}>垂直分布</button>
               <div className="menu-separator" />
@@ -4154,6 +4218,7 @@ export function App() {
       )}
 
       {workspaceSearchOpen && <WorkspaceSearch storageKey={`refmind3d.search-index.${workspaceCacheId}`} canvases={canvases.map((canvas) => ({ id: canvas.id, name: canvas.name, project: canvas.id === activeCanvasId ? project : canvasProject(canvas) }))} onClose={() => setWorkspaceSearchOpen(false)} onOpenHit={(hit) => void openWorkspaceSearchHit(hit)} />}
+      {imageCompareOpen && compareItems.length === 2 && <ImageCompareModal items={compareItems as [CompareImageItem, CompareImageItem]} onClose={() => setImageCompareOpen(false)} />}
       <TaskCenter />
     </div>
   );

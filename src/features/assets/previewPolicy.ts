@@ -1,5 +1,9 @@
 export type ImagePreviewTier = 'thumbnail' | 'medium' | 'preview' | 'full';
 
+export function shouldUseOverviewRenderer(scale: number, imageCount: number) {
+  return scale < 0.12 && imageCount >= 50;
+}
+
 export function nextImagePreviewTier(
   current: ImagePreviewTier | undefined,
   displaySize: number,

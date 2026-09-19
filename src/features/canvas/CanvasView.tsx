@@ -8,7 +8,7 @@ import { prepareImageCache, type PreparedImageCache } from '../assets/imageCache
 import { ImageLoadCancelledError, imageLoadScheduler } from '../assets/imageLoadScheduler';
 import { LruCache } from '../assets/lruCache';
 import { getModelCover, modelCoverKey, setModelCover } from '../assets/modelCoverCache';
-import { boundedGpuNodeIds, closestNodeIds, nextImagePreviewTier } from '../assets/previewPolicy';
+import { boundedGpuNodeIds, closestNodeIds, nextImagePreviewTier, shouldUseOverviewRenderer } from '../assets/previewPolicy';
 import { linkedAssetsToWatch, sourceSignatureKey } from '../assets/sourceWatch';
 import { performanceMetricsSnapshot, recordImageCacheResult, recordInputLatency, recordSourceRefresh, updatePerformanceMetrics } from '../performance/performanceMetrics';
 import { adaptiveImageConcurrency, adaptiveResourceBudget } from '../performance/resourceBudget';
@@ -16,6 +16,7 @@ import { FREE_TEXT_FONT_FAMILY, FREE_TEXT_PLACEHOLDER, freeTextNodeSize } from '
 import { DoodleCanvas, type DoodleCanvasHandle } from './DoodleCanvas';
 import { CanvasNavigator } from './CanvasNavigator';
 import { GpuImageLayer, type GpuImageItem } from './GpuImageLayer';
+import { OverviewImageLayer } from './OverviewImageLayer';
 import { SpatialGridIndex } from './spatialIndex';
 import { snapMovingBounds, type SnapGuide } from './snapGuides';
 import { screenToWorld, stableWorldOrigin, worldToScreen } from './viewTransform';
@@ -788,6 +789,7 @@ export function CanvasView({
   const [snapGuides, setSnapGuides] = useState<SnapGuide[]>([]);
   const [gpuSupported, setGpuSupported] = useState(true);
   const [gpuCompositedIds, setGpuCompositedIds] = useState<ReadonlySet<string>>(() => new Set());
+  const [overviewCompositedIds, setOverviewCompositedIds] = useState<ReadonlySet<string>>(() => new Set());
   const [drag, setDrag] = useState<{
     ids?: string[];
     startX: number;
@@ -830,6 +832,9 @@ export function CanvasView({
   const textEditHistoryRecordedRef = useRef(false);
   const [viewportSize, setViewportSize] = useState({ width: 1, height: 1 });
   const panPreviewRef = useRef({ x: 0, y: 0 });
+  const panVelocityRef = useRef({ x: 0, y: 0 });
+  const panSampleRef = useRef({ x: 0, y: 0, at: 0 });
+  const panInertiaFrameRef = useRef<number | null>(null);
   const panGestureRef = useRef<{
     active: boolean;
     startX: number;
@@ -1057,6 +1062,47 @@ export function CanvasView({
   visibleAssetIdsRef.current = visibleAssetIds;
 
   useEffect(() => {
+    const key = `refmind3d.hot-images.${projectCacheId}`;
+    const previous = (() => {
+      try { return JSON.parse(localStorage.getItem(key) || '[]') as string[]; } catch { return []; }
+    })();
+    const visibleImages = [...visibleAssetIds].filter((id) => assetsById.get(id)?.kind === 'image');
+    const next = [...new Set([...visibleImages, ...previous])].slice(0, 48);
+    try { localStorage.setItem(key, JSON.stringify(next)); } catch { /* Cache hints are optional. */ }
+  }, [assetsById, projectCacheId, visibleAssetIds]);
+
+  useEffect(() => {
+    const browser = window as Window & typeof globalThis & {
+      requestIdleCallback?: (callback: () => void, options?: { timeout: number }) => number;
+      cancelIdleCallback?: (id: number) => void;
+    };
+    const key = `refmind3d.hot-images.${projectCacheId}`;
+    let cancelled = false;
+    const warm = () => {
+      let ids: string[] = [];
+      try { ids = JSON.parse(localStorage.getItem(key) || '[]') as string[]; } catch { /* Ignore stale hints. */ }
+      for (const id of ids.slice(0, 24)) {
+        const asset = assetsById.get(id);
+        if (!asset || asset.kind !== 'image') continue;
+        const cacheKey = `${projectCacheId}:${cacheDirectory || 'default'}:${asset.id}`;
+        if (preparedImageCache.get(cacheKey)) continue;
+        void imageLoadScheduler.schedule(cacheKey, 2, () => prepareImageCache(projectCacheId, cacheDirectory, asset))
+          .then((value) => { if (!cancelled) preparedImageCache.set(cacheKey, { value, checkedAt: Date.now() }); })
+          .catch(() => undefined);
+      }
+    };
+    const supportsIdle = typeof browser.requestIdleCallback === 'function';
+    const idleId = supportsIdle
+      ? browser.requestIdleCallback(warm, { timeout: 1_500 })
+      : window.setTimeout(warm, 600);
+    return () => {
+      cancelled = true;
+      if (supportsIdle && browser.cancelIdleCallback) browser.cancelIdleCallback(idleId);
+      else window.clearTimeout(idleId);
+    };
+  }, [assetsById, cacheDirectory, projectCacheId]);
+
+  useEffect(() => {
     if (!pageVisible) return;
     let cancelled = false;
     const poll = async () => {
@@ -1091,13 +1137,11 @@ export function CanvasView({
   const liveVideoIds = useMemo(() => closestNodeIds(visibleNodes.filter((node) => node.type === 'video'), viewportWorldCenter, resourceBudget.videos), [resourceBudget.videos, viewportWorldCenter, visibleNodes]);
   const fullResolutionImageIds = useMemo(() => closestNodeIds(visibleNodes.filter((node) => node.type === 'image'), viewportWorldCenter, resourceBudget.fullImages), [resourceBudget.fullImages, viewportWorldCenter, visibleNodes]);
   const gpuTextureLimit = memoryPressure ? 48 : 192;
-  const gpuImageItems = useMemo(() => {
+  const allImageRenderItems = useMemo(() => {
     const images = renderedNodes.filter((node) => node.type === 'image');
-    if (!gpuSupported || images.length < 30 || (view.scale >= 0.32 && project.nodes.length < 2_000)) return [] as GpuImageItem[];
-    const candidates = boundedGpuNodeIds(images, viewportWorldCenter, gpuTextureLimit, selectedNodeIdSet);
     return images.flatMap((node) => {
       const asset = node.assetId ? assetsById.get(node.assetId) : undefined;
-      if (!asset || !candidates.has(node.id)) return [];
+      if (!asset || selectedNodeIdSet.has(node.id)) return [];
       const screen = worldToScreen(node, view, worldOrigin);
       const naturalWidth = Number((asset as AssetRecord & { width?: number }).width) || node.width;
       const naturalHeight = Number((asset as AssetRecord & { height?: number }).height) || node.height;
@@ -1113,10 +1157,25 @@ export function CanvasView({
       } else { width = height * sourceAspect; x += (node.width * view.scale - width) / 2; }
       return [{ id: node.id, src: assetUrl(asset, true), x, y, width, height, opacity: node.opacity ?? 1, rotation: node.rotation || 0, flipX: Boolean(node.flipX), flipY: Boolean(node.flipY), grayscale: Boolean(node.grayscale || project.canvasGrayscale), u0, v0, u1, v1 }];
     });
-  }, [assetsById, gpuSupported, gpuTextureLimit, project.canvasGrayscale, project.nodes.length, renderedNodes, selectedNodeIdSet, view, viewportWorldCenter, worldOrigin]);
-  const gpuImageIds = gpuCompositedIds;
+  }, [assetsById, project.canvasGrayscale, renderedNodes, selectedNodeIdSet, view, worldOrigin]);
+  const overviewMode = shouldUseOverviewRenderer(view.scale, allImageRenderItems.length);
+  const gpuImageItems = useMemo(() => {
+    if (overviewMode || !gpuSupported || allImageRenderItems.length < 30 || (view.scale >= 0.32 && project.nodes.length < 2_000)) return [] as GpuImageItem[];
+    const candidateIds = boundedGpuNodeIds(allImageRenderItems, { x: viewportSize.width / 2, y: viewportSize.height / 2 }, gpuTextureLimit, new Set());
+    return allImageRenderItems.filter((item) => candidateIds.has(item.id));
+  }, [allImageRenderItems, gpuSupported, gpuTextureLimit, overviewMode, project.nodes.length, view.scale, viewportSize]);
+  const gpuImageIds = overviewMode ? overviewCompositedIds : gpuCompositedIds;
   const handleGpuSupport = useCallback((supported: boolean) => setGpuSupported((current) => current === supported ? current : supported), []);
+  useEffect(() => {
+    if (gpuSupported) return;
+    const retry = window.setTimeout(() => setGpuSupported(true), 4_000);
+    return () => window.clearTimeout(retry);
+  }, [gpuSupported]);
   const handleGpuCompositedIds = useCallback((ids: ReadonlySet<string>) => setGpuCompositedIds((current) => {
+    if (current.size === ids.size && [...current].every((id) => ids.has(id))) return current;
+    return ids;
+  }), []);
+  const handleOverviewCompositedIds = useCallback((ids: ReadonlySet<string>) => setOverviewCompositedIds((current) => {
     if (current.size === ids.size && [...current].every((id) => ids.has(id))) return current;
     return ids;
   }), []);
@@ -1484,6 +1543,18 @@ export function CanvasView({
     const applyPanPreview = (clientX: number, clientY: number) => {
       const gesture = panGestureRef.current;
       if (!gesture?.active) return;
+      const now = performance.now();
+      const sample = panSampleRef.current;
+      const elapsed = now - sample.at;
+      if (sample.at > 0 && elapsed > 0 && elapsed < 80) {
+        const instantX = (clientX - sample.x) / elapsed;
+        const instantY = (clientY - sample.y) / elapsed;
+        panVelocityRef.current = {
+          x: panVelocityRef.current.x * 0.65 + instantX * 0.35,
+          y: panVelocityRef.current.y * 0.65 + instantY * 0.35
+        };
+      }
+      panSampleRef.current = { x: clientX, y: clientY, at: now };
       const offset = {
         x: clientX - gesture.startX,
         y: clientY - gesture.startY
@@ -1519,9 +1590,27 @@ export function CanvasView({
         x: gesture.originX + offset.x,
         y: gesture.originY + offset.y
       }));
+      const releasedAt = performance.now();
+      let previous = releasedAt;
+      const velocity = panVelocityRef.current;
+      const startInertia = Math.hypot(velocity.x, velocity.y) > 0.12 && performance.now() - panSampleRef.current.at < 90;
+      const step = (now: number) => {
+        const dt = Math.min(32, now - previous);
+        previous = now;
+        const decay = Math.exp(-dt / 115);
+        velocity.x *= decay;
+        velocity.y *= decay;
+        if (Math.hypot(velocity.x, velocity.y) < 0.015 || inputModeRef.current !== 'idle') {
+          panInertiaFrameRef.current = null;
+          return;
+        }
+        setView((current) => ({ ...current, x: current.x + velocity.x * dt, y: current.y + velocity.y * dt }));
+        panInertiaFrameRef.current = requestAnimationFrame(step);
+      };
       panPreviewRef.current = { x: 0, y: 0 };
       setDrag(null);
       inputModeRef.current = 'idle';
+      if (startInertia) panInertiaFrameRef.current = requestAnimationFrame(step);
     };
 
     const handleMousedown = (event: MouseEvent) => {
@@ -1537,6 +1626,10 @@ export function CanvasView({
       event.preventDefault();
       event.stopPropagation();
       inputModeRef.current = 'pan';
+      if (panInertiaFrameRef.current !== null) cancelAnimationFrame(panInertiaFrameRef.current);
+      panInertiaFrameRef.current = null;
+      panVelocityRef.current = { x: 0, y: 0 };
+      panSampleRef.current = { x: event.clientX, y: event.clientY, at: performance.now() };
 
       // Capture the pending zoom camera before flushing it. React state is
       // asynchronous, so reading viewRef after flushZoom used to occasionally
@@ -1587,6 +1680,7 @@ export function CanvasView({
     window.addEventListener('auxclick', preventAuxClick, true);
     window.addEventListener('blur', handleBlur);
     return () => {
+      if (panInertiaFrameRef.current !== null) cancelAnimationFrame(panInertiaFrameRef.current);
       panGestureRef.current = null;
       panPreviewRef.current = { x: 0, y: 0 };
       worldRef.current?.style.setProperty('transform', 'none', 'important');
@@ -2490,6 +2584,7 @@ export function CanvasView({
         className="canvas-world screen-space-renderer"
       >
         {showGrid && !lowZoom && <div className="canvas-grid" />}
+        {overviewMode && <OverviewImageLayer items={allImageRenderItems} width={viewportSize.width} height={viewportSize.height} onCompositedIdsChange={handleOverviewCompositedIds} />}
         {gpuImageItems.length > 0 && <GpuImageLayer items={gpuImageItems} width={viewportSize.width} height={viewportSize.height} textureLimit={gpuTextureLimit} onSupportChange={handleGpuSupport} onCompositedIdsChange={handleGpuCompositedIds} />}
         <svg className="mindmap-layer" width={viewportSize.width} height={viewportSize.height} viewBox={`0 0 ${viewportSize.width} ${viewportSize.height}`}>
           {renderedLinks.map((link) => {

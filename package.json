@@ -1,7 +1,7 @@
 {
   "name": "refmind3d-v2",
   "private": true,
-  "version": "1.12.1",
+  "version": "1.13.0",
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
@@ -10,7 +10,8 @@
     "tauri:dev": "npm exec -- tauri dev",
     "tauri:build": "npm exec -- tauri build",
     "check": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "release:gate": "powershell -ExecutionPolicy Bypass -File scripts/stability-release-gate.ps1"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",

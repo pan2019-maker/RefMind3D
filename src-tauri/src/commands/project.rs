@@ -2,7 +2,7 @@ use base64::Engine as _;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{hash_map::DefaultHasher, HashSet};
+use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::fs::File;
@@ -69,6 +69,22 @@ struct PackedProjectFile {
 struct PackedCanvas {
     id: String,
     zip_path: String,
+    #[serde(default)]
+    content_hash: String,
+}
+
+fn payload_hash(bytes: &[u8]) -> String {
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn open_previous_canvases(path: &Path) -> Option<(ZipArchive<File>, HashMap<String, PackedCanvas>)> {
+    let mut archive = ZipArchive::new(File::open(path).ok()?).ok()?;
+    let mut manifest_text = String::new();
+    archive.by_name("project.json").ok()?.read_to_string(&mut manifest_text).ok()?;
+    let manifest: PackedProjectFile = serde_json::from_str(&manifest_text).ok()?;
+    Some((archive, manifest.canvases.into_iter().map(|canvas| (canvas.id.clone(), canvas)).collect()))
 }
 
 enum ResourceSource {
@@ -685,7 +701,7 @@ fn save_packed_project(path: String, mut project: Value) -> Result<(), String> {
         .map(str::to_string);
     let sources = collect_packed_resources(&mut project)?;
     write_index_backup(&path, &project);
-    let mut canvas_payloads: Vec<(PackedCanvas, Value)> = Vec::new();
+    let mut canvas_payloads: Vec<(PackedCanvas, Vec<u8>)> = Vec::new();
     if project.get("fileType").and_then(Value::as_str) == Some("refmind3d-workspace") {
         if let Some(canvases) = project.get_mut("canvases").and_then(Value::as_array_mut) {
             for canvas in canvases {
@@ -696,13 +712,11 @@ fn save_packed_project(path: String, mut project: Value) -> Result<(), String> {
                     .to_string();
                 if let Some(project_value) = canvas.get_mut("project") {
                     let payload = std::mem::replace(project_value, Value::Null);
-                    canvas_payloads.push((
-                        PackedCanvas {
-                            id: id.clone(),
-                            zip_path: format!("canvases/{}.json", sanitize_file_name(&id)),
-                        },
-                        payload,
-                    ));
+                    let bytes = serde_json::to_vec(&payload).map_err(|e| format!("Serialize canvas failed: {e}"))?;
+                    canvas_payloads.push((PackedCanvas {
+                        id: id.clone(), zip_path: format!("canvases/{}.json", sanitize_file_name(&id)),
+                        content_hash: payload_hash(&bytes),
+                    }, bytes));
                 }
             }
         }
@@ -726,12 +740,14 @@ fn save_packed_project(path: String, mut project: Value) -> Result<(), String> {
             .map(|(meta, _)| PackedCanvas {
                 id: meta.id.clone(),
                 zip_path: meta.zip_path.clone(),
+                content_hash: meta.content_hash.clone(),
             })
             .collect(),
         packed_at,
     };
 
     let destination = PathBuf::from(&path);
+    let mut previous = open_previous_canvases(&destination);
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).map_err(|e| format!("Create project directory failed: {e}"))?;
     let temporary = parent.join(format!(".refmind3d-save-{}.tmp", Uuid::new_v4()));
@@ -747,13 +763,17 @@ fn save_packed_project(path: String, mut project: Value) -> Result<(), String> {
     zip.write_all(&manifest_text)
         .map_err(|e| format!("Write project index failed: {e}"))?;
 
-    for (meta, canvas) in &canvas_payloads {
-        zip.start_file(&meta.zip_path, deflated)
-            .map_err(|e| format!("Write canvas index failed: {e}"))?;
-        let bytes =
-            serde_json::to_vec(canvas).map_err(|e| format!("Serialize canvas failed: {e}"))?;
-        zip.write_all(&bytes)
-            .map_err(|e| format!("Write canvas failed: {e}"))?;
+    for (meta, bytes) in &canvas_payloads {
+        let reused = previous.as_mut().and_then(|(archive, prior)| {
+            let old = prior.get(&meta.id)?;
+            if old.content_hash != meta.content_hash || old.content_hash.is_empty() { return None; }
+            let file = archive.by_name(&old.zip_path).ok()?;
+            zip.raw_copy_file_rename(file, &meta.zip_path).ok()?;
+            Some(())
+        }).is_some();
+        if reused { continue; }
+        zip.start_file(&meta.zip_path, deflated).map_err(|e| format!("Write canvas index failed: {e}"))?;
+        zip.write_all(bytes).map_err(|e| format!("Write canvas failed: {e}"))?;
     }
 
     for item in sources {

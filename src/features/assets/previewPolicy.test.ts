@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { boundedGpuNodeIds, closestNodeIds, nextImagePreviewTier } from './previewPolicy';
+import { boundedGpuNodeIds, closestNodeIds, nextImagePreviewTier, shouldUseOverviewRenderer } from './previewPolicy';
 
 describe('preview policy', () => {
   it('uses hysteresis around image tier boundaries', () => {
@@ -21,5 +21,11 @@ describe('preview policy', () => {
     expect(ids.size).toBe(192);
     expect(ids.has('0')).toBe(false);
     expect(nodes.filter((node) => !ids.has(node.id))).toHaveLength(308);
+  });
+
+  it('switches to the bounded overview renderer only for dense extreme zooms', () => {
+    expect(shouldUseOverviewRenderer(0.08, 500)).toBe(true);
+    expect(shouldUseOverviewRenderer(0.2, 500)).toBe(false);
+    expect(shouldUseOverviewRenderer(0.08, 20)).toBe(false);
   });
 });

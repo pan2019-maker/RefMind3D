@@ -1,4 +1,5 @@
 import { convertFileSrc, invoke } from '@tauri-apps/api/core';
+import { join } from '@tauri-apps/api/path';
 import type { AssetRecord, CanvasNode, RefMindProject } from '../../shared/types';
 
 function isTextLike(node: CanvasNode) {
@@ -99,13 +100,13 @@ function expandSelectedNodes(project: RefMindProject, nodeIds: string[]) {
     .sort((a, b) => (a.zIndex || 0) - (b.zIndex || 0));
 }
 
-async function renderNodesToPng(project: RefMindProject, outputPath: string, sourceNodes: CanvasNode[], background = 'transparent') {
+async function renderNodesToPng(project: RefMindProject, outputPath: string, sourceNodes: CanvasNode[], background = 'transparent', fixedBounds?: { left: number; top: number; right: number; bottom: number }) {
   const nodes = sourceNodes.filter((node) => !node.hidden).slice().sort((a, b) => (a.zIndex || 0) - (b.zIndex || 0));
   if (nodes.length === 0) throw new Error('没有可导出的节点');
 
   const assetsById = new Map(project.assets.map((asset) => [asset.id, asset]));
-  const bounds = boundsOf(nodes);
-  const padding = nodes.length === project.nodes.length ? 80 : 24;
+  const bounds = fixedBounds || boundsOf(nodes);
+  const padding = fixedBounds ? 0 : nodes.length === project.nodes.length ? 80 : 24;
   const width = Math.max(64, Math.ceil(bounds.right - bounds.left + padding * 2));
   const height = Math.max(64, Math.ceil(bounds.bottom - bounds.top + padding * 2));
   const offsetX = padding - bounds.left;
@@ -215,4 +216,32 @@ export async function exportProjectToPng(project: RefMindProject, outputPath: st
 export async function exportSelectedNodesToPng(project: RefMindProject, nodeIds: string[], outputPath: string) {
   const nodes = expandSelectedNodes(project, nodeIds);
   await renderNodesToPng(project, outputPath, nodes, 'transparent');
+}
+
+export async function exportProjectToPngTiles(project: RefMindProject, outputDirectory: string, tileSize = 2048) {
+  const visible = project.nodes.filter((node) => !node.hidden);
+  if (visible.length === 0) throw new Error('没有可导出的节点');
+  const bounds = boundsOf(visible);
+  const columns = Math.max(1, Math.ceil((bounds.right - bounds.left) / tileSize));
+  const rows = Math.max(1, Math.ceil((bounds.bottom - bounds.top) / tileSize));
+  let written = 0;
+  for (let row = 0; row < rows; row += 1) {
+    for (let column = 0; column < columns; column += 1) {
+      const tileBounds = {
+        left: bounds.left + column * tileSize,
+        top: bounds.top + row * tileSize,
+        right: Math.min(bounds.right, bounds.left + (column + 1) * tileSize),
+        bottom: Math.min(bounds.bottom, bounds.top + (row + 1) * tileSize)
+      };
+      const nodes = visible.filter((node) => node.x < tileBounds.right && node.x + node.width > tileBounds.left
+        && node.y < tileBounds.bottom && node.y + node.height > tileBounds.top);
+      if (nodes.length === 0) continue;
+      const name = `RefMind3D_tile_${String(row + 1).padStart(3, '0')}_${String(column + 1).padStart(3, '0')}.png`;
+      await renderNodesToPng(project, await join(outputDirectory, name), nodes, '#242424', tileBounds);
+      written += 1;
+      // Yield between tiles so the UI remains responsive and memory can be reclaimed.
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+    }
+  }
+  return { written, columns, rows, tileSize };
 }

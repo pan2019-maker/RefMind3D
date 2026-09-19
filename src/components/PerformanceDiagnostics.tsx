@@ -39,7 +39,7 @@ export function PerformanceDiagnostics({ projectPath }: { projectPath?: string }
     if (!path) return;
     const report = {
       generatedAt: new Date().toISOString(),
-      appVersion: '1.12.1',
+      appVersion: '1.13.0',
       platform: navigator.platform,
       hardwareConcurrency: navigator.hardwareConcurrency,
       deviceMemoryGb: (navigator as Navigator & { deviceMemory?: number }).deviceMemory,

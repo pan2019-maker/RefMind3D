@@ -67,6 +67,11 @@ export const GpuImageLayer = memo(function GpuImageLayer({ items, width, height,
     const program = gl.createProgram();
     if (!vertex || !fragment || !program) { onSupportChange(false); return; }
     gl.attachShader(program, vertex); gl.attachShader(program, fragment); gl.linkProgram(program); gl.useProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) { onSupportChange(false); return; }
+    const handleContextLost = (event: Event) => {
+      event.preventDefault(); onCompositedIdsChange(new Set()); onSupportChange(false);
+    };
+    canvas.addEventListener('webglcontextlost', handleContextLost);
     const positionLocation = gl.getAttribLocation(program, 'a_position');
     const textureLocation = gl.getAttribLocation(program, 'a_texCoord');
     const opacityLocation = gl.getUniformLocation(program, 'u_opacity');
@@ -110,6 +115,7 @@ export const GpuImageLayer = memo(function GpuImageLayer({ items, width, height,
     redrawRef.current();
     return () => {
       onCompositedIdsChange(new Set());
+      canvas.removeEventListener('webglcontextlost', handleContextLost);
       textures.forEach((texture) => gl.deleteTexture(texture));
       gl.deleteBuffer(positionBuffer); gl.deleteBuffer(textureBuffer); gl.deleteProgram(program); gl.deleteShader(vertex); gl.deleteShader(fragment);
       runtimeRef.current = null; updatePerformanceMetrics({ gpuTextureCount: 0 });
