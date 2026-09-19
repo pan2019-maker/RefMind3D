@@ -4,7 +4,7 @@ import { desktopDir, join } from '@tauri-apps/api/path';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWindow } from '@tauri-apps/api/window';
-import { readTextFile } from '@tauri-apps/plugin-fs';
+import { readTextFile, stat } from '@tauri-apps/plugin-fs';
 import { AssetPanel } from '../components/AssetPanel';
 import { InspectorPanel } from '../components/InspectorPanel';
 import { HierarchyPanel } from '../components/HierarchyPanel';
@@ -911,6 +911,7 @@ export function App() {
     copySelected,
     pasteClipboard,
     createTextNode,
+    updateAsset,
     updateNode,
     updateNodes,
     updateProjectOptions,
@@ -1054,6 +1055,7 @@ export function App() {
   }, []);
   const [activeCanvasId, setActiveCanvasId] = useState('main-canvas');
   const [canvasSwitching, setCanvasSwitching] = useState(false);
+  const [projectOpenPhase, setProjectOpenPhase] = useState<'index' | 'recovery' | 'canvas' | null>(null);
   const [canvases, setCanvases] = useState<CanvasWorkspace[]>(() => [{
     id: 'main-canvas',
     name: '主画布',
@@ -1773,8 +1775,37 @@ export function App() {
     setStatus(`已移除 ${unused.length} 个未使用资源，原始文件未删除`);
   };
 
+  const relinkAssetsFromFolder = async () => {
+    const folder = await open({ directory: true, multiple: false, title: '选择失联资源的新根目录' });
+    if (typeof folder !== 'string') return;
+    setStatus('正在按文件名与大小查找失联资源…');
+    const paths = await invoke<string[]>('scan_asset_folder', { path: folder });
+    const byName = new Map<string, string[]>();
+    for (const path of paths) {
+      const name = path.split(/[\\/]/).pop()?.toLowerCase() || '';
+      byName.set(name, [...(byName.get(name) || []), path]);
+    }
+    let matched = 0;
+    for (const asset of project.assets.filter((item) => item.storageMode === 'linked')) {
+      const name = (asset.name || asset.originalPath.split(/[\\/]/).pop() || '').toLowerCase();
+      const candidates = byName.get(name) || [];
+      for (const candidate of candidates) {
+        try {
+          const info = await stat(candidate);
+          if (asset.fileSize > 0 && info.size !== asset.fileSize) continue;
+          updateAsset(asset.id, { originalPath: candidate, projectAssetPath: candidate });
+          matched += 1; break;
+        } catch { /* Skip inaccessible candidates. */ }
+      }
+    }
+    if (matched) window.dispatchEvent(new Event('refmind3d-image-cache-reset'));
+    setStatus(matched ? `已重新定位 ${matched} 个链接资源` : '没有找到文件名和大小同时匹配的资源');
+  };
+
   const loadProjectFromPath = async (path: string) => {
     const openStartedAt = performance.now();
+    setProjectOpenPhase('index');
+    try {
     let original = await loadProjectIndex(path);
     persistedAssetIdsRef.current = projectAssetIds(original);
     recoveryBaselineRef.current = isWorkspaceFile(original)
@@ -1783,6 +1814,7 @@ export function App() {
     const originalCacheId = original.cacheId || crypto.randomUUID();
     let loaded = original;
     let restoredRecovery = false;
+    setProjectOpenPhase('recovery');
     try {
       const recovery = await loadNewerRecoveryProject(originalCacheId, path);
       if (recovery) {
@@ -1798,6 +1830,7 @@ export function App() {
       console.warn('读取自动恢复副本失败', error);
     }
     if (isWorkspaceFile(loaded)) {
+      setProjectOpenPhase('canvas');
       setWorkspaceCacheId(loaded.cacheId || originalCacheId);
       setWorkspaceCacheDirectory(loaded.cacheDirectory);
       setCachePathDirty(false);
@@ -1832,6 +1865,9 @@ export function App() {
     setCurrentProjectPath(path);
     setStatus(`旧版单画布工程已打开：${path}`);
     recordProjectOpen(performance.now() - openStartedAt);
+    } finally {
+      setProjectOpenPhase(null);
+    }
   };
 
   useEffect(() => {
@@ -2900,6 +2936,27 @@ export function App() {
     setStatus(selectedNodeIds.length > 0 ? '已定位并拉近选中对象' : '已定位全部导入对象');
   };
 
+  const rotateSelected = (degrees: number) => applyLayoutUpdates(
+    selectedLayoutNodes().filter((node) => !node.locked).map((node) => ({ id: node.id, patch: { rotation: (node.rotation + degrees + 360) % 360 } })),
+    `已旋转选中对象 ${degrees}°`
+  );
+
+  const flipSelectedImages = (axis: 'x' | 'y') => applyLayoutUpdates(
+    selectedLayoutNodes().filter((node) => node.type === 'image' && !node.locked).map((node) => ({ id: node.id, patch: axis === 'x' ? { flipX: !node.flipX } : { flipY: !node.flipY } })),
+    axis === 'x' ? '已水平翻转选中图片' : '已垂直翻转选中图片'
+  );
+
+  const preciseTransformSelected = () => {
+    const anchor = selectedLayoutNodes().find((node) => node.id === selectedNodeIds[selectedNodeIds.length - 1]);
+    if (!anchor) return;
+    const value = prompt('输入 X, Y, 宽度, 高度, 旋转角度', `${Math.round(anchor.x)}, ${Math.round(anchor.y)}, ${Math.round(anchor.width)}, ${Math.round(anchor.height)}, ${Math.round(anchor.rotation)}`);
+    if (!value) return;
+    const numbers = value.split(/[,，\s]+/).map(Number);
+    if (numbers.length < 5 || numbers.some((number) => !Number.isFinite(number))) { alert('请输入 5 个有效数字。'); return; }
+    updateNode(anchor.id, { x: numbers[0], y: numbers[1], width: Math.max(18, numbers[2]), height: Math.max(18, numbers[3]), rotation: ((numbers[4] % 360) + 360) % 360 }, true, false);
+    setStatus('已应用精确变换'); closeMenu();
+  };
+
   const pickScreenColor = async () => {
     const EyeDropperCtor = (window as unknown as { EyeDropper?: new () => { open: () => Promise<{ sRGBHex: string }> } }).EyeDropper;
     if (!EyeDropperCtor) { alert('当前 WebView 不支持屏幕取色器。'); return; }
@@ -3519,6 +3576,7 @@ export function App() {
       </div>}
       {saveNotice && <div className="project-save-notice" role="status" aria-live="polite">{saveNotice}</div>}
       {savePhase && <div className="project-save-progress" role="status" aria-live="polite"><span className="project-save-spinner" />{savePhase === 'prepare' ? '正在准备工程数据' : savePhase === 'write' ? '正在后台压缩并写入' : '正在校验并完成保存'}</div>}
+      {projectOpenPhase && <div className="project-open-progress" role="status" aria-live="polite"><span className="project-save-spinner" />{projectOpenPhase === 'index' ? '正在读取画布索引' : projectOpenPhase === 'recovery' ? '正在检查恢复快照' : '正在显示当前画布，其他内容后台待命'}</div>}
 
       <section
         className={`canvas-opacity-control ${opacityPanelOpen ? 'is-open' : ''}`}
@@ -3901,6 +3959,11 @@ export function App() {
               <button onClick={runMenuAction(toggleSelectedFrozen)} disabled={selectedNodeIds.length === 0}>{project.nodes.some((node) => selectedNodeIds.includes(node.id) && node.frozen) ? '解冻选中对象' : '冻结选中对象'}</button>
               <button onClick={runMenuAction(() => scaleSelected(0.5))} disabled={selectedNodeIds.length === 0}>缩小 50%</button>
               <button onClick={runMenuAction(() => scaleSelected(2))} disabled={selectedNodeIds.length === 0}>放大 200%</button>
+              <button onClick={runMenuAction(() => rotateSelected(-90))} disabled={selectedNodeIds.length === 0}>向左旋转 90°</button>
+              <button onClick={runMenuAction(() => rotateSelected(90))} disabled={selectedNodeIds.length === 0}>向右旋转 90°</button>
+              <button onClick={runMenuAction(() => flipSelectedImages('x'))} disabled={!project.nodes.some((node) => selectedNodeIds.includes(node.id) && node.type === 'image')}>水平翻转图片</button>
+              <button onClick={runMenuAction(() => flipSelectedImages('y'))} disabled={!project.nodes.some((node) => selectedNodeIds.includes(node.id) && node.type === 'image')}>垂直翻转图片</button>
+              <button onClick={runMenuAction(preciseTransformSelected)} disabled={selectedNodeIds.length === 0}>精确变换…</button>
             </div>
           </div>
           <div className="menu-separator" />
@@ -4054,7 +4117,7 @@ export function App() {
               <div className="settings-section-title"><strong>检索与资源治理</strong><button onClick={() => { setSettingsOpen(false); setWorkspaceSearchOpen(true); }}>全工程搜索</button></div>
               <p className="muted">Ctrl+Shift+P 搜索全部画布的标题、正文、文件名、路径与标签。</p>
               <div className="resource-summary-grid"><span>资源总数 <b>{project.assets.length}</b></span><span>工程资源体积 <b>{(resourceBytes / 1024 / 1024).toFixed(1)} MB</b></span><span>未使用 <b>{unusedAssets.length}</b></span><span>超大资源 <b>{oversizedAssets.length}</b></span></div>
-              <div className="cache-actions"><button onClick={() => { const count = mergeDuplicateAssets(); setStatus(count ? `已合并 ${count} 个精确重复资源` : '未发现可安全合并的精确重复资源'); }}>合并精确重复资源</button><button disabled={visualDuplicateBusy} onClick={() => void scanVisualDuplicates()}>{visualDuplicateBusy ? '分析中…' : '扫描视觉相似图片'}</button><button disabled={unusedAssets.length === 0} onClick={cleanUnusedAssets}>移除未使用资源</button></div>
+              <div className="cache-actions"><button onClick={() => { const count = mergeDuplicateAssets(); setStatus(count ? `已合并 ${count} 个精确重复资源` : '未发现可安全合并的精确重复资源'); }}>合并精确重复资源</button><button disabled={visualDuplicateBusy} onClick={() => void scanVisualDuplicates()}>{visualDuplicateBusy ? '分析中…' : '扫描视觉相似图片'}</button><button onClick={() => void relinkAssetsFromFolder()}>批量重新定位链接资源</button><button disabled={unusedAssets.length === 0} onClick={cleanUnusedAssets}>移除未使用资源</button></div>
               <p className="muted">只合并内容哈希一致或同一路径且大小一致的资源，节点引用会自动迁移，不使用容易误判的文件名相似度。</p>
               <div className="smart-collection-row"><button onClick={() => selectCollection('images')}>全部图片</button><button onClick={() => selectCollection('tagged')}>已加标签</button><button onClick={() => selectCollection('recent')}>最近 7 天</button><button onClick={() => selectCollection('large')}>超大资源</button><button onClick={() => selectCollection('missing')}>失联资源</button></div>
               {visualDuplicateGroups.slice(0, 8).map((group, index) => <div className="duplicate-candidate-row" key={group.join(':')}><span>相似组 {index + 1}</span><code>{group.length} 张</code><button onClick={() => { const assetIds = new Set(group); const ids = project.nodes.filter((node) => node.assetId && assetIds.has(node.assetId)).map((node) => node.id); selectNodes(ids); dispatchFocusNodeIds(ids); }}>在画布中选择</button></div>)}

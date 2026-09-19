@@ -20,6 +20,7 @@ export function ImageCompareModal({ items, onClose }: { items: [CompareImageItem
   const [checkerboard, setCheckerboard] = useState(true);
   const [zoom, setZoom] = useState(100);
   const cursorRef = useRef<HTMLOutputElement | null>(null);
+  const [analysis, setAnalysis] = useState<Array<{ average: string; alpha: number; histogram: number[] }>>([]);
   const urls = useMemo(() => items.map((item) => source(item.asset)) as [string, string], [items]);
 
   useEffect(() => {
@@ -27,6 +28,32 @@ export function ImageCompareModal({ items, onClose }: { items: [CompareImageItem
     const timer = window.setInterval(() => setShowB((value) => !value), 450);
     return () => window.clearInterval(timer);
   }, [blink]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const analyze = (url: string) => new Promise<{ average: string; alpha: number; histogram: number[] }>((resolve) => {
+      const image = new Image(); image.decoding = 'async';
+      image.onload = () => {
+        try {
+          const canvas = document.createElement('canvas'); canvas.width = 128; canvas.height = 128;
+          const context = canvas.getContext('2d', { willReadFrequently: true });
+          if (!context) throw new Error('No canvas');
+          context.drawImage(image, 0, 0, 128, 128);
+          const pixels = context.getImageData(0, 0, 128, 128).data; const histogram = Array.from({ length: 16 }, () => 0);
+          let red = 0; let green = 0; let blue = 0; let opaque = 0;
+          for (let index = 0; index < pixels.length; index += 4) {
+            red += pixels[index]; green += pixels[index + 1]; blue += pixels[index + 2]; if (pixels[index + 3] > 8) opaque += 1;
+            histogram[Math.min(15, Math.floor((pixels[index] * .2126 + pixels[index + 1] * .7152 + pixels[index + 2] * .0722) / 16))] += 1;
+          }
+          const count = pixels.length / 4; const hex = (value: number) => Math.round(value / count).toString(16).padStart(2, '0');
+          resolve({ average: `#${hex(red)}${hex(green)}${hex(blue)}`.toUpperCase(), alpha: Math.round(opaque / count * 100), histogram });
+        } catch { resolve({ average: '不可读取', alpha: 0, histogram: [] }); }
+      };
+      image.onerror = () => resolve({ average: '读取失败', alpha: 0, histogram: [] }); image.src = url;
+    });
+    void Promise.all(urls.map(analyze)).then((value) => { if (!cancelled) setAnalysis(value); });
+    return () => { cancelled = true; };
+  }, [urls]);
 
   return <div className="image-compare-backdrop" onMouseDown={onClose}>
     <section className="image-compare-modal" onMouseDown={(event) => event.stopPropagation()}>
@@ -53,6 +80,7 @@ export function ImageCompareModal({ items, onClose }: { items: [CompareImageItem
         <button className={checkerboard ? 'active' : ''} onClick={() => setCheckerboard((value) => !value)}>透明棋盘格</button>
         <span>A：{items[0].asset.name} · {(items[0].asset.fileSize / 1024 / 1024).toFixed(1)} MB</span>
         <span>B：{items[1].asset.name} · {(items[1].asset.fileSize / 1024 / 1024).toFixed(1)} MB</span>
+        {analysis.map((item, index) => <span className="image-analysis" key={index}>{index ? 'B' : 'A'} 均色 {item.average} · Alpha 覆盖 {item.alpha}% <i>{item.histogram.map((value, bar) => <b key={bar} style={{ height: `${Math.max(2, value / Math.max(...item.histogram, 1) * 18)}px` }} />)}</i></span>)}
       </footer>
     </section>
   </div>;

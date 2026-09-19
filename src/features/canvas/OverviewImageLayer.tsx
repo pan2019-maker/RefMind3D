@@ -12,10 +12,32 @@ export const OverviewImageLayer = memo(function OverviewImageLayer({ items, widt
   const imagesRef = useRef(new Map<string, HTMLImageElement>());
   const itemsRef = useRef(items);
   const redrawRef = useRef<() => void>(() => undefined);
+  const workerRef = useRef<Worker | null>(null);
+  const offscreenRef = useRef(false);
 
   useEffect(() => {
     itemsRef.current = items;
-    const canvas = canvasRef.current; const context = canvas?.getContext('2d', { alpha: true });
+    const canvas = canvasRef.current;
+    const renderScale = Math.min(1, 1024 / Math.max(1, width), 768 / Math.max(1, height));
+    if (canvas && 'transferControlToOffscreen' in canvas) {
+      try {
+        if (!workerRef.current) {
+          workerRef.current = new Worker(new URL('./overviewRender.worker.ts', import.meta.url), { type: 'module' });
+          workerRef.current.onmessage = (event: MessageEvent<{ type: string; ids: string[] }>) => {
+            if (event.data.type === 'ready') onCompositedIdsChange(new Set(event.data.ids));
+          };
+        }
+        const message: { canvas?: OffscreenCanvas; items: GpuImageItem[]; width: number; height: number; pixelWidth: number; pixelHeight: number } = {
+          items, width, height, pixelWidth: Math.max(1, Math.round(width * renderScale)), pixelHeight: Math.max(1, Math.round(height * renderScale))
+        };
+        if (!offscreenRef.current) {
+          message.canvas = canvas.transferControlToOffscreen(); offscreenRef.current = true;
+          workerRef.current.postMessage(message, [message.canvas]);
+        } else workerRef.current.postMessage(message);
+        return;
+      } catch { workerRef.current?.terminate(); workerRef.current = null; }
+    }
+    const context = canvas?.getContext('2d', { alpha: true });
     if (!canvas || !context) { onCompositedIdsChange(new Set()); return; }
     const cssScaleX = canvas.width / Math.max(1, width); const cssScaleY = canvas.height / Math.max(1, height);
     redrawRef.current = () => {
@@ -46,6 +68,7 @@ export const OverviewImageLayer = memo(function OverviewImageLayer({ items, widt
   }, [height, items, onCompositedIdsChange, width]);
 
   useEffect(() => () => onCompositedIdsChange(new Set()), [onCompositedIdsChange]);
+  useEffect(() => () => { workerRef.current?.terminate(); workerRef.current = null; }, []);
   const renderScale = Math.min(1, 1024 / Math.max(1, width), 768 / Math.max(1, height));
   return <canvas ref={canvasRef} className="overview-image-layer" style={{ width, height }} width={Math.max(1, Math.round(width * renderScale))} height={Math.max(1, Math.round(height * renderScale))} aria-hidden="true" />;
 });

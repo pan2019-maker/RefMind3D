@@ -3,7 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { save } from '@tauri-apps/plugin-dialog';
 import { performanceMetricsSnapshot, subscribePerformanceMetrics } from '../features/performance/performanceMetrics';
 import { runCanvasBenchmarkSuite, type BenchmarkResult } from '../features/performance/benchmark';
-import { errorJournalSnapshot } from '../features/diagnostics/errorJournal';
+import { crashSessionStatus, errorJournalSnapshot } from '../features/diagnostics/errorJournal';
 import { useProjectStore } from '../stores/projectStore';
 
 type IntegrityReport = { valid: boolean; canvasCount: number; resourceCount: number; checkedEntries: number; sizeBytes: number };
@@ -40,7 +40,7 @@ export function PerformanceDiagnostics({ projectPath }: { projectPath?: string }
     if (!path) return;
     const report = {
       generatedAt: new Date().toISOString(),
-      appVersion: '1.14.0',
+      appVersion: '1.15.0',
       platform: navigator.platform,
       hardwareConcurrency: navigator.hardwareConcurrency,
       deviceMemoryGb: (navigator as Navigator & { deviceMemory?: number }).deviceMemory,
@@ -50,7 +50,8 @@ export function PerformanceDiagnostics({ projectPath }: { projectPath?: string }
       benchmark,
       integrity,
       projectSummary: { nodes: project.nodes.length, assets: project.assets.length, links: project.links.length, doodles: project.doodles?.length || 0 },
-      recentErrors: errorJournalSnapshot()
+      recentErrors: errorJournalSnapshot(),
+      crashSession: crashSessionStatus()
     };
     await invoke('save_data_url_to_path', { path, dataUrl: dataUrlFromText(JSON.stringify(report, null, 2)) });
   };
@@ -71,6 +72,7 @@ export function PerformanceDiagnostics({ projectPath }: { projectPath?: string }
         <span>缓存命中率</span><code>{hitRate}%（{requests} 次）</code>
         <span>源文件刷新</span><code>{metrics.sourceRefreshes} 次</code>
         <span>最近保存</span><code>{metrics.lastSaveMs === undefined ? '尚未记录' : `${metrics.lastSaveMs} ms`}</code>
+        <span>崩溃诊断</span><code>{crashSessionStatus().previousSessionUnclean ? '上次会话可能异常结束' : '正常'} · 本地日志 {crashSessionStatus().persistedErrors} 条</code>
         <span>最近工程打开</span><code>{metrics.projectOpenMs === undefined ? '尚未记录' : `${metrics.projectOpenMs} ms（索引与当前画布）`}</code>
       </div>
       <div className="performance-benchmark-row">

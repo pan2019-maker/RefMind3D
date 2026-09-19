@@ -11,7 +11,7 @@ import { getModelCover, modelCoverKey, setModelCover } from '../assets/modelCove
 import { boundedGpuNodeIds, closestNodeIds, nextImagePreviewTier, shouldUseOverviewRenderer } from '../assets/previewPolicy';
 import { linkedAssetsToWatch, sourceSignatureKey } from '../assets/sourceWatch';
 import { performanceMetricsSnapshot, recordImageCacheResult, recordInputLatency, recordSourceRefresh, updatePerformanceMetrics } from '../performance/performanceMetrics';
-import { adaptiveImageConcurrency, adaptiveResourceBudget } from '../performance/resourceBudget';
+import { adaptiveImageConcurrency, adaptiveResourceBudget, nextQualityTier } from '../performance/resourceBudget';
 import { FREE_TEXT_FONT_FAMILY, FREE_TEXT_PLACEHOLDER, freeTextNodeSize } from '../../shared/freeText';
 import { DoodleCanvas, type DoodleCanvasHandle } from './DoodleCanvas';
 import { CanvasNavigator } from './CanvasNavigator';
@@ -772,6 +772,7 @@ export function CanvasView({
     bringNodesToFront,
     createDrawBox,
     addDoodleStroke,
+    undoLastDoodle,
     createMindChild,
     createMindLink,
     deleteMindLink,
@@ -789,6 +790,7 @@ export function CanvasView({
     bringNodesToFront: state.bringNodesToFront,
     createDrawBox: state.createDrawBox,
     addDoodleStroke: state.addDoodleStroke,
+    undoLastDoodle: state.undoLastDoodle,
     createMindChild: state.createMindChild,
     createMindLink: state.createMindLink,
     deleteMindLink: state.deleteMindLink,
@@ -850,6 +852,9 @@ export function CanvasView({
   const panVelocityRef = useRef({ x: 0, y: 0 });
   const panSampleRef = useRef({ x: 0, y: 0, at: 0 });
   const panInertiaFrameRef = useRef<number | null>(null);
+  const touchPointsRef = useRef(new Map<number, { x: number; y: number }>());
+  const touchGestureRef = useRef<{ distance: number; worldX: number; worldY: number } | null>(null);
+  const touchFrameRef = useRef<number | null>(null);
   const panGestureRef = useRef<{
     active: boolean;
     startX: number;
@@ -924,7 +929,7 @@ export function CanvasView({
       if (nextPressure && !snapshot.memoryPressure) preparedImageCache.clear();
       setMemoryPressure(nextPressure);
       imageLoadScheduler.setConcurrency(adaptiveImageConcurrency(memory, fps));
-      setQualityTier(fps > 0 && fps < 42 ? 'responsive' : fps > 0 && fps < 54 ? 'balanced' : 'full');
+      setQualityTier((current) => nextQualityTier(current, fps, nextPressure));
       if (nextPressure) setResourceBudget({ models: 0, videos: 1, fullImages: 0 }); else update();
       updatePerformanceMetrics({
         jsHeapMb: heap ? Math.round(heap.usedJSHeapSize / 1024 / 1024) : 0,
@@ -1477,6 +1482,9 @@ export function CanvasView({
   };
 
   const beginDoodleStroke = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.pointerType === 'pen' && (event.button === 5 || (event.buttons & 32) !== 0)) {
+      event.preventDefault(); undoLastDoodle(); return;
+    }
     if (!doodleMode || event.button !== 0 || event.altKey || inputModeRef.current !== 'idle') return;
     inputModeRef.current = 'doodle';
     flushZoom();
@@ -1706,6 +1714,57 @@ export function CanvasView({
       window.removeEventListener('blur', handleBlur);
     };
   }, []);
+
+  useEffect(() => {
+    const midpoint = () => {
+      const points = [...touchPointsRef.current.values()];
+      if (points.length < 2) return null;
+      return { x: (points[0].x + points[1].x) / 2, y: (points[0].y + points[1].y) / 2, distance: Math.hypot(points[1].x - points[0].x, points[1].y - points[0].y) };
+    };
+    const down = (event: PointerEvent) => {
+      if (event.pointerType !== 'touch' || doodleMode || !viewportRef.current?.contains(event.target as Node | null)) return;
+      touchPointsRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+      const start = midpoint();
+      if (!start) return;
+      event.preventDefault(); flushZoom(); inputModeRef.current = 'pan';
+      const rect = viewportRef.current.getBoundingClientRect(); const current = viewRef.current;
+      touchGestureRef.current = {
+        distance: Math.max(1, start.distance),
+        worldX: (start.x - rect.left - current.x) / current.scale,
+        worldY: (start.y - rect.top - current.y) / current.scale
+      };
+    };
+    const move = (event: PointerEvent) => {
+      if (!touchPointsRef.current.has(event.pointerId)) return;
+      touchPointsRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+      const currentGesture = touchGestureRef.current; const currentMidpoint = midpoint(); const viewport = viewportRef.current;
+      if (!currentGesture || !currentMidpoint || !viewport) return;
+      event.preventDefault();
+      if (touchFrameRef.current !== null) cancelAnimationFrame(touchFrameRef.current);
+      touchFrameRef.current = requestAnimationFrame(() => {
+        const rect = viewport.getBoundingClientRect();
+        const scale = Math.max(.05, Math.min(8, viewRef.current.scale * currentMidpoint.distance / currentGesture.distance));
+        setView({ x: currentMidpoint.x - rect.left - currentGesture.worldX * scale, y: currentMidpoint.y - rect.top - currentGesture.worldY * scale, scale });
+        touchGestureRef.current = { ...currentGesture, distance: currentMidpoint.distance };
+        touchFrameRef.current = null;
+      });
+    };
+    const up = (event: PointerEvent) => {
+      touchPointsRef.current.delete(event.pointerId);
+      if (touchPointsRef.current.size < 2) { touchGestureRef.current = null; inputModeRef.current = 'idle'; }
+    };
+    window.addEventListener('pointerdown', down, { capture: true });
+    window.addEventListener('pointermove', move, { capture: true, passive: false });
+    window.addEventListener('pointerup', up, { capture: true });
+    window.addEventListener('pointercancel', up, { capture: true });
+    return () => {
+      if (touchFrameRef.current !== null) cancelAnimationFrame(touchFrameRef.current);
+      window.removeEventListener('pointerdown', down, { capture: true });
+      window.removeEventListener('pointermove', move, { capture: true });
+      window.removeEventListener('pointerup', up, { capture: true });
+      window.removeEventListener('pointercancel', up, { capture: true });
+    };
+  }, [doodleMode]);
 
   const onWheel = (event: React.WheelEvent) => {
     event.preventDefault();
