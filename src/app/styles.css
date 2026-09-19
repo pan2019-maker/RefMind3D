@@ -1515,6 +1515,9 @@ h3 { font-size: 13px; color: #c8c8c8; margin-top: 16px; }
      every image node separately causes GPU-layer churn on large boards. */
   will-change: auto !important;
 }
+.project-save-progress { position: fixed; left: 50%; bottom: 52px; z-index: 2147483400; transform: translateX(-50%); display: flex; align-items: center; gap: 8px; padding: 7px 12px; border: 1px solid rgba(126,177,255,.36); border-radius: 999px; background: rgba(25,31,42,.94); color: #dceaff; font-size: 12px; box-shadow: 0 8px 24px #0007; pointer-events: none; }
+.project-save-spinner { width: 12px; height: 12px; border: 2px solid #6d7d98; border-top-color: #a8ccff; border-radius: 50%; animation: save-spin .75s linear infinite; }
+@keyframes save-spin { to { rotate: 360deg; } }
 
 /* Keep the canvas in independent compositor/paint islands. Interaction only
    promotes the layer that is actually moving, while static nodes remain cached. */
@@ -1523,6 +1526,12 @@ h3 { font-size: 13px; color: #c8c8c8; margin-top: 16px; }
 .smart-guide-layer,
 .doodle-layer { contain: layout paint style; }
 .canvas-node { contain: layout paint style; backface-visibility: hidden; }
+.canvas-node { content-visibility: auto; contain-intrinsic-size: 320px 220px; }
+.canvas-node.selected, .canvas-node.editing { content-visibility: visible; }
+.image-node-base { filter: blur(1.5px); transform-origin: center; }
+.image-node-detail { transition: opacity 90ms linear; }
+.node-frozen { outline: 1px dashed rgba(112,181,255,.62); }
+.node-frozen-badge { position: absolute; top: 7px; right: 7px; z-index: 20; padding: 3px 7px; border-radius: 999px; background: rgba(24,35,52,.82); color: #9dcbff; font: 11px/1.2 Segoe UI,sans-serif; pointer-events: none; }
 .canvas-viewport.is-interacting .canvas-node:not(.selected) { pointer-events: none; }
 .canvas-viewport.quality-balanced .canvas-node { box-shadow: none !important; }
 .canvas-viewport.quality-responsive .canvas-node { box-shadow: none !important; filter: none; }
@@ -1544,6 +1553,10 @@ h3 { font-size: 13px; color: #c8c8c8; margin-top: 16px; }
 .image-compare-stage.checkerboard { background-color: #20242b; background-image: linear-gradient(45deg,#303641 25%,transparent 25%),linear-gradient(-45deg,#303641 25%,transparent 25%),linear-gradient(45deg,transparent 75%,#303641 75%),linear-gradient(-45deg,transparent 75%,#303641 75%); background-size: 24px 24px; background-position: 0 0,0 12px,12px -12px,-12px 0; }
 .image-compare-stage img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
 .image-compare-top { position: absolute; inset: 0; }
+.image-compare-top.difference { mix-blend-mode: difference; }
+.image-compare-stage img { transform-origin: center; }
+.image-compare-cursor { position: absolute; right: 8px; bottom: 8px; padding: 3px 7px; border-radius: 5px; background: #000a; color: #fff; font-size: 11px; }
+.image-compare-zoom { display: grid; grid-template-columns: auto 1fr 58px; gap: 10px; align-items: center; color: #b9c2d1; font-size: 12px; }
 .image-compare-divider { position: absolute; inset-block: 0; width: 2px; background: #fff; box-shadow: 0 0 0 1px #0008; }
 .image-compare-divider span { position: absolute; top: 50%; left: 50%; translate: -50% -50%; display: grid; place-items: center; width: 34px; height: 34px; border-radius: 50%; color: #111; background: #fff; font-weight: 800; }
 .image-canvas-node.gpu-composited { background: transparent; }
@@ -2350,6 +2363,9 @@ h3 { font-size: 13px; color: #c8c8c8; margin-top: 16px; }
 .sync-log-row > span { color: #8fbaff; }
 .sync-log-row.sync-missing > span { color: #ff9d84; }
 .smart-collection-row { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+.resource-summary-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 7px; margin: 9px 0; }
+.resource-summary-grid span { display: flex; justify-content: space-between; gap: 8px; padding: 7px 9px; border-radius: 7px; background: rgba(255,255,255,.045); color: #aeb6c5; font-size: 12px; }
+.resource-summary-grid b { color: #e9edf5; }
 .duplicate-candidate-row { grid-template-columns: minmax(0, 1fr) auto auto; }
 .task-center { position: fixed; right: 18px; bottom: 44px; z-index: 1200; width: min(390px, calc(100vw - 36px)); padding: 10px; border: 1px solid rgba(255,255,255,.16); border-radius: 10px; background: rgba(25,25,28,.94); box-shadow: 0 12px 38px rgba(0,0,0,.38); backdrop-filter: blur(12px); }
 .task-center > strong { display: block; margin-bottom: 7px; font-size: 12px; color: #ddd; }

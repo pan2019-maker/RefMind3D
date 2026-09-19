@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useRef, useState, useLayoutEffect, type PointerEvent as ReactPointerEvent } from 'react';
+import { lazy, Suspense, useEffect, useMemo, useRef, useState, useLayoutEffect, type PointerEvent as ReactPointerEvent } from 'react';
 import { open, save } from '@tauri-apps/plugin-dialog';
 import { desktopDir, join } from '@tauri-apps/api/path';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
@@ -933,6 +933,7 @@ export function App() {
   const [status, setStatus] = useState('就绪 · 右键打开菜单，拖入文件可导入');
   const [currentProjectPath, setCurrentProjectPath] = useState<string | null>(null);
   const [saveNotice, setSaveNotice] = useState<string | null>(null);
+  const [savePhase, setSavePhase] = useState<'prepare' | 'write' | 'finalize' | null>(null);
   const [alwaysOnTop, setAlwaysOnTop] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
   const [referenceMode, setReferenceMode] = useState(false);
@@ -1532,9 +1533,12 @@ export function App() {
 
   const writeWorkspaceToPath = async (path: string) => {
     const saveStarted = performance.now();
+    setSavePhase('prepare');
     const materialized = await materializeCanvases(canvases);
     const workspaceFile = createWorkspaceFile(materialized, activeCanvasId, project, workspaceCacheId, workspaceCacheDirectory);
+    setSavePhase('write');
     await saveProjectFile(path, workspaceFile);
+    setSavePhase('finalize');
     recordProjectSave(performance.now() - saveStarted);
     persistedAssetIdsRef.current = projectAssetIds(workspaceFile);
     recoveryBaselineRef.current = new Map(workspaceFile.canvases.map((canvas) => [canvas.id, canvas.project.updatedAt]));
@@ -1569,7 +1573,7 @@ export function App() {
       () => runBackgroundTask('保存并校验工程', () => writeWorkspaceToPath(path))
     );
     saveQueueRef.current = queued.then(() => undefined, () => undefined);
-    return queued;
+    return queued.finally(() => setSavePhase(null));
   };
 
   const saveProjectAs = async () => {
@@ -1757,6 +1761,16 @@ export function App() {
     selectNodes(ids);
     if (ids.length) dispatchFocusNodeIds(ids);
     setStatus(`智能集合已选择 ${ids.length} 个节点`);
+  };
+
+  const cleanUnusedAssets = () => {
+    const used = new Set(project.nodes.flatMap((node) => node.assetId ? [node.assetId] : []));
+    const unused = project.assets.filter((asset) => !used.has(asset.id));
+    if (unused.length === 0) { setStatus('工程中没有未使用资源'); return; }
+    const bytes = unused.reduce((sum, asset) => sum + asset.fileSize, 0);
+    if (!confirm(`确认从工程中移除 ${unused.length} 个未使用资源？约 ${(bytes / 1024 / 1024).toFixed(1)} MB。原始文件不会删除。`)) return;
+    setProject({ ...project, assets: project.assets.filter((asset) => used.has(asset.id)), updatedAt: new Date().toISOString() });
+    setStatus(`已移除 ${unused.length} 个未使用资源，原始文件未删除`);
   };
 
   const loadProjectFromPath = async (path: string) => {
@@ -2568,6 +2582,15 @@ export function App() {
 
   const selectedLayoutNodes = () => project.nodes.filter((node) => selectedNodeIds.includes(node.id));
 
+  const toggleSelectedFrozen = () => {
+    const nodes = selectedLayoutNodes();
+    if (nodes.length === 0) return;
+    const freeze = nodes.some((node) => !node.frozen);
+    updateNodes(nodes.map((node) => ({ id: node.id, patch: { frozen: freeze } })), true, false);
+    setStatus(freeze ? `已冻结 ${nodes.length} 个对象，暂停实时资源` : `已解冻 ${nodes.length} 个对象`);
+    closeMenu();
+  };
+
   const applyLayoutUpdates = (updates: Array<{ id: string; patch: Partial<CanvasNode> }>, message: string) => {
     if (updates.length === 0) {
       setStatus('请先选中要整理的对象');
@@ -2708,6 +2731,28 @@ export function App() {
   };
 
   const arrangeSelectedOptimal = () => packNodes(selectedLayoutNodes().slice().sort((a, b) => (b.height * b.width) - (a.height * a.width)), '已进行紧凑智能装箱');
+  const arrangeSelectedWaterfall = () => {
+    const nodes = selectedLayoutNodes().filter((node) => !node.locked);
+    if (nodes.length < 2) return;
+    const bounds = boundsForNodes(nodes);
+    const columns = Math.max(2, Math.ceil(Math.sqrt(nodes.length)));
+    const gap = settings.alignmentPadding;
+    const columnWidth = Math.max(...nodes.map((node) => node.width));
+    const heights = Array.from({ length: columns }, () => bounds.top);
+    const updates = nodes.map((node) => {
+      const column = heights.indexOf(Math.min(...heights));
+      const patch = { x: Math.round(bounds.left + column * (columnWidth + gap)), y: Math.round(heights[column]) };
+      heights[column] += node.height + gap;
+      return { id: node.id, patch };
+    });
+    applyLayoutUpdates(updates, '已按瀑布流整理，锁定对象保持原位');
+  };
+
+  const arrangeInSelectionOrder = () => {
+    const nodesById = new Map(project.nodes.map((node) => [node.id, node]));
+    const nodes = selectedNodeIds.map((id) => nodesById.get(id)).filter((node): node is CanvasNode => Boolean(node && !node.locked));
+    packNodes(nodes, '已按选择顺序排列，锁定对象保持原位');
+  };
   const arrangeSelectedByAsset = (mode: 'path' | 'addition' | 'order' | 'random') => {
     const assets = new Map(project.assets.map((asset) => [asset.id, asset]));
     let nodes = selectedLayoutNodes().slice();
@@ -3352,6 +3397,17 @@ export function App() {
     const asset = node?.assetId ? project.assets.find((candidate) => candidate.id === node.assetId) : undefined;
     return node?.type === 'image' && asset ? [{ node, asset }] : [];
   }).slice(0, 2) as CompareImageItem[];
+  const resourceSummary = useMemo(() => {
+    const used = new Set(project.nodes.flatMap((node) => node.assetId ? [node.assetId] : []));
+    return {
+      unused: project.assets.filter((asset) => !used.has(asset.id)),
+      oversized: project.assets.filter((asset) => asset.fileSize >= 100 * 1024 * 1024),
+      bytes: project.assets.reduce((sum, asset) => sum + asset.fileSize, 0)
+    };
+  }, [project.assets, project.nodes]);
+  const unusedAssets = resourceSummary.unused;
+  const oversizedAssets = resourceSummary.oversized;
+  const resourceBytes = resourceSummary.bytes;
 
   const renderLocalModelCard = (model: AiModelManifest) => {
     const selected = settings.ai.localVisionModelId === model.id;
@@ -3462,6 +3518,7 @@ export function App() {
         </section>
       </div>}
       {saveNotice && <div className="project-save-notice" role="status" aria-live="polite">{saveNotice}</div>}
+      {savePhase && <div className="project-save-progress" role="status" aria-live="polite"><span className="project-save-spinner" />{savePhase === 'prepare' ? '正在准备工程数据' : savePhase === 'write' ? '正在后台压缩并写入' : '正在校验并完成保存'}</div>}
 
       <section
         className={`canvas-opacity-control ${opacityPanelOpen ? 'is-open' : ''}`}
@@ -3492,6 +3549,8 @@ export function App() {
             <button disabled={selectedNodeIds.length < 2} onClick={arrangeSelectedByName}>按名称智能排列</button>
             <button disabled={selectedNodeIds.length < 2} onClick={normalizeSelectedArea}>统一视觉面积</button>
             <button disabled={selectedNodeIds.length < 2} onClick={arrangeSelectedOptimal}>紧凑智能装箱</button>
+            <button disabled={selectedNodeIds.length < 2} onClick={arrangeSelectedWaterfall}>瀑布流排列</button>
+            <button disabled={selectedNodeIds.length < 2} onClick={arrangeInSelectionOrder}>按选择顺序排列</button>
             <button disabled={selectedNodeIds.length < 2} onClick={arrangeOverlappingOnly}>仅整理重叠对象</button>
             <button disabled={!lastLayoutCommandRef.current} onClick={repeatLastLayout}>重复上次布局</button>
             <button disabled={selectedNodeIds.length < 2} onClick={() => arrangeSelectedByAsset('path')}>按资源路径排列</button>
@@ -3499,6 +3558,7 @@ export function App() {
             <button disabled={selectedNodeIds.length < 2} onClick={() => arrangeSelectedByAsset('order')}>按层级顺序排列</button>
             <button disabled={selectedNodeIds.length < 2} onClick={() => arrangeSelectedByAsset('random')}>随机排列</button>
             <button disabled={selectedNodeIds.length < 2} onClick={stackSelected}>堆叠选中对象</button>
+            <button disabled={selectedNodeIds.length === 0} onClick={toggleSelectedFrozen}>{project.nodes.some((node) => selectedNodeIds.includes(node.id) && node.frozen) ? '解冻选中对象' : '冻结选中对象'}</button>
             <button onClick={() => void pickScreenColor()}>屏幕取色{sampledColor ? ` ${sampledColor}` : ''}</button>
             <button onClick={showImageCoordinates}>查看图片坐标</button>
             <span className="passthrough-hint">按住 Ctrl+Alt+M：临时鼠标穿透{mousePassthrough ? '（已启用）' : ''}</span>
@@ -3821,6 +3881,8 @@ export function App() {
               <button onClick={runMenuAction(() => arrangeSelectedLine('horizontal'))} disabled={selectedNodeIds.length < 2}>横向排列</button>
               <button onClick={runMenuAction(() => arrangeSelectedLine('vertical'))} disabled={selectedNodeIds.length < 2}>纵向排列</button>
               <button onClick={runMenuAction(arrangeSelectedGrid)} disabled={selectedNodeIds.length < 2}>网格排列</button>
+              <button onClick={runMenuAction(arrangeSelectedWaterfall)} disabled={selectedNodeIds.length < 2}>瀑布流排列</button>
+              <button onClick={runMenuAction(arrangeInSelectionOrder)} disabled={selectedNodeIds.length < 2}>按选择顺序排列</button>
               <button onClick={runMenuAction(arrangeOverlappingOnly)} disabled={selectedNodeIds.length < 2}>仅整理重叠对象</button>
               <button onClick={runMenuAction(repeatLastLayout)} disabled={!lastLayoutCommandRef.current}>重复上次布局</button>
               <button onClick={runMenuAction(() => distributeSelected('horizontal'))} disabled={selectedNodeIds.length < 3}>水平分布</button>
@@ -3836,6 +3898,7 @@ export function App() {
               <button onClick={runMenuAction(() => matchSelectedSize('width'))} disabled={selectedNodeIds.length < 2}>匹配宽度</button>
               <button onClick={runMenuAction(() => matchSelectedSize('height'))} disabled={selectedNodeIds.length < 2}>匹配高度</button>
               <button onClick={runMenuAction(() => matchSelectedSize('both'))} disabled={selectedNodeIds.length < 2}>匹配尺寸</button>
+              <button onClick={runMenuAction(toggleSelectedFrozen)} disabled={selectedNodeIds.length === 0}>{project.nodes.some((node) => selectedNodeIds.includes(node.id) && node.frozen) ? '解冻选中对象' : '冻结选中对象'}</button>
               <button onClick={runMenuAction(() => scaleSelected(0.5))} disabled={selectedNodeIds.length === 0}>缩小 50%</button>
               <button onClick={runMenuAction(() => scaleSelected(2))} disabled={selectedNodeIds.length === 0}>放大 200%</button>
             </div>
@@ -3990,7 +4053,8 @@ export function App() {
             <section className="workflow-settings">
               <div className="settings-section-title"><strong>检索与资源治理</strong><button onClick={() => { setSettingsOpen(false); setWorkspaceSearchOpen(true); }}>全工程搜索</button></div>
               <p className="muted">Ctrl+Shift+P 搜索全部画布的标题、正文、文件名、路径与标签。</p>
-              <div className="cache-actions"><button onClick={() => { const count = mergeDuplicateAssets(); setStatus(count ? `已合并 ${count} 个精确重复资源` : '未发现可安全合并的精确重复资源'); }}>合并精确重复资源</button><button disabled={visualDuplicateBusy} onClick={() => void scanVisualDuplicates()}>{visualDuplicateBusy ? '分析中…' : '扫描视觉相似图片'}</button></div>
+              <div className="resource-summary-grid"><span>资源总数 <b>{project.assets.length}</b></span><span>工程资源体积 <b>{(resourceBytes / 1024 / 1024).toFixed(1)} MB</b></span><span>未使用 <b>{unusedAssets.length}</b></span><span>超大资源 <b>{oversizedAssets.length}</b></span></div>
+              <div className="cache-actions"><button onClick={() => { const count = mergeDuplicateAssets(); setStatus(count ? `已合并 ${count} 个精确重复资源` : '未发现可安全合并的精确重复资源'); }}>合并精确重复资源</button><button disabled={visualDuplicateBusy} onClick={() => void scanVisualDuplicates()}>{visualDuplicateBusy ? '分析中…' : '扫描视觉相似图片'}</button><button disabled={unusedAssets.length === 0} onClick={cleanUnusedAssets}>移除未使用资源</button></div>
               <p className="muted">只合并内容哈希一致或同一路径且大小一致的资源，节点引用会自动迁移，不使用容易误判的文件名相似度。</p>
               <div className="smart-collection-row"><button onClick={() => selectCollection('images')}>全部图片</button><button onClick={() => selectCollection('tagged')}>已加标签</button><button onClick={() => selectCollection('recent')}>最近 7 天</button><button onClick={() => selectCollection('large')}>超大资源</button><button onClick={() => selectCollection('missing')}>失联资源</button></div>
               {visualDuplicateGroups.slice(0, 8).map((group, index) => <div className="duplicate-candidate-row" key={group.join(':')}><span>相似组 {index + 1}</span><code>{group.length} 张</code><button onClick={() => { const assetIds = new Set(group); const ids = project.nodes.filter((node) => node.assetId && assetIds.has(node.assetId)).map((node) => node.id); selectNodes(ids); dispatchFocusNodeIds(ids); }}>在画布中选择</button></div>)}

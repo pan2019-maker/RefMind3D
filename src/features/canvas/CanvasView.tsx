@@ -574,6 +574,7 @@ const CanvasImage = memo(function CanvasImage({ asset, node, canvasGrayscale, pr
       : previewTier === 'medium' ? cached.mediumUrl
         : previewTier === 'full' ? fullResolutionAssetUrl(asset) : cached.previewUrl)
     : assetUrl(asset, true);
+  const baseSrc = cached?.thumbnailUrl || assetUrl(asset, true);
   const [resolvedSrc, setResolvedSrc] = useState(src);
 
   useEffect(() => {
@@ -615,6 +616,20 @@ const CanvasImage = memo(function CanvasImage({ asset, node, canvasGrayscale, pr
   return (
     <>
       <span className="image-node-fallback">{title || '图片预览'}</span>
+      {!useTiles && resolvedSrc !== baseSrc && <img
+        className="image-node image-node-base"
+        src={baseSrc}
+        draggable={false}
+        decoding="async"
+        alt=""
+        aria-hidden="true"
+        style={{
+          transform: imageTransform,
+          opacity: node.opacity ?? 1,
+          filter: canvasGrayscale || node.grayscale ? 'grayscale(1)' : undefined,
+          objectFit: node.cropEnabled ? 'cover' : 'contain'
+        }}
+      />}
       {useTiles && cached && <div className="image-tile-pyramid" style={{
         aspectRatio: `${cached.imageWidth} / ${cached.imageHeight}`,
         transform: imageTransform,
@@ -628,7 +643,7 @@ const CanvasImage = memo(function CanvasImage({ asset, node, canvasGrayscale, pr
         return <img key={url} src={url} draggable={false} decoding="async" alt="" style={{ left: `${x / cached.imageWidth * 100}%`, top: `${y / cached.imageHeight * 100}%`, width: `${tileWidth / cached.imageWidth * 100}%`, height: `${tileHeight / cached.imageHeight * 100}%` }} />;
       })}</div>}
       {!useTiles && <img
-        className="image-node"
+        className="image-node image-node-detail"
         src={resolvedSrc}
         data-preview-tier={previewTier}
         draggable={false}
@@ -2637,7 +2652,7 @@ export function CanvasView({
             const lockedByGroup = Boolean(isLockedContainerGroup(parentGroup) && activeGroupId !== node.groupId);
             const groupEditing = node.type === 'group' && node.isGroupContainer !== false && activeGroupId === node.id;
             const screenRect = screenNodeRect(node);
-            const resourceVisible = pageVisible && visibleNodeIds.has(node.id);
+            const resourceVisible = pageVisible && visibleNodeIds.has(node.id) && !node.frozen;
             const textStyle = isTextNode(node) ? {
               fontFamily: node.fontFamily || (['note','mindmap'].includes(node.type) ? FREE_TEXT_FONT_FAMILY : 'Segoe UI'),
               fontSize: `${Math.max(1, (node.fontSize || 16) * view.scale)}px`,
@@ -2649,7 +2664,7 @@ export function CanvasView({
               <div
                 key={node.id}
                 data-node-id={node.id}
-                className={`canvas-node ${node.type}-canvas-node ${gpuImageIds.has(node.id) ? 'gpu-composited' : ''} ${selected ? 'selected' : ''} ${editing ? 'editing' : ''} ${lockedByGroup ? 'group-child-locked' : ''} ${groupEditing ? 'group-edit-active' : ''} ${node.locked ? 'node-locked' : ''} ${editing && node.type === 'image' && node.cropEnabled ? 'crop-editing' : ''}`}
+                className={`canvas-node ${node.type}-canvas-node ${gpuImageIds.has(node.id) ? 'gpu-composited' : ''} ${selected ? 'selected' : ''} ${editing ? 'editing' : ''} ${lockedByGroup ? 'group-child-locked' : ''} ${groupEditing ? 'group-edit-active' : ''} ${node.locked ? 'node-locked' : ''} ${node.frozen ? 'node-frozen' : ''} ${editing && node.type === 'image' && node.cropEnabled ? 'crop-editing' : ''}`}
                 style={{
                   left: screenRect.x,
                   top: screenRect.y,
@@ -2705,7 +2720,7 @@ export function CanvasView({
                     viewportSize={viewportSize}
                     visible={resourceVisible}
                     loadPriority={resourceVisible ? 0 : (predictedPrefetchIds.has(node.id) ? 1 : 2)}
-                    loadEnabled={pageVisible}
+                    loadEnabled={pageVisible && !node.frozen}
                     allowFullResolution={pageVisible && (selected || fullResolutionImageIds.has(node.id))}
                     alt={node.title}
                     selected={selected}
@@ -2824,6 +2839,7 @@ export function CanvasView({
                   <div className="group-node-label">{groupEditing ? `${node.title} · 组内编辑` : (node.isGroupContainer !== false && node.groupLocked !== false ? `${node.title} · 已锁定` : node.title)}</div>
                 )}
                 {!isTextNode(node) && node.type !== 'video' && <div className="node-title">{node.title}</div>}
+                {node.frozen && <div className="node-frozen-badge">已冻结</div>}
                 {isTextNode(node) && node.type !== 'note' && node.type !== 'mindmap' && <div className="node-title document-title">{node.title}</div>}
                 {selected && !editing && (
                   <div className="resize-handles" aria-hidden="true">

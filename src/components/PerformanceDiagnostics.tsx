@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { save } from '@tauri-apps/plugin-dialog';
 import { performanceMetricsSnapshot, subscribePerformanceMetrics } from '../features/performance/performanceMetrics';
-import { runCanvasBenchmark, type BenchmarkResult } from '../features/performance/benchmark';
+import { runCanvasBenchmarkSuite, type BenchmarkResult } from '../features/performance/benchmark';
 import { errorJournalSnapshot } from '../features/diagnostics/errorJournal';
 import { useProjectStore } from '../stores/projectStore';
 
@@ -20,6 +20,7 @@ export function PerformanceDiagnostics({ projectPath }: { projectPath?: string }
   const [metrics, setMetrics] = useState(performanceMetricsSnapshot);
   const project = useProjectStore((state) => state.project);
   const [benchmark, setBenchmark] = useState<BenchmarkResult | null>(null);
+  const [benchmarkSuite, setBenchmarkSuite] = useState<BenchmarkResult[]>([]);
   const [benchmarking, setBenchmarking] = useState(false);
   const [integrity, setIntegrity] = useState<IntegrityReport | null>(null);
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
@@ -39,7 +40,7 @@ export function PerformanceDiagnostics({ projectPath }: { projectPath?: string }
     if (!path) return;
     const report = {
       generatedAt: new Date().toISOString(),
-      appVersion: '1.13.0',
+      appVersion: '1.14.0',
       platform: navigator.platform,
       hardwareConcurrency: navigator.hardwareConcurrency,
       deviceMemoryGb: (navigator as Navigator & { deviceMemory?: number }).deviceMemory,
@@ -75,8 +76,12 @@ export function PerformanceDiagnostics({ projectPath }: { projectPath?: string }
       <div className="performance-benchmark-row">
         <button disabled={benchmarking} onClick={() => {
           setBenchmarking(true);
-          void runCanvasBenchmark().then(setBenchmark).finally(() => setBenchmarking(false));
-        }}>{benchmarking ? '正在测试…' : '运行 10,000 节点基准'}</button>
+          void runCanvasBenchmarkSuite().then((results) => {
+            setBenchmarkSuite(results);
+            setBenchmark(results[results.length - 1]);
+            localStorage.setItem('refmind3d.performance-baseline.v1', JSON.stringify({ at: new Date().toISOString(), results }));
+          }).finally(() => setBenchmarking(false));
+        }}>{benchmarking ? '正在测试…' : '运行 1K / 5K / 10K 稳定基准'}</button>
         <button onClick={() => void exportReport()}>导出诊断报告</button>
         <button disabled={!projectPath || checking} onClick={() => {
           if (!projectPath) return;
@@ -88,6 +93,7 @@ export function PerformanceDiagnostics({ projectPath }: { projectPath?: string }
         {integrity && <code>工程包完整：{integrity.canvasCount} 画布 · {integrity.resourceCount} 资源 · 已校验 {integrity.checkedEntries} 项</code>}
         {updateInfo && <code>最新版本 {updateInfo.version} · <a href={updateInfo.releaseUrl} target="_blank" rel="noreferrer">打开官方下载页</a>{updateInfo.sha256 ? ` · SHA-256 ${updateInfo.sha256.slice(0, 12)}…` : ''}</code>}
         {benchmark && <code>索引 {benchmark.buildMs} ms · 查询 {benchmark.queryMs} ms · 120 帧合成 {benchmark.transformMs} ms · 千张 8K 瓦片调度 {benchmark.tileSelectionMs} ms · {benchmark.soakCycles} 轮稳定性 {benchmark.soakMs} ms · 压力估算 {benchmark.estimatedPeakMb} MB</code>}
+        {benchmarkSuite.length > 0 && <code>{benchmarkSuite.map((item) => `${item.nodeCount / 1000}K：索引 ${item.buildMs}ms / 查询 ${item.queryMs}ms / 稳定 ${item.soakMs}ms`).join(' · ')}</code>}
       </div>
     </section>
   );

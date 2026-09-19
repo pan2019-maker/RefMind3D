@@ -43,3 +43,9 @@ export async function runCanvasBenchmark(nodeCount = 10_000): Promise<BenchmarkR
   const soakMs = performance.now() - soakStart;
   return { nodeCount, buildMs: Math.round(buildMs * 10) / 10, queryMs: Math.round(queryMs * 10) / 10, transformMs: Math.round(transformMs * 10) / 10, tileSelectionMs: Math.round(tileSelectionMs * 10) / 10, soakCycles, soakMs: Math.round(soakMs * 10) / 10, estimatedPeakMb: Math.round((visibleTiles / 120 * 4 + Math.min(nodeCount, 2_000) * .02) * 10) / 10, averageHits: Math.round(hits / 200) };
 }
+
+export async function runCanvasBenchmarkSuite(nodeCounts = [1_000, 5_000, 10_000]) {
+  const results: BenchmarkResult[] = [];
+  for (const nodeCount of nodeCounts) results.push(await runCanvasBenchmark(nodeCount));
+  return results;
+}

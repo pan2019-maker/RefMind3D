@@ -9,10 +9,25 @@ export interface SnapRect {
 export interface SnapGuide {
   axis: 'x' | 'y';
   value: number;
+  kind?: 'anchor' | 'spacing';
 }
 
 function anchors(start: number, size: number) {
   return [start, start + size / 2, start + size];
+}
+
+function commonGap(rects: SnapRect[], axis: 'x' | 'y') {
+  const sorted = rects.slice().sort((a, b) => a[axis] - b[axis]);
+  const gaps: number[] = [];
+  for (let index = 1; index < sorted.length; index += 1) {
+    const previous = sorted[index - 1];
+    const size = axis === 'x' ? previous.width : previous.height;
+    const gap = sorted[index][axis] - (previous[axis] + size);
+    if (gap >= 0 && gap <= 400) gaps.push(gap);
+  }
+  if (gaps.length === 0) return undefined;
+  gaps.sort((a, b) => a - b);
+  return gaps[Math.floor(gaps.length / 2)];
 }
 
 export function snapMovingBounds(
@@ -36,6 +51,20 @@ export function snapMovingBounds(
         const delta = fixed - candidate;
         if (Math.abs(delta) <= threshold && (!bestY || Math.abs(delta) < Math.abs(bestY.delta))) bestY = { delta, value: fixed };
       }
+    }
+  }
+  const horizontalGap = commonGap(stationary, 'x');
+  const verticalGap = commonGap(stationary, 'y');
+  if (horizontalGap !== undefined) for (const node of stationary) {
+    for (const target of [node.x + node.width + horizontalGap, node.x - moving.width - horizontalGap]) {
+      const delta = target - moving.x;
+      if (Math.abs(delta) <= threshold && (!bestX || Math.abs(delta) < Math.abs(bestX.delta))) bestX = { delta, value: target };
+    }
+  }
+  if (verticalGap !== undefined) for (const node of stationary) {
+    for (const target of [node.y + node.height + verticalGap, node.y - moving.height - verticalGap]) {
+      const delta = target - moving.y;
+      if (Math.abs(delta) <= threshold && (!bestY || Math.abs(delta) < Math.abs(bestY.delta))) bestY = { delta, value: target };
     }
   }
   return {

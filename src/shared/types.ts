@@ -164,6 +164,8 @@ export interface CanvasNode {
   /** Content groups are locked by default and require double click to edit inside. */
   groupLocked?: boolean;
   locked?: boolean;
+  /** Frozen nodes render from lightweight previews and suspend live media work. */
+  frozen?: boolean;
   hidden?: boolean;
   opacity?: number;
   grayscale?: boolean;
