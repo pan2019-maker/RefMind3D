@@ -1,51 +1,46 @@
-export type ImagePreviewTier = 'thumbnail' | 'medium' | 'preview' | 'full';
+export type ImageResolutionBand = 'thumbnail' | 'medium' | 'preview' | 'full';
 
-export interface ImagePreviewSources {
-  thumbnail: string;
-  medium: string;
-  preview: string;
-  full: string;
+export interface ImageMipSource {
+  maxEdge: number;
+  url: string;
+  band: ImageResolutionBand;
 }
 
-export function imagePreviewSource(tier: ImagePreviewTier, sources: ImagePreviewSources) {
-  if (tier === 'thumbnail') return sources.thumbnail;
-  if (tier === 'medium') return sources.medium;
-  if (tier === 'full') return sources.full;
-  return sources.preview;
+export interface SelectedImageMip {
+  url: string;
+  band: ImageResolutionBand;
+  targetPhysicalEdge: number;
+}
+
+/**
+ * Selects the smallest decoded image that still has enough physical pixels for
+ * the node on screen. It intentionally knows nothing about canvas zoom,
+ * selection state or resource budgets: those heuristics previously allowed a
+ * 512 px thumbnail to remain visible while a large node was being inspected.
+ */
+export function selectImageMip(
+  displayEdgeCss: number,
+  devicePixelRatio: number,
+  sources: readonly ImageMipSource[],
+  headroom = 1.35
+): SelectedImageMip {
+  const physicalEdge = Math.max(1, displayEdgeCss) * Math.min(3, Math.max(1, devicePixelRatio));
+  const targetPhysicalEdge = Math.ceil(physicalEdge * Math.max(1, headroom));
+  const available = sources
+    .filter((source) => source.url && source.maxEdge > 0)
+    .slice()
+    .sort((a, b) => a.maxEdge - b.maxEdge);
+  const selected = available.find((source) => source.maxEdge >= targetPhysicalEdge)
+    || available[available.length - 1];
+  return {
+    url: selected?.url || '',
+    band: selected?.band || 'full',
+    targetPhysicalEdge
+  };
 }
 
 export function shouldUseOverviewRenderer(scale: number, imageCount: number) {
   return scale < 0.12 && imageCount >= 50;
-}
-
-export function nextImagePreviewTier(
-  current: ImagePreviewTier | undefined,
-  displaySize: number,
-  _lowZoom: boolean,
-  allowFullResolution: boolean,
-  devicePixelRatio = 1
-): ImagePreviewTier {
-  // Cache tiers are sized in physical pixels, while layout measurements are
-  // CSS pixels. Canvas zoom alone must not force a thumbnail: a large node can
-  // still occupy hundreds of physical pixels at a low global zoom level.
-  const physicalSize = displaySize * Math.min(3, Math.max(1, devicePixelRatio));
-  if (!current) {
-    if (physicalSize <= 384) return 'thumbnail';
-    if (physicalSize <= 900) return 'medium';
-    if (allowFullResolution && physicalSize > 1800) return 'full';
-    return 'preview';
-  }
-  if (current === 'thumbnail') return physicalSize > 420 ? 'medium' : 'thumbnail';
-  if (current === 'medium') {
-    if (physicalSize < 320) return 'thumbnail';
-    if (physicalSize > 1000) return allowFullResolution && physicalSize > 2000 ? 'full' : 'preview';
-    return 'medium';
-  }
-  if (current === 'preview') {
-    if (physicalSize < 720) return 'medium';
-    return allowFullResolution && physicalSize > 2000 ? 'full' : 'preview';
-  }
-  return !allowFullResolution || physicalSize <= 1600 ? 'preview' : 'full';
 }
 
 export function closestNodeIds<T extends { id: string; x: number; y: number; width: number; height: number }>(

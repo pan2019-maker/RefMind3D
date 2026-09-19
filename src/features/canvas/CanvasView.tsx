@@ -8,7 +8,7 @@ import { prepareImageCache, type PreparedImageCache } from '../assets/imageCache
 import { ImageLoadCancelledError, imageLoadScheduler } from '../assets/imageLoadScheduler';
 import { LruCache } from '../assets/lruCache';
 import { getModelCover, modelCoverKey, setModelCover } from '../assets/modelCoverCache';
-import { boundedGpuNodeIds, closestNodeIds, imagePreviewSource, nextImagePreviewTier, shouldUseOverviewRenderer } from '../assets/previewPolicy';
+import { boundedGpuNodeIds, closestNodeIds, selectImageMip, shouldUseOverviewRenderer, type ImageMipSource } from '../assets/previewPolicy';
 import { linkedAssetsToWatch, sourceSignatureKey } from '../assets/sourceWatch';
 import { performanceMetricsSnapshot, recordImageCacheResult, recordInputLatency, recordSourceRefresh, updatePerformanceMetrics } from '../performance/performanceMetrics';
 import { adaptiveImageConcurrency, adaptiveResourceBudget, nextQualityTier } from '../performance/resourceBudget';
@@ -73,6 +73,20 @@ function assetUrl(asset?: AssetRecord, preferThumbnail = false) {
 function fullResolutionAssetUrl(asset: AssetRecord) {
   const path = asset.embeddedDataUrl || asset.projectAssetPath || asset.originalPath || asset.previewPath || '';
   return displayAssetPath(path);
+}
+
+function imageMipSources(asset: AssetRecord, cached?: PreparedImageCache | null): ImageMipSource[] {
+  const sourceWidth = Number((asset as AssetRecord & { width?: number }).width) || 0;
+  const sourceHeight = Number((asset as AssetRecord & { height?: number }).height) || 0;
+  const sourceMaxEdge = Math.max(sourceWidth, sourceHeight) || Number.MAX_SAFE_INTEGER;
+  const full: ImageMipSource = { maxEdge: sourceMaxEdge, url: fullResolutionAssetUrl(asset), band: 'full' };
+  if (!cached) return [full];
+  return [
+    { maxEdge: Math.min(512, sourceMaxEdge), url: cached.thumbnailUrl, band: 'thumbnail' },
+    { maxEdge: Math.min(1200, sourceMaxEdge), url: cached.mediumUrl, band: 'medium' },
+    { maxEdge: Math.min(2400, sourceMaxEdge), url: cached.previewUrl, band: 'preview' },
+    full
+  ];
 }
 
 function assetModelSource(asset?: AssetRecord) {
@@ -503,21 +517,19 @@ function cloneWorkbook(workbook: SpreadsheetWorkbook): SpreadsheetWorkbook {
   return JSON.parse(JSON.stringify(workbook)) as SpreadsheetWorkbook;
 }
 
-const CanvasImage = memo(function CanvasImage({ asset, node, canvasGrayscale, projectCacheId, cacheDirectory, cacheEpoch, lowZoom, displaySize, screenRect, viewportSize, visible, loadPriority, loadEnabled, allowFullResolution, alt, selected, title }: {
+const CanvasImage = memo(function CanvasImage({ asset, node, canvasGrayscale, projectCacheId, cacheDirectory, cacheEpoch, displaySize, screenRect, viewportSize, visible, loadPriority, loadEnabled, alt, selected, title }: {
   asset: AssetRecord;
   node: CanvasNode;
   canvasGrayscale: boolean;
   projectCacheId: string;
   cacheDirectory?: string;
   cacheEpoch: number;
-  lowZoom: boolean;
   displaySize: number;
   screenRect: { x: number; y: number; width: number; height: number };
   viewportSize: { width: number; height: number };
   visible: boolean;
   loadPriority: 0 | 1 | 2;
   loadEnabled: boolean;
-  allowFullResolution: boolean;
   alt?: string;
   selected: boolean;
   title?: string;
@@ -525,14 +537,6 @@ const CanvasImage = memo(function CanvasImage({ asset, node, canvasGrayscale, pr
   const cacheKey = `${projectCacheId}:${cacheDirectory || 'default'}:${asset.id}`;
   const displayPixelRatio = Math.min(3, Math.max(1, window.devicePixelRatio || 1));
   const [cached, setCached] = useState<PreparedImageCache | null>(() => preparedImageCache.get(cacheKey)?.value || null);
-  const [previewTier, setPreviewTier] = useState(() => nextImagePreviewTier(undefined, displaySize, lowZoom, allowFullResolution, displayPixelRatio));
-
-  useEffect(() => {
-    const timer = window.setTimeout(() => {
-      setPreviewTier((current) => nextImagePreviewTier(current, displaySize, lowZoom, allowFullResolution, displayPixelRatio));
-    }, selected ? 40 : 100);
-    return () => window.clearTimeout(timer);
-  }, [allowFullResolution, displayPixelRatio, displaySize, lowZoom, selected]);
 
   useEffect(() => {
     let cancelled = false;
@@ -570,14 +574,8 @@ const CanvasImage = memo(function CanvasImage({ asset, node, canvasGrayscale, pr
     };
   }, [asset, cacheDirectory, cacheEpoch, cacheKey, loadEnabled, loadPriority, projectCacheId]);
 
-  const src = cached
-    ? imagePreviewSource(previewTier, {
-      thumbnail: cached.thumbnailUrl,
-      medium: cached.mediumUrl,
-      preview: cached.previewUrl,
-      full: fullResolutionAssetUrl(asset)
-    })
-    : assetUrl(asset, true);
+  const selectedMip = selectImageMip(displaySize, displayPixelRatio, imageMipSources(asset, cached));
+  const src = selectedMip.url;
   const baseSrc = cached?.thumbnailUrl || assetUrl(asset, true);
   const [resolvedSrc, setResolvedSrc] = useState(src);
 
@@ -649,7 +647,7 @@ const CanvasImage = memo(function CanvasImage({ asset, node, canvasGrayscale, pr
       {!useTiles && <img
         className="image-node image-node-detail"
         src={resolvedSrc}
-        data-preview-tier={previewTier}
+        data-preview-tier={selectedMip.band}
         draggable={false}
         loading={visible ? 'eager' : 'lazy'}
         decoding="async"
@@ -1160,7 +1158,6 @@ export function CanvasView({
   }), [view, viewportSize]);
   const liveModelIds = useMemo(() => closestNodeIds(visibleNodes.filter((node) => node.type === 'model'), viewportWorldCenter, resourceBudget.models), [resourceBudget.models, viewportWorldCenter, visibleNodes]);
   const liveVideoIds = useMemo(() => closestNodeIds(visibleNodes.filter((node) => node.type === 'video'), viewportWorldCenter, resourceBudget.videos), [resourceBudget.videos, viewportWorldCenter, visibleNodes]);
-  const fullResolutionImageIds = useMemo(() => closestNodeIds(visibleNodes.filter((node) => node.type === 'image'), viewportWorldCenter, resourceBudget.fullImages), [resourceBudget.fullImages, viewportWorldCenter, visibleNodes]);
   const lowZoom = view.scale < 0.35;
   const gpuTextureLimit = memoryPressure ? 48 : 192;
   const allImageRenderItems = useMemo(() => {
@@ -1184,18 +1181,10 @@ export function CanvasView({
       } else { width = height * sourceAspect; x += (node.width * view.scale - width) / 2; }
       const cacheKey = `${projectCacheId}:${cacheDirectory || 'default'}:${asset.id}`;
       const cached = preparedImageCache.get(cacheKey)?.value;
-      const tier = nextImagePreviewTier(undefined, Math.max(width, height), lowZoom, fullResolutionImageIds.has(node.id), displayPixelRatio);
-      const src = cached
-        ? imagePreviewSource(tier, {
-          thumbnail: cached.thumbnailUrl,
-          medium: cached.mediumUrl,
-          preview: cached.previewUrl,
-          full: fullResolutionAssetUrl(asset)
-        })
-        : assetUrl(asset, true);
+      const src = selectImageMip(Math.max(width, height), displayPixelRatio, imageMipSources(asset, cached)).url;
       return [{ id: node.id, src, x, y, width, height, opacity: node.opacity ?? 1, rotation: node.rotation || 0, flipX: Boolean(node.flipX), flipY: Boolean(node.flipY), grayscale: Boolean(node.grayscale || project.canvasGrayscale), u0, v0, u1, v1 }];
     });
-  }, [assetsById, cacheDirectory, fullResolutionImageIds, lowZoom, preparedImageRevision, project.canvasGrayscale, projectCacheId, renderedNodes, selectedNodeIdSet, view, worldOrigin]);
+  }, [assetsById, cacheDirectory, preparedImageRevision, project.canvasGrayscale, projectCacheId, renderedNodes, selectedNodeIdSet, view, worldOrigin]);
   const overviewMode = shouldUseOverviewRenderer(view.scale, allImageRenderItems.length);
   const gpuImageItems = useMemo(() => {
     if (overviewMode || !gpuSupported || allImageRenderItems.length < 30 || (view.scale >= 0.32 && project.nodes.length < 2_000)) return [] as GpuImageItem[];
@@ -2818,14 +2807,12 @@ export function CanvasView({
                     projectCacheId={projectCacheId}
                     cacheDirectory={cacheDirectory}
                     cacheEpoch={imageCacheEpoch}
-                    lowZoom={lowZoom}
                     displaySize={Math.max(screenRect.width, screenRect.height)}
                     screenRect={screenRect}
                     viewportSize={viewportSize}
                     visible={resourceVisible}
                     loadPriority={resourceVisible ? 0 : (predictedPrefetchIds.has(node.id) ? 1 : 2)}
                     loadEnabled={pageVisible && !node.frozen}
-                    allowFullResolution={pageVisible && (selected || fullResolutionImageIds.has(node.id))}
                     alt={node.title}
                     selected={selected}
                     title={node.title}
