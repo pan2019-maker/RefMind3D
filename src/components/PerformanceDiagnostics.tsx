@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { save } from '@tauri-apps/plugin-dialog';
 import { performanceMetricsSnapshot, subscribePerformanceMetrics } from '../features/performance/performanceMetrics';
-import { runCanvasBenchmarkSuite, type BenchmarkResult } from '../features/performance/benchmark';
+import { assessBenchmarkSuite, runCanvasBenchmarkSuite, type BenchmarkResult } from '../features/performance/benchmark';
 import { crashSessionStatus, errorJournalSnapshot } from '../features/diagnostics/errorJournal';
 import { useProjectStore } from '../stores/projectStore';
 
@@ -34,6 +34,7 @@ export function PerformanceDiagnostics({ projectPath }: { projectPath?: string }
   }, []);
   const requests = metrics.imageCacheHits + metrics.imageCacheMisses;
   const hitRate = requests ? Math.round(metrics.imageCacheHits / requests * 100) : 0;
+  const benchmarkAssessment = benchmarkSuite.length > 0 ? assessBenchmarkSuite(benchmarkSuite) : null;
   const qualityName = metrics.qualityTier === 'full' ? '完整' : metrics.qualityTier === 'balanced' ? '均衡' : '流畅优先';
 
   const exportReport = async () => {
@@ -41,7 +42,7 @@ export function PerformanceDiagnostics({ projectPath }: { projectPath?: string }
     if (!path) return;
     const report = {
       generatedAt: new Date().toISOString(),
-      appVersion: '1.17.0',
+      appVersion: '1.18.0',
       platform: navigator.platform,
       hardwareConcurrency: navigator.hardwareConcurrency,
       deviceMemoryGb: (navigator as Navigator & { deviceMemory?: number }).deviceMemory,
@@ -103,6 +104,7 @@ export function PerformanceDiagnostics({ projectPath }: { projectPath?: string }
         {updateInfo && <code>最新版本 {updateInfo.version} · <a href={updateInfo.releaseUrl} target="_blank" rel="noreferrer">打开官方下载页</a>{updateInfo.sha256 ? ` · SHA-256 ${updateInfo.sha256.slice(0, 12)}…` : ''}</code>}
         {benchmark && <code>索引 {benchmark.buildMs} ms · 查询 {benchmark.queryMs} ms · 120 帧合成 {benchmark.transformMs} ms · 千张 8K 瓦片调度 {benchmark.tileSelectionMs} ms · {benchmark.soakCycles} 轮稳定性 {benchmark.soakMs} ms · 压力估算 {benchmark.estimatedPeakMb} MB</code>}
         {benchmarkSuite.length > 0 && <code>{benchmarkSuite.map((item) => `${item.nodeCount / 1000}K：索引 ${item.buildMs}ms / 查询 ${item.queryMs}ms / 稳定 ${item.soakMs}ms`).join(' · ')}</code>}
+        {benchmarkAssessment && <code className={benchmarkAssessment.passed ? 'benchmark-pass' : 'benchmark-fail'}>{benchmarkAssessment.passed ? '性能验收通过' : `性能验收失败：${benchmarkAssessment.failures.join('；')}`}</code>}
       </div>
     </section>
   );

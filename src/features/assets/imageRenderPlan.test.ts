@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildImageRenderPlan, selectTileLevel } from './imageRenderPlan';
+import { buildImageRenderPlan, selectImageMipWithHysteresis, selectTileLevel } from './imageRenderPlan';
 
 const sources = [
   { maxEdge: 512, url: 'thumb', band: 'thumbnail' as const },
@@ -29,6 +29,16 @@ describe('unified image render plan', () => {
   it('keeps tiles out of crop mode and low-resolution views', () => {
     expect(buildImageRenderPlan({ displayEdgeCss: 900, devicePixelRatio: 2, sources, baseUrl: 'thumb', tileLevels: levels, visible: true, cropEnabled: false }).renderer).toBe('tiles');
     expect(buildImageRenderPlan({ displayEdgeCss: 300, devicePixelRatio: 1, sources, baseUrl: 'thumb', tileLevels: levels, visible: true, cropEnabled: false }).renderer).toBe('mip');
-    expect(buildImageRenderPlan({ displayEdgeCss: 1800, devicePixelRatio: 2, sources, baseUrl: 'thumb', tileLevels: levels, visible: true, cropEnabled: true }).renderer).toBe('mip');
+    expect(buildImageRenderPlan({ displayEdgeCss: 1800, devicePixelRatio: 2, sources, baseUrl: 'thumb', tileLevels: levels, visible: false, cropEnabled: true }).renderer).toBe('mip');
+    expect(buildImageRenderPlan({ displayEdgeCss: 1800, devicePixelRatio: 2, sources, baseUrl: 'thumb', tileLevels: levels, visible: true, cropEnabled: true }).renderer).toBe('tiles');
+  });
+
+  it('holds the current mip around both sides of a boundary', () => {
+    const medium = { url: 'medium', band: 'medium' as const, maxEdge: 1200, targetPhysicalEdge: 1100 };
+    expect(selectImageMipWithHysteresis(890, 1, sources, medium).url).toBe('medium');
+    expect(selectImageMipWithHysteresis(1000, 1, sources, medium).url).toBe('preview');
+    const preview = { url: 'preview', band: 'preview' as const, maxEdge: 2400, targetPhysicalEdge: 1400 };
+    expect(selectImageMipWithHysteresis(800, 1, sources, preview).url).toBe('preview');
+    expect(selectImageMipWithHysteresis(650, 1, sources, preview).url).toBe('medium');
   });
 });

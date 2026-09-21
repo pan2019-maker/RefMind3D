@@ -28,6 +28,7 @@ pub fn run() {
             commands::cache::confirm_default_image_cache_directory,
             commands::cache::clear_image_cache,
             commands::cache::prepare_image_cache,
+            commands::cache::cancel_image_cache_prepare,
             commands::cache::load_model_cover,
             commands::cache::save_model_cover,
             commands::document::import_document_asset,

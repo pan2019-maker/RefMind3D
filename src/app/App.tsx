@@ -3623,6 +3623,7 @@ export function App() {
             <button onClick={showImageCoordinates}>查看图片坐标</button>
             <button disabled={!project.nodes.some((node) => selectedNodeIds.includes(node.id) && node.type === 'image')} onClick={() => window.dispatchEvent(new CustomEvent('refmind3d-image-pixel-view', { detail: { ratio: 1 } }))}>原始像素 100%</button>
             <button disabled={!project.nodes.some((node) => selectedNodeIds.includes(node.id) && node.type === 'image')} onClick={() => window.dispatchEvent(new CustomEvent('refmind3d-image-pixel-view', { detail: { ratio: 2 } }))}>原始像素 200%</button>
+            <button disabled={!project.nodes.some((node) => selectedNodeIds.includes(node.id) && node.type === 'image')} onClick={() => window.dispatchEvent(new Event('refmind3d-image-loupe-toggle'))}>切换像素放大镜</button>
             <span className="passthrough-hint">按住 Ctrl+Alt+M：临时鼠标穿透{mousePassthrough ? '（已启用）' : ''}</span>
           </div>
           <div className="canvas-opacity-heading">

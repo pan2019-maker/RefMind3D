@@ -27,6 +27,7 @@ export interface PreparedImageCache {
     tileColumns: number;
     imageWidth: number;
     imageHeight: number;
+    overlap?: number;
   }>;
   cacheHit: boolean;
 }
@@ -41,5 +42,7 @@ export const confirmDefaultImageCacheDirectory = (projectCacheId: string) =>
   invoke<ImageCacheStatus>('confirm_default_image_cache_directory', { projectCacheId });
 export const clearImageCache = (projectCacheId: string, cacheDirectory?: string, olderThanDays?: number) =>
   invoke<ImageCacheStatus>('clear_image_cache', { projectCacheId, cacheDirectory, olderThanDays });
-export const prepareImageCache = (projectCacheId: string, cacheDirectory: string | undefined, asset: AssetRecord) =>
-  invoke<PreparedImageCache>('prepare_image_cache', { projectCacheId, cacheDirectory, asset });
+export const prepareImageCache = (projectCacheId: string, cacheDirectory: string | undefined, asset: AssetRecord, requestId?: string) =>
+  invoke<PreparedImageCache>('prepare_image_cache', { projectCacheId, cacheDirectory, asset, requestId });
+export const cancelImageCachePrepare = (requestId: string) =>
+  invoke<void>('cancel_image_cache_prepare', { requestId });

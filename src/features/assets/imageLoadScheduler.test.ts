@@ -42,4 +42,16 @@ describe('ImageLoadScheduler', () => {
     await blocker;
     expect(ran).toBe(false);
   });
+
+  it('signals cancellation for in-flight work after the last consumer leaves', async () => {
+    const scheduler = new ImageLoadScheduler(1);
+    let cancelled = false;
+    let finish!: () => void;
+    const pending = scheduler.schedule('active', 0, () => new Promise<void>((resolve) => { finish = resolve; }), () => { cancelled = true; });
+    await Promise.resolve();
+    scheduler.release('active');
+    expect(cancelled).toBe(true);
+    finish();
+    await pending;
+  });
 });

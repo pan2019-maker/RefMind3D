@@ -1,6 +1,20 @@
 import { SpatialGridIndex } from '../canvas/spatialIndex';
 
 export type BenchmarkResult = { nodeCount: number; buildMs: number; queryMs: number; transformMs: number; tileSelectionMs: number; soakCycles: number; soakMs: number; estimatedPeakMb: number; averageHits: number };
+export type BenchmarkAssessment = { passed: boolean; failures: string[] };
+
+export function assessBenchmarkSuite(results: BenchmarkResult[]): BenchmarkAssessment {
+  const failures: string[] = [];
+  for (const result of results) {
+    const scale = Math.max(1, result.nodeCount / 1_000);
+    if (result.buildMs > Math.max(50, scale * 25)) failures.push(`${result.nodeCount} nodes: index ${result.buildMs}ms`);
+    if (result.queryMs > Math.max(80, scale * 12)) failures.push(`${result.nodeCount} nodes: queries ${result.queryMs}ms`);
+    if (result.transformMs > 50) failures.push(`${result.nodeCount} nodes: frame composition ${result.transformMs}ms`);
+    if (result.tileSelectionMs > 120) failures.push(`${result.nodeCount} nodes: tile scheduling ${result.tileSelectionMs}ms`);
+    if (result.soakMs > Math.max(160, scale * 30)) failures.push(`${result.nodeCount} nodes: soak ${result.soakMs}ms`);
+  }
+  return { passed: failures.length === 0, failures };
+}
 
 export async function runCanvasBenchmark(nodeCount = 10_000): Promise<BenchmarkResult> {
   await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));

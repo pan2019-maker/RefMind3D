@@ -48,4 +48,13 @@ describe('SpatialGridIndex', () => {
     expect(index.query({ x: 850, y: 850, width: 500, height: 500 })).toEqual([renamed]);
     expect(index.query({ x: 49_000, y: 49_000, width: 2_000, height: 2_000 })).toEqual([]);
   });
+
+  it('indexes the visible segment before background nodes', async () => {
+    const board = Array.from({ length: 2_500 }, (_, index) => ({ id: String(index), x: index * 20, y: 0, width: 10, height: 10 }));
+    const index = new SpatialGridIndex<typeof board[number]>([]);
+    index.syncProgressively(board, { x: 24_000, y: -10, width: 100, height: 40 }, () => undefined);
+    expect(index.query({ x: 24_000, y: -10, width: 100, height: 40 }).length).toBeGreaterThan(0);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(index.size).toBe(2_500);
+  });
 });

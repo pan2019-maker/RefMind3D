@@ -2323,6 +2323,8 @@ h3 { font-size: 13px; color: #c8c8c8; margin-top: 16px; }
 .project-health-panel li.info { color: #d4d4d4; }
 .health-ok { color: #72d49b; }
 .performance-benchmark-row { display: flex; gap: 10px; align-items: center; margin-top: 10px; flex-wrap: wrap; }
+.benchmark-pass { color: #73d99a; }
+.benchmark-fail { color: #ff8585; }
 .canvas-viewport.large-canvas-mode .canvas-node:not(.selected) { box-shadow: none; }
 .canvas-viewport.large-canvas-mode .canvas-node:not(.selected) .node-title,
 .canvas-viewport.large-canvas-mode .canvas-node:not(.selected) .model-badge { display: none; }
@@ -2333,6 +2335,12 @@ h3 { font-size: 13px; color: #c8c8c8; margin-top: 16px; }
 }
 .image-tile-pyramid { position: absolute; inset: 0; margin: auto; max-width: 100%; max-height: 100%; width: 100%; height: auto; overflow: hidden; transform-origin: center; }
 .image-render-diagnostic { position: absolute; left: 6px; bottom: 6px; z-index: 8; max-width: calc(100% - 12px); padding: 3px 6px; border-radius: 4px; background: rgba(0,0,0,.78); color: #9ed0ff; font: 10px/1.35 Consolas, monospace; pointer-events: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pixel-loupe { position: absolute; z-index: 40; border: 2px solid #82b7ff; border-radius: 50%; box-shadow: 0 8px 28px rgba(0,0,0,.55), inset 0 0 0 1px rgba(255,255,255,.35); background-color: #191919; background-repeat: no-repeat; pointer-events: none; overflow: hidden; image-rendering: pixelated; }
+.pixel-loupe::before, .pixel-loupe::after { content: ''; position: absolute; background: rgba(255,255,255,.75); }
+.pixel-loupe::before { width: 1px; height: 22px; left: 50%; top: calc(50% - 11px); }
+.pixel-loupe::after { height: 1px; width: 22px; top: 50%; left: calc(50% - 11px); }
+.pixel-loupe span { position: absolute; left: 22px; right: 22px; bottom: 8px; padding: 2px 5px; border-radius: 4px; background: rgba(0,0,0,.72); color: #fff; font: 10px/1.3 Consolas, monospace; text-align: center; }
+.pixel-loupe-empty { display: grid; place-items: center; left: 24px; top: 72px; width: 140px; height: 140px; background-image: none; color: #ddd; font-size: 12px; }
 .image-tile-pyramid > img { position: absolute; display: block; padding: 0 !important; object-fit: fill; }
 
 .color-srgb .canvas-stage img { color-interpolation: sRGB; }

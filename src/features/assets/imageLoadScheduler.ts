@@ -10,6 +10,7 @@ interface QueueEntry<T> {
   reject: (reason: unknown) => void;
   started: boolean;
   consumers: number;
+  cancel?: () => void;
 }
 
 export class ImageLoadCancelledError extends Error {
@@ -33,7 +34,7 @@ export class ImageLoadScheduler {
     this.pump();
   }
 
-  schedule<T>(key: string, priority: ImageLoadPriority, run: () => Promise<T>): Promise<T> {
+  schedule<T>(key: string, priority: ImageLoadPriority, run: () => Promise<T>, cancel?: () => void): Promise<T> {
     const existing = this.entries.get(key) as QueueEntry<T> | undefined;
     if (existing) {
       existing.consumers += 1;
@@ -43,7 +44,7 @@ export class ImageLoadScheduler {
     let resolve!: (value: T) => void;
     let reject!: (reason: unknown) => void;
     const promise = new Promise<T>((ok, fail) => { resolve = ok; reject = fail; });
-    const entry: QueueEntry<T> = { key, priority, order: this.order++, run, promise, resolve, reject, started: false, consumers: 1 };
+    const entry: QueueEntry<T> = { key, priority, order: this.order++, run, promise, resolve, reject, started: false, consumers: 1, cancel };
     this.entries.set(key, entry as QueueEntry<unknown>);
     this.queued.push(entry as QueueEntry<unknown>);
     this.pump();
@@ -54,7 +55,11 @@ export class ImageLoadScheduler {
     const entry = this.entries.get(key);
     if (!entry) return;
     entry.consumers = Math.max(0, entry.consumers - 1);
-    if (entry.consumers > 0 || entry.started) return;
+    if (entry.consumers > 0) return;
+    if (entry.started) {
+      entry.cancel?.();
+      return;
+    }
     const index = this.queued.indexOf(entry);
     if (index >= 0) this.queued.splice(index, 1);
     this.entries.delete(key);

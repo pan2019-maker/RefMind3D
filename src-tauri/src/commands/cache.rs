@@ -1,7 +1,8 @@
 use anyhow::{anyhow, Context};
 use base64::Engine;
 use image::{
-    metadata::Orientation, DynamicImage, GenericImageView, ImageDecoder, ImageEncoder, ImageReader,
+    metadata::Orientation, DynamicImage, GenericImageView, ImageDecoder, ImageEncoder, ImageFormat,
+    ImageReader,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -11,7 +12,7 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
@@ -19,6 +20,71 @@ use crate::runtime_assets;
 
 const DEFAULT_LIMIT_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const CACHE_MARKER: &str = ".refmind3d-image-cache";
+static CANCELLED_PREPARES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn prepare_cancelled(request_id: Option<&str>) -> bool {
+    request_id.is_some_and(|id| {
+        CANCELLED_PREPARES
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap()
+            .contains(id)
+    })
+}
+
+fn ensure_prepare_active(request_id: Option<&str>) -> anyhow::Result<()> {
+    if prepare_cancelled(request_id) {
+        Err(anyhow!("IMAGE_CACHE_CANCELLED"))
+    } else {
+        Ok(())
+    }
+}
+
+struct GenerationGate {
+    active: Mutex<usize>,
+    wake: Condvar,
+}
+
+struct GenerationPermit(&'static GenerationGate);
+
+impl Drop for GenerationPermit {
+    fn drop(&mut self) {
+        let mut active = self.0.active.lock().unwrap();
+        *active = active.saturating_sub(1);
+        self.0.wake.notify_one();
+    }
+}
+
+fn acquire_generation_permit(request_id: Option<&str>) -> anyhow::Result<GenerationPermit> {
+    static GATE: OnceLock<GenerationGate> = OnceLock::new();
+    let gate = GATE.get_or_init(|| GenerationGate {
+        active: Mutex::new(0),
+        wake: Condvar::new(),
+    });
+    let mut active = gate.active.lock().unwrap();
+    while *active >= 2 {
+        ensure_prepare_active(request_id)?;
+        active = gate
+            .wake
+            .wait_timeout(active, Duration::from_millis(80))
+            .unwrap()
+            .0;
+    }
+    *active += 1;
+    Ok(GenerationPermit(gate))
+}
+
+#[tauri::command]
+pub fn cancel_image_cache_prepare(request_id: String) {
+    let mut cancelled = CANCELLED_PREPARES
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap();
+    if cancelled.len() > 4_096 {
+        cancelled.clear();
+    }
+    cancelled.insert(request_id);
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -49,6 +115,7 @@ pub struct PreparedTileLevel {
     tile_columns: u32,
     image_width: u32,
     image_height: u32,
+    overlap: u32,
 }
 
 #[derive(Serialize)]
@@ -75,6 +142,8 @@ struct CacheTileLevel {
     tile_columns: u32,
     image_width: u32,
     image_height: u32,
+    #[serde(default)]
+    overlap: u32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -109,6 +178,7 @@ struct TileRegistration {
     tile_columns: u32,
     image_width: u32,
     image_height: u32,
+    overlap: u32,
 }
 
 fn tile_level_edges(max_edge: u32) -> Vec<u32> {
@@ -353,20 +423,53 @@ pub async fn prepare_image_cache(
     project_cache_id: String,
     cache_directory: Option<String>,
     asset: Value,
+    request_id: Option<String>,
 ) -> Result<PreparedImageCache, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        prepare_sync(&project_cache_id, cache_directory.as_deref(), &asset)
+    if let Some(id) = request_id.as_deref() {
+        CANCELLED_PREPARES
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap()
+            .remove(id);
+    }
+    let cleanup_id = request_id.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        prepare_sync_cancelable(
+            &project_cache_id,
+            cache_directory.as_deref(),
+            &asset,
+            request_id.as_deref(),
+        )
     })
     .await
     .map_err(|e| format!("生成图片缓存任务失败：{e}"))?
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string());
+    if let Some(id) = cleanup_id.as_deref() {
+        CANCELLED_PREPARES
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap()
+            .remove(id);
+    }
+    result
 }
 
+#[cfg(test)]
 fn prepare_sync(
     project_id: &str,
     cache_directory: Option<&str>,
     asset: &Value,
 ) -> anyhow::Result<PreparedImageCache> {
+    prepare_sync_cancelable(project_id, cache_directory, asset, None)
+}
+
+fn prepare_sync_cancelable(
+    project_id: &str,
+    cache_directory: Option<&str>,
+    asset: &Value,
+    request_id: Option<&str>,
+) -> anyhow::Result<PreparedImageCache> {
+    ensure_prepare_active(request_id)?;
     let requested_root = project_cache_dir(project_id, cache_directory);
     // A missing removable drive or a stale per-project path must never prevent
     // images from appearing. Preserve the configured path for the settings UI,
@@ -423,6 +526,7 @@ fn prepare_sync(
                         tile_columns: manifest.tile_columns,
                         image_width: manifest.image_width,
                         image_height: manifest.image_height,
+                        overlap: 0,
                     }]
                 } else {
                     manifest
@@ -440,6 +544,7 @@ fn prepare_sync(
                             tile_columns: level.tile_columns,
                             image_width: level.image_width,
                             image_height: level.image_height,
+                            overlap: level.overlap,
                         })
                         .filter(|level| !level.paths.is_empty())
                         .collect()
@@ -465,8 +570,8 @@ fn prepare_sync(
     // Cache misses decode large source images. Serializing only this expensive
     // path prevents a newly opened board from saturating every CPU core and
     // making camera movement stutter; cache hits above remain fully parallel.
-    static GENERATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    let _generate_guard = GENERATE_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+    let _generate_guard = acquire_generation_permit(request_id)?;
+    ensure_prepare_active(request_id)?;
     let bytes = match source.location {
         SourceLocation::File(path) => fs::read(path)?,
         SourceLocation::Runtime(url) => {
@@ -477,35 +582,67 @@ fn prepare_sync(
         SourceLocation::Memory(bytes) => bytes,
     };
     let (image, icc_profile) = decode(&bytes, &source.extension)?;
-    let preview = dir.join("decoded-preview.png");
-    let medium = dir.join("medium-preview.png");
-    let thumb = dir.join("thumbnail.png");
+    ensure_prepare_active(request_id)?;
+    let use_webp = !image.color().has_alpha() && icc_profile.is_none();
+    let preview_file = if use_webp {
+        "decoded-preview.webp"
+    } else {
+        "decoded-preview.png"
+    };
+    let medium_file = if use_webp {
+        "medium-preview.webp"
+    } else {
+        "medium-preview.png"
+    };
+    let thumbnail_file = if use_webp {
+        "thumbnail.webp"
+    } else {
+        "thumbnail.png"
+    };
+    let preview = dir.join(preview_file);
+    let medium = dir.join(medium_file);
+    let thumb = dir.join(thumbnail_file);
     let (source_width, source_height) = image.dimensions();
-    write_png(
-        &preview,
-        resize(image.clone(), 2400),
-        icc_profile.as_deref(),
-    )?;
-    write_png(&medium, resize(image.clone(), 1200), icc_profile.as_deref())?;
-    write_png(&thumb, resize(image.clone(), 512), icc_profile.as_deref())?;
+    let write_preview = |path: &Path, value: DynamicImage| {
+        if use_webp {
+            write_webp(path, value)
+        } else {
+            write_png(path, value, icc_profile.as_deref())
+        }
+    };
+    write_preview(&preview, resize(image.clone(), 2400))?;
+    write_preview(&medium, resize(image.clone(), 1200))?;
+    write_preview(&thumb, resize(image.clone(), 512))?;
     let tile_size = 1024;
+    let tile_overlap = 2;
     let mut tile_levels = Vec::new();
     for max_edge in tile_level_edges(source_width.max(source_height)) {
+        ensure_prepare_active(request_id)?;
         let pyramid = resize(image.clone(), max_edge);
         let (image_width, image_height) = pyramid.dimensions();
         let tile_columns = image_width.div_ceil(tile_size);
         let tile_rows = image_height.div_ceil(tile_size);
         let mut files = Vec::new();
         for row in 0..tile_rows {
+            ensure_prepare_active(request_id)?;
             for column in 0..tile_columns {
                 let x = column * tile_size;
                 let y = row * tile_size;
                 let width = tile_size.min(image_width - x);
                 let height = tile_size.min(image_height - y);
+                let source_x = x.saturating_sub(tile_overlap);
+                let source_y = y.saturating_sub(tile_overlap);
+                let source_right = (x + width + tile_overlap).min(image_width);
+                let source_bottom = (y + height + tile_overlap).min(image_height);
                 let file = format!("tile-{max_edge}-{row}-{column}.png");
                 write_png(
                     &dir.join(&file),
-                    pyramid.crop_imm(x, y, width, height),
+                    pyramid.crop_imm(
+                        source_x,
+                        source_y,
+                        source_right - source_x,
+                        source_bottom - source_y,
+                    ),
                     icc_profile.as_deref(),
                 )?;
                 files.push(file);
@@ -518,6 +655,7 @@ fn prepare_sync(
             tile_columns,
             image_width,
             image_height,
+            overlap: tile_overlap,
         });
     }
     let highest = tile_levels.last();
@@ -529,9 +667,9 @@ fn prepare_sync(
         source_size: size,
         source_modified_ms: modified,
         source_hash: hash,
-        preview_file: "decoded-preview.png".into(),
-        medium_file: Some("medium-preview.png".into()),
-        thumbnail_file: "thumbnail.png".into(),
+        preview_file: preview_file.into(),
+        medium_file: Some(medium_file.into()),
+        thumbnail_file: thumbnail_file.into(),
         tile_files: tile_files.clone(),
         tile_size,
         tile_columns,
@@ -555,6 +693,7 @@ fn prepare_sync(
             tile_columns: level.tile_columns,
             image_width: level.image_width,
             image_height: level.image_height,
+            overlap: level.overlap,
         })
         .collect::<Vec<_>>();
     Ok(register(
@@ -673,6 +812,32 @@ fn write_png(path: &Path, image: DynamicImage, icc_profile: Option<&[u8]>) -> an
     }
     fs::write(path, bytes).with_context(|| format!("写入缓存失败：{}", path.display()))
 }
+fn write_webp(path: &Path, image: DynamicImage) -> anyhow::Result<()> {
+    let mut cursor = Cursor::new(Vec::new());
+    image.write_to(&mut cursor, ImageFormat::WebP)?;
+    fs::write(path, cursor.into_inner())
+        .with_context(|| format!("write cache failed: {}", path.display()))
+}
+
+fn cached_image_mime(path: &Path) -> String {
+    if path
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("webp"))
+    {
+        "image/webp".into()
+    } else {
+        "image/png".into()
+    }
+}
+
+fn cached_image_name(path: &Path, fallback: &str) -> String {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(fallback)
+        .to_string()
+}
+
 fn register(
     asset_id: &str,
     project_id: &str,
@@ -698,22 +863,22 @@ fn register(
         preview_url: runtime_assets::register_file_resource(
             asset_id,
             &format!("cachePreview:{suffix}:{generation}"),
-            "decoded-preview.png".into(),
-            "image/png".into(),
+            cached_image_name(preview, "decoded-preview.png"),
+            cached_image_mime(preview),
             preview.to_path_buf(),
         ),
         medium_url: runtime_assets::register_file_resource(
             asset_id,
             &format!("cacheMedium:{suffix}:{generation}"),
-            "medium-preview.png".into(),
-            "image/png".into(),
+            cached_image_name(medium.unwrap_or(preview), "medium-preview.png"),
+            cached_image_mime(medium.unwrap_or(preview)),
             medium.unwrap_or(preview).to_path_buf(),
         ),
         thumbnail_url: runtime_assets::register_file_resource(
             asset_id,
             &format!("cacheThumbnail:{suffix}:{generation}"),
-            "thumbnail.png".into(),
-            "image/png".into(),
+            cached_image_name(thumb, "thumbnail.png"),
+            cached_image_mime(thumb),
             thumb.to_path_buf(),
         ),
         tile_urls: tiles
@@ -756,6 +921,7 @@ fn register(
                 tile_columns: level.tile_columns,
                 image_width: level.image_width,
                 image_height: level.image_height,
+                overlap: level.overlap,
             })
             .collect(),
         cache_hit: hit,
@@ -1093,6 +1259,36 @@ mod tests {
         assert_eq!(prepared.tile_columns, 5);
         assert_eq!(prepared.tile_urls.len(), 5);
         assert_eq!(prepared.tile_levels.len(), 2);
+        let first_tile = WalkDir::new(&cache)
+            .into_iter()
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name() == "tile-4096-0-0.png")
+            .unwrap();
+        assert_eq!(image::open(first_tile.path()).unwrap().width(), 1026);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn opaque_sources_use_webp_for_compact_preview_levels() {
+        let root = env::temp_dir().join(format!(
+            "refmind3d-cache-webp-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let source = root.join("opaque.jpg");
+        let cache = root.join("project-cache");
+        fs::create_dir_all(&root).unwrap();
+        DynamicImage::new_rgb8(320, 200).save(&source).unwrap();
+        let asset = serde_json::json!({ "id": "opaque", "format": "jpg", "originalPath": source.to_string_lossy() });
+        prepare_sync(
+            "project-webp",
+            Some(cache.to_string_lossy().as_ref()),
+            &asset,
+        )
+        .unwrap();
+        assert!(WalkDir::new(&cache)
+            .into_iter()
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name() == "decoded-preview.webp"));
         let _ = fs::remove_dir_all(root);
     }
 

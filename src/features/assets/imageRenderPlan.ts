@@ -7,6 +7,7 @@ export interface ImageTileLevel {
   tileColumns: number;
   imageWidth: number;
   imageHeight: number;
+  overlap?: number;
 }
 
 export interface ImageRenderPlan {
@@ -14,6 +15,30 @@ export interface ImageRenderPlan {
   mip: SelectedImageMip;
   tileLevel?: ImageTileLevel;
   renderer: 'mip' | 'tiles';
+}
+
+export function selectImageMipWithHysteresis(
+  displayEdgeCss: number,
+  devicePixelRatio: number,
+  sources: readonly ImageMipSource[],
+  previous?: SelectedImageMip,
+  headroom = 1.35
+) {
+  const desired = selectImageMip(displayEdgeCss, devicePixelRatio, sources, headroom);
+  if (!previous?.url || previous.url === desired.url) return desired;
+  const available = sources.filter((source) => source.url && source.maxEdge > 0).slice().sort((a, b) => a.maxEdge - b.maxEdge);
+  const previousIndex = available.findIndex((source) => source.url === previous.url);
+  const desiredIndex = available.findIndex((source) => source.url === desired.url);
+  if (previousIndex < 0 || desiredIndex < 0) return desired;
+  const physicalTarget = desired.targetPhysicalEdge;
+  if (desiredIndex > previousIndex && physicalTarget <= available[previousIndex].maxEdge * 1.08) {
+    return { ...previous, targetPhysicalEdge: physicalTarget };
+  }
+  const lower = available[Math.max(0, previousIndex - 1)];
+  if (desiredIndex < previousIndex && physicalTarget >= lower.maxEdge * .82) {
+    return { ...previous, targetPhysicalEdge: physicalTarget };
+  }
+  return desired;
 }
 
 export function selectTileLevel(targetPhysicalEdge: number, levels: readonly ImageTileLevel[]) {
@@ -34,14 +59,16 @@ export function buildImageRenderPlan(options: {
   visible: boolean;
   cropEnabled: boolean;
   forceFull?: boolean;
+  previousMip?: SelectedImageMip;
 }): ImageRenderPlan {
-  const mip = selectImageMip(
+  const mip = selectImageMipWithHysteresis(
     options.displayEdgeCss,
     options.devicePixelRatio,
     options.sources,
+    options.previousMip,
     options.forceFull ? Number.MAX_SAFE_INTEGER : 1.35
   );
-  const tileLevel = options.visible && !options.cropEnabled
+  const tileLevel = options.visible
     ? selectTileLevel(mip.targetPhysicalEdge, options.tileLevels || [])
     : undefined;
   // Tiles are useful only after the normal preview would be undersampled. A

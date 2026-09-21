@@ -262,25 +262,42 @@ pub async fn wait_source_folder_changes(
             notify::Config::default(),
         )
         .map_err(|e| format!("启动原生文件监听失败: {e}"))?;
+        let mut watched_files = HashSet::new();
+        let mut watched_parents = HashSet::new();
         for path in paths {
             let root = PathBuf::from(path);
             if root.is_dir() {
                 watcher
                     .watch(&root, RecursiveMode::Recursive)
                     .map_err(|e| format!("监听文件夹失败: {e}"))?;
+            } else if let Some(parent) = root.parent() {
+                watched_files.insert(root.to_string_lossy().to_lowercase());
+                if watched_parents.insert(parent.to_path_buf()) {
+                    watcher
+                        .watch(parent, RecursiveMode::NonRecursive)
+                        .map_err(|e| format!("watch source failed: {e}"))?;
+                }
             }
         }
         let timeout =
             std::time::Duration::from_millis(timeout_ms.unwrap_or(15_000).clamp(1_000, 30_000));
         let mut changed = HashSet::new();
+        let include_path = |path: &Path| {
+            watched_files.is_empty()
+                || watched_files.contains(&path.to_string_lossy().to_lowercase())
+        };
         if let Ok(Ok(event)) = receiver.recv_timeout(timeout) {
             for path in event.paths {
-                changed.insert(path.to_string_lossy().to_string());
+                if include_path(&path) {
+                    changed.insert(path.to_string_lossy().to_string());
+                }
             }
         }
         while let Ok(Ok(event)) = receiver.try_recv() {
             for path in event.paths {
-                changed.insert(path.to_string_lossy().to_string());
+                if include_path(&path) {
+                    changed.insert(path.to_string_lossy().to_string());
+                }
             }
         }
         Ok::<Vec<String>, String>(changed.into_iter().collect())
@@ -1778,7 +1795,8 @@ mod tests {
 
     #[test]
     fn streaming_open_collects_only_current_canvas_asset_ids() {
-        let canvas = json!({ "assets": [{ "id": "visible-a" }, { "id": "visible-b" }], "nodes": [] });
+        let canvas =
+            json!({ "assets": [{ "id": "visible-a" }, { "id": "visible-b" }], "nodes": [] });
         let ids = project_asset_ids(&canvas);
         assert_eq!(ids.len(), 2);
         assert!(ids.contains("visible-a"));

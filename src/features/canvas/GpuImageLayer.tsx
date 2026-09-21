@@ -128,10 +128,8 @@ export const GpuImageLayer = memo(function GpuImageLayer({ items, width, height,
     itemsRef.current = items; sizeRef.current = { width, height };
     const runtime = runtimeRef.current; if (!runtime) return;
     const activeSources = new Set(items.map((item) => item.src));
-    for (const [src, entry] of [...runtime.textures]) {
-      if (activeSources.has(src)) continue;
-      runtime.gl.deleteTexture(entry.texture); runtime.textures.delete(src);
-    }
+    const now = performance.now();
+    activeSources.forEach((src) => { const entry = runtime.textures.get(src); if (entry) entry.usedAt = now; });
     const publishCompositedIds = () => onCompositedIdsChange(new Set(
       itemsRef.current.filter((item) => runtimeRef.current?.textures.has(item.src)).map((item) => item.id)
     ));
@@ -155,7 +153,10 @@ export const GpuImageLayer = memo(function GpuImageLayer({ items, width, height,
         current.textures.set(item.src, { texture, bytes: image.naturalWidth * image.naturalHeight * 4, usedAt: performance.now() });
         const totalBytes = () => [...current.textures.values()].reduce((sum, entry) => sum + entry.bytes, 0);
         while (current.textures.size > textureLimit || totalBytes() > textureBudgetBytes) {
-          const oldest = [...current.textures.entries()].sort((a, b) => a[1].usedAt - b[1].usedAt)[0];
+          const oldest = [...current.textures.entries()].sort((a, b) => {
+            const aActive = activeSources.has(a[0]) ? 1 : 0; const bActive = activeSources.has(b[0]) ? 1 : 0;
+            return (aActive - bActive) || (a[1].usedAt - b[1].usedAt);
+          })[0];
           if (!oldest) break;
           current.gl.deleteTexture(oldest[1].texture); current.textures.delete(oldest[0]);
         }
@@ -164,6 +165,8 @@ export const GpuImageLayer = memo(function GpuImageLayer({ items, width, height,
       image.onerror = () => { runtimeRef.current?.loading.delete(item.src); publishCompositedIds(); };
       image.src = item.src;
     }
+    const bytes = [...runtime.textures.values()].reduce((sum, entry) => sum + entry.bytes, 0);
+    updatePerformanceMetrics({ gpuTextureCount: runtime.textures.size, gpuTextureMb: Math.round(bytes / 1024 / 1024) });
     redrawRef.current();
   }, [height, items, onCompositedIdsChange, textureBudgetBytes, textureLimit, width]);
   const dpr = Math.min(3, Math.max(1, window.devicePixelRatio || 1));

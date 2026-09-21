@@ -1,10 +1,10 @@
 import { lazy, memo, MouseEvent as ReactMouseEvent, Suspense, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type MutableRefObject, type PointerEvent as ReactPointerEvent } from 'react';
-import { convertFileSrc } from '@tauri-apps/api/core';
+import { convertFileSrc, invoke } from '@tauri-apps/api/core';
 import { stat } from '@tauri-apps/plugin-fs';
 import { useShallow } from 'zustand/react/shallow';
 import { useProjectStore } from '../../stores/projectStore';
 import type { AssetRecord, CanvasNode, DoodleStroke, DoodleTool, ImportedModel, SpreadsheetCell, SpreadsheetCellStyle, SpreadsheetMerge, SpreadsheetSheet, SpreadsheetWorkbook } from '../../shared/types';
-import { prepareImageCache, type PreparedImageCache } from '../assets/imageCache';
+import { cancelImageCachePrepare, prepareImageCache, type PreparedImageCache } from '../assets/imageCache';
 import { buildImageRenderPlan } from '../assets/imageRenderPlan';
 import { ImageLoadCancelledError, imageLoadScheduler } from '../assets/imageLoadScheduler';
 import { LruCache } from '../assets/lruCache';
@@ -541,6 +541,7 @@ const CanvasImage = memo(function CanvasImage({ asset, node, canvasGrayscale, pr
   const cacheKey = `${projectCacheId}:${cacheDirectory || 'default'}:${asset.id}`;
   const displayPixelRatio = Math.min(3, Math.max(1, window.devicePixelRatio || 1));
   const [cached, setCached] = useState<PreparedImageCache | null>(() => preparedImageCache.get(cacheKey)?.value || null);
+  const selectedMipRef = useRef<ReturnType<typeof buildImageRenderPlan>['mip']>();
 
   useEffect(() => {
     let cancelled = false;
@@ -559,13 +560,14 @@ const CanvasImage = memo(function CanvasImage({ asset, node, canvasGrayscale, pr
         return;
       }
       scheduled = true;
-      const pending = imageLoadScheduler.schedule(cacheKey, loadPriority, () => prepareImageCache(projectCacheId, cacheDirectory, asset));
+      const requestId = crypto.randomUUID();
+      const pending = imageLoadScheduler.schedule(cacheKey, loadPriority, () => prepareImageCache(projectCacheId, cacheDirectory, asset, requestId), () => { void cancelImageCachePrepare(requestId); });
       void pending.then((value) => {
         recordImageCacheResult(value.cacheHit);
         preparedImageCache.set(cacheKey, { value, checkedAt: Date.now() });
         if (!cancelled) setCached(value);
       }).catch((error) => {
-        if (error instanceof ImageLoadCancelledError) return;
+        if (error instanceof ImageLoadCancelledError || String(error).includes('IMAGE_CACHE_CANCELLED')) return;
         window.dispatchEvent(new CustomEvent('refmind3d-image-cache-error', { detail: String(error) }));
       });
     };
@@ -581,14 +583,15 @@ const CanvasImage = memo(function CanvasImage({ asset, node, canvasGrayscale, pr
   const legacyTileLevel = cached?.tileUrls.length ? [{
     maxEdge: Math.max(cached.imageWidth, cached.imageHeight), urls: cached.tileUrls,
     tileSize: cached.tileSize, tileColumns: cached.tileColumns,
-    imageWidth: cached.imageWidth, imageHeight: cached.imageHeight
+    imageWidth: cached.imageWidth, imageHeight: cached.imageHeight, overlap: 0
   }] : [];
   const renderPlan = buildImageRenderPlan({
     displayEdgeCss: displaySize, devicePixelRatio: displayPixelRatio,
     sources: imageMipSources(asset, cached), baseUrl: cached?.thumbnailUrl || assetUrl(asset, true),
     tileLevels: cached?.tileLevels?.length ? cached.tileLevels : legacyTileLevel,
-    visible, cropEnabled: Boolean(node.cropEnabled)
+    visible, cropEnabled: Boolean(node.cropEnabled), previousMip: selectedMipRef.current
   });
+  selectedMipRef.current = renderPlan.mip;
   const selectedMip = renderPlan.mip;
   const src = selectedMip.url;
   const baseSrc = renderPlan.baseUrl;
@@ -617,7 +620,9 @@ const CanvasImage = memo(function CanvasImage({ asset, node, canvasGrayscale, pr
   const useTiles = renderPlan.renderer === 'tiles' && Boolean(tileLevel);
   const visibleTileIndexes = useMemo(() => {
     if (!useTiles || !tileLevel) return new Set<number>();
-    const scale = Math.min(screenRect.width / tileLevel.imageWidth, screenRect.height / tileLevel.imageHeight);
+    const scale = node.cropEnabled
+      ? Math.max(screenRect.width / tileLevel.imageWidth, screenRect.height / tileLevel.imageHeight)
+      : Math.min(screenRect.width / tileLevel.imageWidth, screenRect.height / tileLevel.imageHeight);
     const renderWidth = tileLevel.imageWidth * scale; const renderHeight = tileLevel.imageHeight * scale;
     const left = screenRect.x + (screenRect.width - renderWidth) / 2; const top = screenRect.y + (screenRect.height - renderHeight) / 2;
     const x0 = Math.max(0, (Math.max(0, left) - left) / scale - tileLevel.tileSize);
@@ -630,7 +635,16 @@ const CanvasImage = memo(function CanvasImage({ asset, node, canvasGrayscale, pr
       if (tx < x1 && tx + tileLevel.tileSize > x0 && ty < y1 && ty + tileLevel.tileSize > y0) indexes.add(row * tileLevel.tileColumns + column);
     }
     return indexes;
-  }, [screenRect, tileLevel, useTiles, viewportSize]);
+  }, [node.cropEnabled, screenRect, tileLevel, useTiles, viewportSize]);
+
+  const tileCoverStyle = useMemo(() => {
+    if (!node.cropEnabled || !tileLevel) return {};
+    const sourceAspect = tileLevel.imageWidth / Math.max(1, tileLevel.imageHeight);
+    const targetAspect = node.width / Math.max(1, node.height);
+    return sourceAspect > targetAspect
+      ? { width: `${sourceAspect / targetAspect * 100}%`, height: '100%', maxWidth: 'none', maxHeight: 'none' }
+      : { width: '100%', height: `${targetAspect / sourceAspect * 100}%`, maxWidth: 'none', maxHeight: 'none' };
+  }, [node.cropEnabled, node.height, node.width, tileLevel]);
 
   return (
     <>
@@ -651,6 +665,7 @@ const CanvasImage = memo(function CanvasImage({ asset, node, canvasGrayscale, pr
       />}
       {useTiles && tileLevel && <div className="image-tile-pyramid" style={{
         aspectRatio: `${tileLevel.imageWidth} / ${tileLevel.imageHeight}`,
+        ...tileCoverStyle,
         transform: imageTransform,
         opacity: node.opacity ?? 1,
         filter: canvasGrayscale || node.grayscale ? 'grayscale(1)' : undefined
@@ -659,7 +674,10 @@ const CanvasImage = memo(function CanvasImage({ asset, node, canvasGrayscale, pr
         const column = index % tileLevel.tileColumns; const row = Math.floor(index / tileLevel.tileColumns);
         const x = column * tileLevel.tileSize; const y = row * tileLevel.tileSize;
         const tileWidth = Math.min(tileLevel.tileSize, tileLevel.imageWidth - x); const tileHeight = Math.min(tileLevel.tileSize, tileLevel.imageHeight - y);
-        return <img key={url} src={url} draggable={false} decoding="async" alt="" style={{ left: `${x / tileLevel.imageWidth * 100}%`, top: `${y / tileLevel.imageHeight * 100}%`, width: `${tileWidth / tileLevel.imageWidth * 100}%`, height: `${tileHeight / tileLevel.imageHeight * 100}%` }} />;
+        const overlap = tileLevel.overlap || 0;
+        const sourceX = Math.max(0, x - overlap); const sourceY = Math.max(0, y - overlap);
+        const sourceRight = Math.min(tileLevel.imageWidth, x + tileWidth + overlap); const sourceBottom = Math.min(tileLevel.imageHeight, y + tileHeight + overlap);
+        return <img key={url} src={url} draggable={false} decoding="async" alt="" style={{ left: `${sourceX / tileLevel.imageWidth * 100}%`, top: `${sourceY / tileLevel.imageHeight * 100}%`, width: `${(sourceRight - sourceX) / tileLevel.imageWidth * 100}%`, height: `${(sourceBottom - sourceY) / tileLevel.imageHeight * 100}%` }} />;
       })}</div>}
       {!useTiles && <img
         className="image-node image-node-detail"
@@ -824,6 +842,7 @@ export function CanvasView({
   const [pageVisible, setPageVisible] = useState(() => document.visibilityState !== 'hidden');
   const [imageCacheEpoch, setImageCacheEpoch] = useState(0);
   const [preparedImageRevision, setPreparedImageRevision] = useState(0);
+  const [spatialIndexRevision, setSpatialIndexRevision] = useState(0);
   const [resourceBudget, setResourceBudget] = useState(() => adaptiveResourceBudget(project.nodes.length, (navigator as Navigator & { deviceMemory?: number }).deviceMemory || 8));
   const [memoryPressure, setMemoryPressure] = useState(false);
   const [qualityTier, setQualityTier] = useState<'full' | 'balanced' | 'responsive'>('full');
@@ -832,6 +851,8 @@ export function CanvasView({
   const [gpuCompositedIds, setGpuCompositedIds] = useState<ReadonlySet<string>>(() => new Set());
   const [overviewCompositedIds, setOverviewCompositedIds] = useState<ReadonlySet<string>>(() => new Set());
   const [imageDiagnostics, setImageDiagnostics] = useState(() => localStorage.getItem('refmind3d.image-diagnostics') === '1');
+  const [pixelLoupeEnabled, setPixelLoupeEnabled] = useState(false);
+  const [pixelLoupePoint, setPixelLoupePoint] = useState({ x: 160, y: 160 });
   const [drag, setDrag] = useState<{
     ids?: string[];
     startX: number;
@@ -898,12 +919,14 @@ export function CanvasView({
   const resizePreviewRef = useRef<Array<{ id: string; patch: Partial<CanvasNode> }> | null>(null);
   const doodleCanvasRef = useRef<DoodleCanvasHandle | null>(null);
   const nodeSpatialIndexRef = useRef<SpatialGridIndex<CanvasNode> | null>(null);
+  const spatialIndexKeyRef = useRef('');
   const panDirectionRef = useRef({ x: 0, y: 0 });
   const retainedNodeIdsRef = useRef(new Map<string, number>());
   const performanceCountsRef = useRef({ totalNodes: 0, renderedNodes: 0, visibleNodes: 0, activeModels: 0, activeVideos: 0 });
   const qualityTierRef = useRef(qualityTier);
   const sourceSignaturesRef = useRef(new Map<string, string>());
   const visibleAssetIdsRef = useRef<ReadonlySet<string>>(new Set());
+  const gpuMipByNodeRef = useRef(new Map<string, ReturnType<typeof buildImageRenderPlan>['mip']>());
   const inputModeRef = useRef<InputMode>('idle');
   qualityTierRef.current = qualityTier;
 
@@ -949,6 +972,12 @@ export function CanvasView({
     const update = () => setImageDiagnostics(localStorage.getItem('refmind3d.image-diagnostics') === '1');
     window.addEventListener('refmind3d-image-diagnostics-changed', update);
     return () => window.removeEventListener('refmind3d-image-diagnostics-changed', update);
+  }, []);
+
+  useEffect(() => {
+    const toggle = () => setPixelLoupeEnabled((value) => !value);
+    window.addEventListener('refmind3d-image-loupe-toggle', toggle);
+    return () => window.removeEventListener('refmind3d-image-loupe-toggle', toggle);
   }, []);
 
   useEffect(() => {
@@ -1036,10 +1065,26 @@ export function CanvasView({
   }, [project.nodes]);
 
   const nodeSpatialIndex = useMemo(() => {
-    if (!nodeSpatialIndexRef.current) nodeSpatialIndexRef.current = new SpatialGridIndex(project.nodes);
-    else nodeSpatialIndexRef.current.sync(project.nodes);
+    const key = `${projectCacheId}:${focusContentKey || 'main'}`;
+    if (!nodeSpatialIndexRef.current || spatialIndexKeyRef.current !== key) {
+      nodeSpatialIndexRef.current = new SpatialGridIndex(project.nodes.length > 10_000 ? [] : project.nodes);
+      spatialIndexKeyRef.current = key;
+    } else if (project.nodes.length <= 10_000 || nodeSpatialIndexRef.current.size === project.nodes.length) {
+      nodeSpatialIndexRef.current.sync(project.nodes);
+    }
     return nodeSpatialIndexRef.current;
-  }, [project.nodes]);
+  }, [focusContentKey, project.nodes, projectCacheId]);
+
+  useEffect(() => {
+    if (project.nodes.length <= 10_000 || nodeSpatialIndex.size === project.nodes.length) return;
+    const priorityRect = {
+      x: -view.x / view.scale,
+      y: -view.y / view.scale,
+      width: viewportSize.width / view.scale,
+      height: viewportSize.height / view.scale
+    };
+    return nodeSpatialIndex.syncProgressively(project.nodes, priorityRect, () => setSpatialIndexRevision((value) => value + 1));
+  }, [focusContentKey, nodeSpatialIndex, project.nodes]);
   const worldOrigin = useMemo(() => stableWorldOrigin(view, viewportSize), [view, viewportSize]);
 
   const linksByNodeId = useMemo(() => {
@@ -1109,14 +1154,14 @@ export function CanvasView({
       if (node) result.push(node);
     }
     return result.filter((node) => !node.hidden);
-  }, [nodeSpatialIndex, project.nodes, nodesById, view, viewportSize, editingNodeId, activeGroupId]);
+  }, [nodeSpatialIndex, spatialIndexRevision, project.nodes, nodesById, view, viewportSize, editingNodeId, activeGroupId]);
 
   const visibleNodes = useMemo(() => nodeSpatialIndex.query({
     x: -view.x / view.scale,
     y: -view.y / view.scale,
     width: viewportSize.width / view.scale,
     height: viewportSize.height / view.scale
-  }).filter((node) => !node.hidden), [nodeSpatialIndex, project.nodes, view, viewportSize]);
+  }).filter((node) => !node.hidden), [nodeSpatialIndex, spatialIndexRevision, project.nodes, view, viewportSize]);
   const visibleNodeIds = useMemo(() => new Set(visibleNodes.map((node) => node.id)), [visibleNodes]);
   const visibleAssetIds = useMemo(() => new Set(visibleNodes.flatMap((node) => node.assetId ? [node.assetId] : [])), [visibleNodes]);
   visibleAssetIdsRef.current = visibleAssetIds;
@@ -1138,6 +1183,7 @@ export function CanvasView({
     };
     const key = `refmind3d.hot-images.${projectCacheId}`;
     let cancelled = false;
+    const scheduledKeys = new Set<string>();
     const warm = () => {
       let ids: string[] = [];
       try { ids = JSON.parse(localStorage.getItem(key) || '[]') as string[]; } catch { /* Ignore stale hints. */ }
@@ -1146,7 +1192,9 @@ export function CanvasView({
         if (!asset || asset.kind !== 'image') continue;
         const cacheKey = `${projectCacheId}:${cacheDirectory || 'default'}:${asset.id}`;
         if (preparedImageCache.get(cacheKey)) continue;
-        void imageLoadScheduler.schedule(cacheKey, 2, () => prepareImageCache(projectCacheId, cacheDirectory, asset))
+        const requestId = crypto.randomUUID();
+        scheduledKeys.add(cacheKey);
+        void imageLoadScheduler.schedule(cacheKey, 2, () => prepareImageCache(projectCacheId, cacheDirectory, asset, requestId), () => { void cancelImageCachePrepare(requestId); })
           .then((value) => { if (!cancelled) preparedImageCache.set(cacheKey, { value, checkedAt: Date.now() }); })
           .catch(() => undefined);
       }
@@ -1157,6 +1205,7 @@ export function CanvasView({
       : window.setTimeout(warm, 600);
     return () => {
       cancelled = true;
+      scheduledKeys.forEach((cacheKey) => imageLoadScheduler.release(cacheKey));
       if (supportsIdle && browser.cancelIdleCallback) browser.cancelIdleCallback(idleId);
       else window.clearTimeout(idleId);
     };
@@ -1165,9 +1214,11 @@ export function CanvasView({
   useEffect(() => {
     if (!pageVisible) return;
     let cancelled = false;
-    const poll = async () => {
+    const watched = linkedAssetsToWatch(project.assets, visibleAssetIdsRef.current)
+      .filter((asset) => asset.originalPath && !isRuntimeResourceUrl(asset.originalPath));
+    if (watched.length === 0) return;
+    const refreshSignatures = async () => {
       const changed = new Set<string>();
-      const watched = linkedAssetsToWatch(project.assets, visibleAssetIdsRef.current);
       await Promise.all(watched.map(async (asset) => {
         try {
           const info = await stat(asset.originalPath);
@@ -1184,9 +1235,19 @@ export function CanvasView({
       changed.forEach(() => recordSourceRefresh());
       setImageCacheEpoch((value) => value + 1);
     };
-    void poll();
-    const timer = window.setInterval(() => void poll(), 5_000);
-    return () => { cancelled = true; window.clearInterval(timer); };
+    const watch = async () => {
+      await refreshSignatures();
+      while (!cancelled) {
+        try {
+          const changedPaths = await invoke<string[]>('wait_source_folder_changes', { paths: watched.map((asset) => asset.originalPath), timeoutMs: 15_000 });
+          if (changedPaths.length > 0) await refreshSignatures();
+        } catch {
+          await new Promise<void>((resolve) => window.setTimeout(resolve, 1_000));
+        }
+      }
+    };
+    void watch();
+    return () => { cancelled = true; };
   }, [pageVisible, project.assets]);
 
   const viewportWorldCenter = useMemo(() => ({
@@ -1219,11 +1280,13 @@ export function CanvasView({
       } else { width = height * sourceAspect; x += (node.width * view.scale - width) / 2; }
       const cacheKey = `${projectCacheId}:${cacheDirectory || 'default'}:${asset.id}`;
       const cached = preparedImageCache.get(cacheKey)?.value;
-      const src = buildImageRenderPlan({
+      const plan = buildImageRenderPlan({
         displayEdgeCss: Math.max(width, height), devicePixelRatio: displayPixelRatio,
         sources: imageMipSources(asset, cached), baseUrl: cached?.thumbnailUrl || assetUrl(asset, true),
-        visible: visibleNodeIds.has(node.id), cropEnabled: Boolean(node.cropEnabled)
-      }).mip.url;
+        visible: visibleNodeIds.has(node.id), cropEnabled: Boolean(node.cropEnabled), previousMip: gpuMipByNodeRef.current.get(node.id)
+      });
+      gpuMipByNodeRef.current.set(node.id, plan.mip);
+      const src = plan.mip.url;
       return [{ id: node.id, src, x, y, width, height, opacity: node.opacity ?? 1, rotation: node.rotation || 0, flipX: Boolean(node.flipX), flipY: Boolean(node.flipY), grayscale: Boolean(node.grayscale || project.canvasGrayscale), u0, v0, u1, v1 }];
     });
   }, [assetsById, cacheDirectory, preparedImageRevision, project.canvasGrayscale, projectCacheId, renderedNodes, selectedNodeIdSet, view, visibleNodeIds, worldOrigin]);
@@ -1245,13 +1308,14 @@ export function CanvasView({
       if (preparedImageCache.get(cacheKey)) continue;
       scheduledKeys.add(cacheKey);
       const priority = visibleNodeIds.has(node.id) ? 0 : 1;
-      void imageLoadScheduler.schedule(cacheKey, priority, () => prepareImageCache(projectCacheId, cacheDirectory, asset))
+      const requestId = crypto.randomUUID();
+      void imageLoadScheduler.schedule(cacheKey, priority, () => prepareImageCache(projectCacheId, cacheDirectory, asset, requestId), () => { void cancelImageCachePrepare(requestId); })
         .then((value) => {
           preparedImageCache.set(cacheKey, { value, checkedAt: Date.now() });
           if (!cancelled) setPreparedImageRevision((current) => current + 1);
         })
         .catch((error) => {
-          if (!(error instanceof ImageLoadCancelledError)) {
+          if (!(error instanceof ImageLoadCancelledError) && !String(error).includes('IMAGE_CACHE_CANCELLED')) {
             window.dispatchEvent(new CustomEvent('refmind3d-image-cache-error', { detail: String(error) }));
           }
         });
@@ -1287,7 +1351,7 @@ export function CanvasView({
       height
     }, { x: direction.x, y: direction.y, speed: Math.hypot(panVelocityRef.current.x, panVelocityRef.current.y) });
     return new Set(nodeSpatialIndex.query(corridor).map((node) => node.id));
-  }, [nodeSpatialIndex, project.nodes, view, viewportSize]);
+  }, [nodeSpatialIndex, spatialIndexRevision, project.nodes, view, viewportSize]);
   performanceCountsRef.current = {
     totalNodes: project.nodes.length,
     renderedNodes: renderedNodes.length,
@@ -2096,6 +2160,10 @@ export function CanvasView({
 
   const onMouseMove = (event: ReactMouseEvent) => {
     recordInputLatency(performance.now() - event.timeStamp);
+    if (pixelLoupeEnabled) {
+      const rect = viewportRef.current?.getBoundingClientRect();
+      if (rect) setPixelLoupePoint({ x: event.clientX - rect.left, y: event.clientY - rect.top });
+    }
     if (drag?.pan) {
       const dx = event.clientX - drag.startX;
       const dy = event.clientY - drag.startY;
@@ -3046,6 +3114,18 @@ export function CanvasView({
           height={viewportSize.height}
         />
       </div>
+      {pixelLoupeEnabled && (() => {
+        const node = project.nodes.find((item) => selectedNodeIdSet.has(item.id) && item.type === 'image' && item.assetId);
+        const asset = node?.assetId ? assetsById.get(node.assetId) : undefined;
+        if (!node || !asset) return <div className="pixel-loupe pixel-loupe-empty">请先选择图片</div>;
+        const rect = screenNodeRect(node);
+        const relativeX = Math.max(0, Math.min(1, (pixelLoupePoint.x - rect.x) / Math.max(1, rect.width)));
+        const relativeY = Math.max(0, Math.min(1, (pixelLoupePoint.y - rect.y) / Math.max(1, rect.height)));
+        const size = 180; const zoom = 6;
+        return <div className="pixel-loupe" style={{ left: Math.min(viewportSize.width - size - 12, pixelLoupePoint.x + 24), top: Math.min(viewportSize.height - size - 42, pixelLoupePoint.y + 24), width: size, height: size, backgroundImage: `url("${fullResolutionAssetUrl(asset)}")`, backgroundSize: `${Math.max(size, rect.width * zoom)}px ${Math.max(size, rect.height * zoom)}px`, backgroundPosition: `${50 - relativeX * 100}% ${50 - relativeY * 100}%` }}>
+          <span>{Number((asset as AssetRecord & { width?: number }).width) || '?'}×{Number((asset as AssetRecord & { height?: number }).height) || '?'} · 6×</span>
+        </div>;
+      })()}
       <CanvasNavigator
         key={`navigator-${projectCacheId}-${focusContentKey || 'main'}`}
         nodes={project.nodes}

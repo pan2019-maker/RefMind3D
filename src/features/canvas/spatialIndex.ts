@@ -23,6 +23,49 @@ export class SpatialGridIndex<T extends SpatialItem> {
     this.sync(items);
   }
 
+  get size() { return this.records.size; }
+
+  clear() {
+    this.cells.clear();
+    this.oversized.clear();
+    this.records.clear();
+  }
+
+  /** Indexes the current viewport first, then yields between background batches. */
+  syncProgressively(items: T[], priorityRect: SpatialRect, onProgress: () => void) {
+    this.clear();
+    let cancelled = false;
+    const priority: T[] = [];
+    const remaining: T[] = [];
+    for (const item of items) (intersects(item, priorityRect) ? priority : remaining).push(item);
+    for (const item of priority) this.insert(item);
+    onProgress();
+    let offset = 0;
+    const browser = globalThis as typeof globalThis & {
+      requestIdleCallback?: (callback: (deadline: { timeRemaining: () => number }) => void, options?: { timeout: number }) => number;
+      cancelIdleCallback?: (id: number) => void;
+    };
+    let handle = 0;
+    const run = (deadline?: { timeRemaining: () => number }) => {
+      if (cancelled) return;
+      const started = performance.now();
+      while (offset < remaining.length && (offset % 800 !== 0 || (!deadline ? performance.now() - started < 8 : deadline.timeRemaining() > 2))) {
+        this.insert(remaining[offset++]);
+      }
+      onProgress();
+      if (offset >= remaining.length) return;
+      handle = browser.requestIdleCallback
+        ? browser.requestIdleCallback(run, { timeout: 80 })
+        : globalThis.setTimeout(() => run(), 0) as unknown as number;
+    };
+    run();
+    return () => {
+      cancelled = true;
+      if (browser.cancelIdleCallback && handle) browser.cancelIdleCallback(handle);
+      else if (handle) globalThis.clearTimeout(handle);
+    };
+  }
+
   private cellRange(item: SpatialRect) {
     const left = Math.floor(item.x / this.cellSize);
     const top = Math.floor(item.y / this.cellSize);
