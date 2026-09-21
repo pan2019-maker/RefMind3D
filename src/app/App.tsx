@@ -1850,6 +1850,7 @@ export function App() {
       setSavedWorkspaceSignature(restoredRecovery ? '__recovered__' : workspaceContentSignature(canvasState, nextActiveId, active.project));
       setCurrentProjectPath(path);
       setStatus(`多画布工程已打开：${path}`);
+      await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
       recordProjectOpen(performance.now() - openStartedAt);
       return;
     }
@@ -1864,6 +1865,7 @@ export function App() {
     setSavedWorkspaceSignature(restoredRecovery ? '__recovered__' : workspaceContentSignature([legacyCanvas], legacyCanvas.id, useProjectStore.getState().project));
     setCurrentProjectPath(path);
     setStatus(`旧版单画布工程已打开：${path}`);
+    await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
     recordProjectOpen(performance.now() - openStartedAt);
     } finally {
       setProjectOpenPhase(null);
@@ -3619,6 +3621,8 @@ export function App() {
             <button disabled={selectedNodeIds.length === 0} onClick={toggleSelectedFrozen}>{project.nodes.some((node) => selectedNodeIds.includes(node.id) && node.frozen) ? '解冻选中对象' : '冻结选中对象'}</button>
             <button onClick={() => void pickScreenColor()}>屏幕取色{sampledColor ? ` ${sampledColor}` : ''}</button>
             <button onClick={showImageCoordinates}>查看图片坐标</button>
+            <button disabled={!project.nodes.some((node) => selectedNodeIds.includes(node.id) && node.type === 'image')} onClick={() => window.dispatchEvent(new CustomEvent('refmind3d-image-pixel-view', { detail: { ratio: 1 } }))}>原始像素 100%</button>
+            <button disabled={!project.nodes.some((node) => selectedNodeIds.includes(node.id) && node.type === 'image')} onClick={() => window.dispatchEvent(new CustomEvent('refmind3d-image-pixel-view', { detail: { ratio: 2 } }))}>原始像素 200%</button>
             <span className="passthrough-hint">按住 Ctrl+Alt+M：临时鼠标穿透{mousePassthrough ? '（已启用）' : ''}</span>
           </div>
           <div className="canvas-opacity-heading">

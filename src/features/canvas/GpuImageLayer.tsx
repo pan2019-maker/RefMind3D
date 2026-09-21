@@ -38,11 +38,12 @@ function shader(gl: WebGLRenderingContext, type: number, source: string) {
   return gl.getShaderParameter(value, gl.COMPILE_STATUS) ? value : null;
 }
 
-export const GpuImageLayer = memo(function GpuImageLayer({ items, width, height, textureLimit, onSupportChange, onCompositedIdsChange }: {
+export const GpuImageLayer = memo(function GpuImageLayer({ items, width, height, textureLimit, textureBudgetBytes, onSupportChange, onCompositedIdsChange }: {
   items: GpuImageItem[];
   width: number;
   height: number;
   textureLimit: number;
+  textureBudgetBytes: number;
   onSupportChange: (supported: boolean) => void;
   onCompositedIdsChange: (ids: ReadonlySet<string>) => void;
 }) {
@@ -53,7 +54,7 @@ export const GpuImageLayer = memo(function GpuImageLayer({ items, width, height,
     gl: WebGLRenderingContext; program: WebGLProgram; vertex: WebGLShader; fragment: WebGLShader;
     positionBuffer: WebGLBuffer; textureBuffer: WebGLBuffer; positionLocation: number; textureLocation: number;
     opacityLocation: WebGLUniformLocation | null; grayscaleLocation: WebGLUniformLocation | null;
-    textures: Map<string, WebGLTexture>; loading: Set<string>;
+    textures: Map<string, { texture: WebGLTexture; bytes: number; usedAt: number }>; loading: Set<string>;
   } | null>(null);
   const redrawRef = useRef<() => void>(() => undefined);
 
@@ -82,7 +83,7 @@ export const GpuImageLayer = memo(function GpuImageLayer({ items, width, height,
     gl.bindBuffer(gl.ARRAY_BUFFER, textureBuffer);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 1]), gl.STATIC_DRAW);
     gl.enableVertexAttribArray(textureLocation); gl.vertexAttribPointer(textureLocation, 2, gl.FLOAT, false, 0, 0);
-    const textures = new Map<string, WebGLTexture>();
+    const textures = new Map<string, { texture: WebGLTexture; bytes: number; usedAt: number }>();
     const loading = new Set<string>();
     runtimeRef.current = { gl, program, vertex, fragment, positionBuffer, textureBuffer, positionLocation, textureLocation, opacityLocation, grayscaleLocation, textures, loading };
     gl.clearColor(0, 0, 0, 0);
@@ -90,7 +91,8 @@ export const GpuImageLayer = memo(function GpuImageLayer({ items, width, height,
       const runtime = runtimeRef.current; if (!runtime) return;
       const size = sizeRef.current; runtime.gl.viewport(0, 0, canvas.width, canvas.height); runtime.gl.clear(runtime.gl.COLOR_BUFFER_BIT);
       for (const item of itemsRef.current) {
-        const texture = runtime.textures.get(item.src); if (!texture) continue;
+        const textureEntry = runtime.textures.get(item.src); if (!textureEntry) continue;
+        textureEntry.usedAt = performance.now();
         const centerX = item.x + item.width / 2; const centerY = item.y + item.height / 2;
       const radians = item.rotation * Math.PI / 180;
       const cos = Math.cos(radians); const sin = Math.sin(radians);
@@ -109,16 +111,16 @@ export const GpuImageLayer = memo(function GpuImageLayer({ items, width, height,
         runtime.gl.bindBuffer(runtime.gl.ARRAY_BUFFER, runtime.textureBuffer);
         runtime.gl.bufferData(runtime.gl.ARRAY_BUFFER, new Float32Array([leftU, topV, rightU, topV, leftU, bottomV, leftU, bottomV, rightU, topV, rightU, bottomV]), runtime.gl.STREAM_DRAW);
         runtime.gl.enableVertexAttribArray(runtime.textureLocation); runtime.gl.vertexAttribPointer(runtime.textureLocation, 2, runtime.gl.FLOAT, false, 0, 0);
-        runtime.gl.bindTexture(runtime.gl.TEXTURE_2D, texture); runtime.gl.uniform1f(runtime.opacityLocation, item.opacity); runtime.gl.uniform1f(runtime.grayscaleLocation, item.grayscale ? 1 : 0); runtime.gl.drawArrays(runtime.gl.TRIANGLES, 0, 6);
+        runtime.gl.bindTexture(runtime.gl.TEXTURE_2D, textureEntry.texture); runtime.gl.uniform1f(runtime.opacityLocation, item.opacity); runtime.gl.uniform1f(runtime.grayscaleLocation, item.grayscale ? 1 : 0); runtime.gl.drawArrays(runtime.gl.TRIANGLES, 0, 6);
       }
     };
     redrawRef.current();
     return () => {
       onCompositedIdsChange(new Set());
       canvas.removeEventListener('webglcontextlost', handleContextLost);
-      textures.forEach((texture) => gl.deleteTexture(texture));
+      textures.forEach((entry) => gl.deleteTexture(entry.texture));
       gl.deleteBuffer(positionBuffer); gl.deleteBuffer(textureBuffer); gl.deleteProgram(program); gl.deleteShader(vertex); gl.deleteShader(fragment);
-      runtimeRef.current = null; updatePerformanceMetrics({ gpuTextureCount: 0 });
+      runtimeRef.current = null; updatePerformanceMetrics({ gpuTextureCount: 0, gpuTextureMb: 0 });
     };
   }, [onCompositedIdsChange, onSupportChange]);
 
@@ -126,9 +128,9 @@ export const GpuImageLayer = memo(function GpuImageLayer({ items, width, height,
     itemsRef.current = items; sizeRef.current = { width, height };
     const runtime = runtimeRef.current; if (!runtime) return;
     const activeSources = new Set(items.map((item) => item.src));
-    for (const [src, texture] of [...runtime.textures]) {
+    for (const [src, entry] of [...runtime.textures]) {
       if (activeSources.has(src)) continue;
-      runtime.gl.deleteTexture(texture); runtime.textures.delete(src);
+      runtime.gl.deleteTexture(entry.texture); runtime.textures.delete(src);
     }
     const publishCompositedIds = () => onCompositedIdsChange(new Set(
       itemsRef.current.filter((item) => runtimeRef.current?.textures.has(item.src)).map((item) => item.id)
@@ -150,19 +152,20 @@ export const GpuImageLayer = memo(function GpuImageLayer({ items, width, height,
         current.gl.texParameteri(current.gl.TEXTURE_2D, current.gl.TEXTURE_WRAP_S, current.gl.CLAMP_TO_EDGE); current.gl.texParameteri(current.gl.TEXTURE_2D, current.gl.TEXTURE_WRAP_T, current.gl.CLAMP_TO_EDGE);
         current.gl.texParameteri(current.gl.TEXTURE_2D, current.gl.TEXTURE_MIN_FILTER, current.gl.LINEAR); current.gl.texParameteri(current.gl.TEXTURE_2D, current.gl.TEXTURE_MAG_FILTER, current.gl.LINEAR);
         current.gl.texImage2D(current.gl.TEXTURE_2D, 0, current.gl.RGBA, current.gl.RGBA, current.gl.UNSIGNED_BYTE, image);
-        current.textures.set(item.src, texture);
-        while (current.textures.size > textureLimit) {
-          const oldest = current.textures.entries().next().value as [string, WebGLTexture] | undefined;
+        current.textures.set(item.src, { texture, bytes: image.naturalWidth * image.naturalHeight * 4, usedAt: performance.now() });
+        const totalBytes = () => [...current.textures.values()].reduce((sum, entry) => sum + entry.bytes, 0);
+        while (current.textures.size > textureLimit || totalBytes() > textureBudgetBytes) {
+          const oldest = [...current.textures.entries()].sort((a, b) => a[1].usedAt - b[1].usedAt)[0];
           if (!oldest) break;
-          current.gl.deleteTexture(oldest[1]); current.textures.delete(oldest[0]);
+          current.gl.deleteTexture(oldest[1].texture); current.textures.delete(oldest[0]);
         }
-        updatePerformanceMetrics({ gpuTextureCount: current.textures.size }); publishCompositedIds(); redrawRef.current();
+        updatePerformanceMetrics({ gpuTextureCount: current.textures.size, gpuTextureMb: Math.round(totalBytes() / 1024 / 1024) }); publishCompositedIds(); redrawRef.current();
       };
       image.onerror = () => { runtimeRef.current?.loading.delete(item.src); publishCompositedIds(); };
       image.src = item.src;
     }
     redrawRef.current();
-  }, [height, items, onCompositedIdsChange, textureLimit, width]);
+  }, [height, items, onCompositedIdsChange, textureBudgetBytes, textureLimit, width]);
   const dpr = Math.min(3, Math.max(1, window.devicePixelRatio || 1));
   return <canvas ref={canvasRef} className="gpu-image-layer" style={{ width, height }} width={Math.max(1, Math.round(width * dpr))} height={Math.max(1, Math.round(height * dpr))} aria-hidden="true" />;
 });

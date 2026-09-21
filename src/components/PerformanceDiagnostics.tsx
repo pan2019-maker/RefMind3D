@@ -25,6 +25,7 @@ export function PerformanceDiagnostics({ projectPath }: { projectPath?: string }
   const [integrity, setIntegrity] = useState<IntegrityReport | null>(null);
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
   const [checking, setChecking] = useState(false);
+  const [imageDiagnostics, setImageDiagnostics] = useState(() => localStorage.getItem('refmind3d.image-diagnostics') === '1');
   useEffect(() => {
     const update = () => setMetrics(performanceMetricsSnapshot());
     const unsubscribe = subscribePerformanceMetrics(update);
@@ -40,7 +41,7 @@ export function PerformanceDiagnostics({ projectPath }: { projectPath?: string }
     if (!path) return;
     const report = {
       generatedAt: new Date().toISOString(),
-      appVersion: '1.16.1',
+      appVersion: '1.17.0',
       platform: navigator.platform,
       hardwareConcurrency: navigator.hardwareConcurrency,
       deviceMemoryGb: (navigator as Navigator & { deviceMemory?: number }).deviceMemory,
@@ -66,7 +67,7 @@ export function PerformanceDiagnostics({ projectPath }: { projectPath?: string }
         <span>图片队列</span><code>活动 {metrics.imageLoadsActive} · 等待 {metrics.imageLoadsQueued} · 并发 {metrics.imageLoadConcurrency}</code>
         <span>图片清晰度</span><code>缩略 {metrics.imageTierThumbnail} · 中等 {metrics.imageTierMedium} · 预览 {metrics.imageTierPreview} · 原图 {metrics.imageTierFull}</code>
         <span>纹理估算</span><code>{metrics.estimatedTextureMb} MB · 内存缓存 {metrics.imageMemoryEntries} 项</code>
-        <span>GPU / 输入延迟</span><code>纹理 {metrics.gpuTextureCount} · P95 {metrics.inputLatencyP95Ms} ms</code>
+        <span>GPU / 输入延迟</span><code>纹理 {metrics.gpuTextureCount} · {metrics.gpuTextureMb} MB · P95 {metrics.inputLatencyP95Ms} ms</code>
         <span>内存硬保护</span><code>{metrics.memoryPressure ? '已触发降载' : '正常'} · JS {metrics.jsHeapMb || '—'} MB · 共 {metrics.resourceProtectionActivations} 次</code>
         <span>显示缩放</span><code>{Math.round(window.devicePixelRatio * 100)}%（DPR {window.devicePixelRatio}）</code>
         <span>缓存命中率</span><code>{hitRate}%（{requests} 次）</code>
@@ -76,6 +77,12 @@ export function PerformanceDiagnostics({ projectPath }: { projectPath?: string }
         <span>最近工程打开</span><code>{metrics.projectOpenMs === undefined ? '尚未记录' : `${metrics.projectOpenMs} ms（索引与当前画布）`}</code>
       </div>
       <div className="performance-benchmark-row">
+        <button onClick={() => {
+          const next = !imageDiagnostics;
+          setImageDiagnostics(next);
+          localStorage.setItem('refmind3d.image-diagnostics', next ? '1' : '0');
+          window.dispatchEvent(new Event('refmind3d-image-diagnostics-changed'));
+        }}>{imageDiagnostics ? '关闭图片渲染诊断' : '开启图片渲染诊断'}</button>
         <button disabled={benchmarking} onClick={() => {
           setBenchmarking(true);
           void runCanvasBenchmarkSuite().then((results) => {

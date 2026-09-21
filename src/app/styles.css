@@ -2332,6 +2332,7 @@ h3 { font-size: 13px; color: #c8c8c8; margin-top: 16px; }
   image-orientation: from-image;
 }
 .image-tile-pyramid { position: absolute; inset: 0; margin: auto; max-width: 100%; max-height: 100%; width: 100%; height: auto; overflow: hidden; transform-origin: center; }
+.image-render-diagnostic { position: absolute; left: 6px; bottom: 6px; z-index: 8; max-width: calc(100% - 12px); padding: 3px 6px; border-radius: 4px; background: rgba(0,0,0,.78); color: #9ed0ff; font: 10px/1.35 Consolas, monospace; pointer-events: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .image-tile-pyramid > img { position: absolute; display: block; padding: 0 !important; object-fit: fill; }
 
 .color-srgb .canvas-stage img { color-interpolation: sRGB; }

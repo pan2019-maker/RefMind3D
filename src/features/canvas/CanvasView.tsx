@@ -5,10 +5,11 @@ import { useShallow } from 'zustand/react/shallow';
 import { useProjectStore } from '../../stores/projectStore';
 import type { AssetRecord, CanvasNode, DoodleStroke, DoodleTool, ImportedModel, SpreadsheetCell, SpreadsheetCellStyle, SpreadsheetMerge, SpreadsheetSheet, SpreadsheetWorkbook } from '../../shared/types';
 import { prepareImageCache, type PreparedImageCache } from '../assets/imageCache';
+import { buildImageRenderPlan } from '../assets/imageRenderPlan';
 import { ImageLoadCancelledError, imageLoadScheduler } from '../assets/imageLoadScheduler';
 import { LruCache } from '../assets/lruCache';
 import { getModelCover, modelCoverKey, setModelCover } from '../assets/modelCoverCache';
-import { boundedGpuNodeIds, closestNodeIds, selectImageMip, shouldUseOverviewRenderer, type ImageMipSource } from '../assets/previewPolicy';
+import { boundedGpuNodeIds, closestNodeIds, shouldUseOverviewRenderer, type ImageMipSource } from '../assets/previewPolicy';
 import { linkedAssetsToWatch, sourceSignatureKey } from '../assets/sourceWatch';
 import { performanceMetricsSnapshot, recordImageCacheResult, recordInputLatency, recordSourceRefresh, updatePerformanceMetrics } from '../performance/performanceMetrics';
 import { adaptiveImageConcurrency, adaptiveResourceBudget, nextQualityTier } from '../performance/resourceBudget';
@@ -20,6 +21,8 @@ import { OverviewImageLayer } from './OverviewImageLayer';
 import { SpatialGridIndex } from './spatialIndex';
 import { snapMovingBounds, type SnapGuide } from './snapGuides';
 import { screenToWorld, stableWorldOrigin, worldToScreen } from './viewTransform';
+import { predictedViewport } from './cameraPrediction';
+import { imagePixelViewScale } from './imagePixelView';
 
 const LazyModelViewer = lazy(() => import('../model-viewer/ModelViewer').then((module) => ({ default: module.ModelViewer })));
 
@@ -517,7 +520,7 @@ function cloneWorkbook(workbook: SpreadsheetWorkbook): SpreadsheetWorkbook {
   return JSON.parse(JSON.stringify(workbook)) as SpreadsheetWorkbook;
 }
 
-const CanvasImage = memo(function CanvasImage({ asset, node, canvasGrayscale, projectCacheId, cacheDirectory, cacheEpoch, displaySize, screenRect, viewportSize, visible, loadPriority, loadEnabled, alt, selected, title }: {
+const CanvasImage = memo(function CanvasImage({ asset, node, canvasGrayscale, projectCacheId, cacheDirectory, cacheEpoch, displaySize, screenRect, viewportSize, visible, loadPriority, loadEnabled, alt, selected, title, diagnostics }: {
   asset: AssetRecord;
   node: CanvasNode;
   canvasGrayscale: boolean;
@@ -533,6 +536,7 @@ const CanvasImage = memo(function CanvasImage({ asset, node, canvasGrayscale, pr
   alt?: string;
   selected: boolean;
   title?: string;
+  diagnostics: boolean;
 }) {
   const cacheKey = `${projectCacheId}:${cacheDirectory || 'default'}:${asset.id}`;
   const displayPixelRatio = Math.min(3, Math.max(1, window.devicePixelRatio || 1));
@@ -574,10 +578,22 @@ const CanvasImage = memo(function CanvasImage({ asset, node, canvasGrayscale, pr
     };
   }, [asset, cacheDirectory, cacheEpoch, cacheKey, loadEnabled, loadPriority, projectCacheId]);
 
-  const selectedMip = selectImageMip(displaySize, displayPixelRatio, imageMipSources(asset, cached));
+  const legacyTileLevel = cached?.tileUrls.length ? [{
+    maxEdge: Math.max(cached.imageWidth, cached.imageHeight), urls: cached.tileUrls,
+    tileSize: cached.tileSize, tileColumns: cached.tileColumns,
+    imageWidth: cached.imageWidth, imageHeight: cached.imageHeight
+  }] : [];
+  const renderPlan = buildImageRenderPlan({
+    displayEdgeCss: displaySize, devicePixelRatio: displayPixelRatio,
+    sources: imageMipSources(asset, cached), baseUrl: cached?.thumbnailUrl || assetUrl(asset, true),
+    tileLevels: cached?.tileLevels?.length ? cached.tileLevels : legacyTileLevel,
+    visible, cropEnabled: Boolean(node.cropEnabled)
+  });
+  const selectedMip = renderPlan.mip;
   const src = selectedMip.url;
-  const baseSrc = cached?.thumbnailUrl || assetUrl(asset, true);
+  const baseSrc = renderPlan.baseUrl;
   const [resolvedSrc, setResolvedSrc] = useState(src);
+  const [decodedSize, setDecodedSize] = useState({ width: 0, height: 0 });
 
   useEffect(() => {
     if (src === resolvedSrc) return;
@@ -597,23 +613,24 @@ const CanvasImage = memo(function CanvasImage({ asset, node, canvasGrayscale, pr
     `scaleX(${node.flipX ? -1 : 1})`,
     `scaleY(${node.flipY ? -1 : 1})`
   ].join(' ');
-  const useTiles = Boolean(cached?.tileUrls.length && cached.tileColumns > 0 && displaySize * displayPixelRatio > 1600 && visible && !node.cropEnabled);
+  const tileLevel = renderPlan.tileLevel;
+  const useTiles = renderPlan.renderer === 'tiles' && Boolean(tileLevel);
   const visibleTileIndexes = useMemo(() => {
-    if (!useTiles || !cached) return new Set<number>();
-    const scale = Math.min(screenRect.width / cached.imageWidth, screenRect.height / cached.imageHeight);
-    const renderWidth = cached.imageWidth * scale; const renderHeight = cached.imageHeight * scale;
+    if (!useTiles || !tileLevel) return new Set<number>();
+    const scale = Math.min(screenRect.width / tileLevel.imageWidth, screenRect.height / tileLevel.imageHeight);
+    const renderWidth = tileLevel.imageWidth * scale; const renderHeight = tileLevel.imageHeight * scale;
     const left = screenRect.x + (screenRect.width - renderWidth) / 2; const top = screenRect.y + (screenRect.height - renderHeight) / 2;
-    const x0 = Math.max(0, (Math.max(0, left) - left) / scale - cached.tileSize);
-    const y0 = Math.max(0, (Math.max(0, top) - top) / scale - cached.tileSize);
-    const x1 = Math.min(cached.imageWidth, (Math.min(viewportSize.width, left + renderWidth) - left) / scale + cached.tileSize);
-    const y1 = Math.min(cached.imageHeight, (Math.min(viewportSize.height, top + renderHeight) - top) / scale + cached.tileSize);
-    const indexes = new Set<number>(); const rows = Math.ceil(cached.imageHeight / cached.tileSize);
-    for (let row = 0; row < rows; row += 1) for (let column = 0; column < cached.tileColumns; column += 1) {
-      const tx = column * cached.tileSize; const ty = row * cached.tileSize;
-      if (tx < x1 && tx + cached.tileSize > x0 && ty < y1 && ty + cached.tileSize > y0) indexes.add(row * cached.tileColumns + column);
+    const x0 = Math.max(0, (Math.max(0, left) - left) / scale - tileLevel.tileSize);
+    const y0 = Math.max(0, (Math.max(0, top) - top) / scale - tileLevel.tileSize);
+    const x1 = Math.min(tileLevel.imageWidth, (Math.min(viewportSize.width, left + renderWidth) - left) / scale + tileLevel.tileSize);
+    const y1 = Math.min(tileLevel.imageHeight, (Math.min(viewportSize.height, top + renderHeight) - top) / scale + tileLevel.tileSize);
+    const indexes = new Set<number>(); const rows = Math.ceil(tileLevel.imageHeight / tileLevel.tileSize);
+    for (let row = 0; row < rows; row += 1) for (let column = 0; column < tileLevel.tileColumns; column += 1) {
+      const tx = column * tileLevel.tileSize; const ty = row * tileLevel.tileSize;
+      if (tx < x1 && tx + tileLevel.tileSize > x0 && ty < y1 && ty + tileLevel.tileSize > y0) indexes.add(row * tileLevel.tileColumns + column);
     }
     return indexes;
-  }, [cached, screenRect, useTiles, viewportSize]);
+  }, [screenRect, tileLevel, useTiles, viewportSize]);
 
   return (
     <>
@@ -632,17 +649,17 @@ const CanvasImage = memo(function CanvasImage({ asset, node, canvasGrayscale, pr
           objectFit: node.cropEnabled ? 'cover' : 'contain'
         }}
       />}
-      {useTiles && cached && <div className="image-tile-pyramid" style={{
-        aspectRatio: `${cached.imageWidth} / ${cached.imageHeight}`,
+      {useTiles && tileLevel && <div className="image-tile-pyramid" style={{
+        aspectRatio: `${tileLevel.imageWidth} / ${tileLevel.imageHeight}`,
         transform: imageTransform,
         opacity: node.opacity ?? 1,
         filter: canvasGrayscale || node.grayscale ? 'grayscale(1)' : undefined
-      }}>{cached.tileUrls.map((url, index) => {
+      }}>{tileLevel.urls.map((url, index) => {
         if (!visibleTileIndexes.has(index)) return null;
-        const column = index % cached.tileColumns; const row = Math.floor(index / cached.tileColumns);
-        const x = column * cached.tileSize; const y = row * cached.tileSize;
-        const tileWidth = Math.min(cached.tileSize, cached.imageWidth - x); const tileHeight = Math.min(cached.tileSize, cached.imageHeight - y);
-        return <img key={url} src={url} draggable={false} decoding="async" alt="" style={{ left: `${x / cached.imageWidth * 100}%`, top: `${y / cached.imageHeight * 100}%`, width: `${tileWidth / cached.imageWidth * 100}%`, height: `${tileHeight / cached.imageHeight * 100}%` }} />;
+        const column = index % tileLevel.tileColumns; const row = Math.floor(index / tileLevel.tileColumns);
+        const x = column * tileLevel.tileSize; const y = row * tileLevel.tileSize;
+        const tileWidth = Math.min(tileLevel.tileSize, tileLevel.imageWidth - x); const tileHeight = Math.min(tileLevel.tileSize, tileLevel.imageHeight - y);
+        return <img key={url} src={url} draggable={false} decoding="async" alt="" style={{ left: `${x / tileLevel.imageWidth * 100}%`, top: `${y / tileLevel.imageHeight * 100}%`, width: `${tileWidth / tileLevel.imageWidth * 100}%`, height: `${tileHeight / tileLevel.imageHeight * 100}%` }} />;
       })}</div>}
       {!useTiles && <img
         className="image-node image-node-detail"
@@ -661,6 +678,7 @@ const CanvasImage = memo(function CanvasImage({ asset, node, canvasGrayscale, pr
         }}
         onLoad={(event) => {
           event.currentTarget.style.opacity = String(node.opacity ?? 1);
+          setDecodedSize({ width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight });
         }}
         onError={(event) => {
           const image = event.currentTarget;
@@ -670,6 +688,9 @@ const CanvasImage = memo(function CanvasImage({ asset, node, canvasGrayscale, pr
           image.alt = `图片预览加载失败：${asset.previewPath || asset.projectAssetPath}`;
         }}
       />}
+      {diagnostics && <span className="image-render-diagnostic">
+        {useTiles ? `DOM tiles ${tileLevel?.maxEdge}px` : `DOM ${selectedMip.band}`} · {decodedSize.width || '…'}×{decodedSize.height || '…'} · 屏幕 {Math.round(displaySize)}px · DPR {displayPixelRatio} · {cached?.cacheHit ? '缓存命中' : '缓存生成'}
+      </span>}
     </>
   );
 });
@@ -810,6 +831,7 @@ export function CanvasView({
   const [gpuSupported, setGpuSupported] = useState(true);
   const [gpuCompositedIds, setGpuCompositedIds] = useState<ReadonlySet<string>>(() => new Set());
   const [overviewCompositedIds, setOverviewCompositedIds] = useState<ReadonlySet<string>>(() => new Set());
+  const [imageDiagnostics, setImageDiagnostics] = useState(() => localStorage.getItem('refmind3d.image-diagnostics') === '1');
   const [drag, setDrag] = useState<{
     ids?: string[];
     startX: number;
@@ -855,6 +877,7 @@ export function CanvasView({
   const panVelocityRef = useRef({ x: 0, y: 0 });
   const panSampleRef = useRef({ x: 0, y: 0, at: 0 });
   const panInertiaFrameRef = useRef<number | null>(null);
+  const panPreviewFrameRef = useRef<number | null>(null);
   const touchPointsRef = useRef(new Map<number, { x: number; y: number }>());
   const touchGestureRef = useRef<{ distance: number; worldX: number; worldY: number } | null>(null);
   const touchFrameRef = useRef<number | null>(null);
@@ -867,6 +890,8 @@ export function CanvasView({
   } | null>(null);
   const zoomRef = useRef<ViewState | null>(null);
   const wheelTimeoutRef = useRef<number | null>(null);
+  const wheelPreviewFrameRef = useRef<number | null>(null);
+  const wheelPreviewTransformRef = useRef('none');
   const activeDoodleRef = useRef<DoodleStroke | null>(null);
   const activeDoodlePointerRef = useRef<number | null>(null);
   const nodeDragPreviewRef = useRef({ dx: 0, dy: 0 });
@@ -890,6 +915,10 @@ export function CanvasView({
     if (viewportRef.current) {
       viewportRef.current.classList.remove('is-zooming');
     }
+    if (wheelPreviewFrameRef.current !== null) {
+      cancelAnimationFrame(wheelPreviewFrameRef.current);
+      wheelPreviewFrameRef.current = null;
+    }
     worldRef.current?.style.setProperty('transform', 'none', 'important');
     if (zoomRef.current) {
       const targetView = zoomRef.current;
@@ -912,6 +941,14 @@ export function CanvasView({
 
   useEffect(() => () => {
     if (wheelTimeoutRef.current !== null) window.clearTimeout(wheelTimeoutRef.current);
+    if (wheelPreviewFrameRef.current !== null) cancelAnimationFrame(wheelPreviewFrameRef.current);
+    if (panPreviewFrameRef.current !== null) cancelAnimationFrame(panPreviewFrameRef.current);
+  }, []);
+
+  useEffect(() => {
+    const update = () => setImageDiagnostics(localStorage.getItem('refmind3d.image-diagnostics') === '1');
+    window.addEventListener('refmind3d-image-diagnostics-changed', update);
+    return () => window.removeEventListener('refmind3d-image-diagnostics-changed', update);
   }, []);
 
   useEffect(() => {
@@ -1160,6 +1197,7 @@ export function CanvasView({
   const liveVideoIds = useMemo(() => closestNodeIds(visibleNodes.filter((node) => node.type === 'video'), viewportWorldCenter, resourceBudget.videos), [resourceBudget.videos, viewportWorldCenter, visibleNodes]);
   const lowZoom = view.scale < 0.35;
   const gpuTextureLimit = memoryPressure ? 48 : 192;
+  const gpuTextureBudgetBytes = (memoryPressure ? 48 : Math.min(384, Math.max(96, ((navigator as Navigator & { deviceMemory?: number }).deviceMemory || 8) * 32))) * 1024 * 1024;
   const allImageRenderItems = useMemo(() => {
     const displayPixelRatio = Math.min(3, Math.max(1, window.devicePixelRatio || 1));
     const images = renderedNodes.filter((node) => node.type === 'image');
@@ -1181,16 +1219,20 @@ export function CanvasView({
       } else { width = height * sourceAspect; x += (node.width * view.scale - width) / 2; }
       const cacheKey = `${projectCacheId}:${cacheDirectory || 'default'}:${asset.id}`;
       const cached = preparedImageCache.get(cacheKey)?.value;
-      const src = selectImageMip(Math.max(width, height), displayPixelRatio, imageMipSources(asset, cached)).url;
+      const src = buildImageRenderPlan({
+        displayEdgeCss: Math.max(width, height), devicePixelRatio: displayPixelRatio,
+        sources: imageMipSources(asset, cached), baseUrl: cached?.thumbnailUrl || assetUrl(asset, true),
+        visible: visibleNodeIds.has(node.id), cropEnabled: Boolean(node.cropEnabled)
+      }).mip.url;
       return [{ id: node.id, src, x, y, width, height, opacity: node.opacity ?? 1, rotation: node.rotation || 0, flipX: Boolean(node.flipX), flipY: Boolean(node.flipY), grayscale: Boolean(node.grayscale || project.canvasGrayscale), u0, v0, u1, v1 }];
     });
-  }, [assetsById, cacheDirectory, preparedImageRevision, project.canvasGrayscale, projectCacheId, renderedNodes, selectedNodeIdSet, view, worldOrigin]);
-  const overviewMode = shouldUseOverviewRenderer(view.scale, allImageRenderItems.length);
+  }, [assetsById, cacheDirectory, preparedImageRevision, project.canvasGrayscale, projectCacheId, renderedNodes, selectedNodeIdSet, view, visibleNodeIds, worldOrigin]);
+  const overviewMode = !imageDiagnostics && shouldUseOverviewRenderer(view.scale, allImageRenderItems.length);
   const gpuImageItems = useMemo(() => {
-    if (overviewMode || !gpuSupported || allImageRenderItems.length < 30 || (view.scale >= 0.32 && project.nodes.length < 2_000)) return [] as GpuImageItem[];
+    if (imageDiagnostics || overviewMode || !gpuSupported || allImageRenderItems.length < 30 || (view.scale >= 0.32 && project.nodes.length < 2_000)) return [] as GpuImageItem[];
     const candidateIds = boundedGpuNodeIds(allImageRenderItems, { x: viewportSize.width / 2, y: viewportSize.height / 2 }, gpuTextureLimit, new Set());
     return allImageRenderItems.filter((item) => candidateIds.has(item.id));
-  }, [allImageRenderItems, gpuSupported, gpuTextureLimit, overviewMode, project.nodes.length, view.scale, viewportSize]);
+  }, [allImageRenderItems, gpuSupported, gpuTextureLimit, imageDiagnostics, overviewMode, project.nodes.length, view.scale, viewportSize]);
   useEffect(() => {
     if (!pageVisible || gpuImageItems.length === 0) return;
     let cancelled = false;
@@ -1236,15 +1278,15 @@ export function CanvasView({
   }), []);
   const predictedPrefetchIds = useMemo(() => {
     const direction = panDirectionRef.current;
-    if (direction.x === 0 && direction.y === 0) return new Set<string>();
     const width = viewportSize.width / view.scale;
     const height = viewportSize.height / view.scale;
-    return new Set(nodeSpatialIndex.query({
-      x: -view.x / view.scale + direction.x * width * 0.65,
-      y: -view.y / view.scale + direction.y * height * 0.65,
+    const corridor = predictedViewport({
+      x: -view.x / view.scale,
+      y: -view.y / view.scale,
       width,
       height
-    }).map((node) => node.id));
+    }, { x: direction.x, y: direction.y, speed: Math.hypot(panVelocityRef.current.x, panVelocityRef.current.y) });
+    return new Set(nodeSpatialIndex.query(corridor).map((node) => node.id));
   }, [nodeSpatialIndex, project.nodes, view, viewportSize]);
   performanceCountsRef.current = {
     totalNodes: project.nodes.length,
@@ -1598,6 +1640,20 @@ export function CanvasView({
   viewRef.current = view;
 
   useEffect(() => {
+    const inspectPixels = (event: Event) => {
+      const ratio = Math.max(1, Math.min(2, Number((event as CustomEvent<{ ratio?: number }>).detail?.ratio) || 1));
+      const node = project.nodes.find((item) => selectedNodeIdSet.has(item.id) && item.type === 'image' && item.assetId);
+      const asset = node?.assetId ? assetsById.get(node.assetId) : undefined;
+      if (!node || !asset) return;
+      const source = { width: Number((asset as AssetRecord & { width?: number }).width) || node.width, height: Number((asset as AssetRecord & { height?: number }).height) || node.height };
+      const scale = Math.min(8, imagePixelViewScale(node, source, window.devicePixelRatio || 1, ratio));
+      setView({ x: viewportSize.width / 2 - (node.x + node.width / 2) * scale, y: viewportSize.height / 2 - (node.y + node.height / 2) * scale, scale });
+    };
+    window.addEventListener('refmind3d-image-pixel-view', inspectPixels);
+    return () => window.removeEventListener('refmind3d-image-pixel-view', inspectPixels);
+  }, [assetsById, project.nodes, selectedNodeIdSet, viewportSize]);
+
+  useEffect(() => {
     const applyPanPreview = (clientX: number, clientY: number) => {
       const gesture = panGestureRef.current;
       if (!gesture?.active) return;
@@ -1618,11 +1674,13 @@ export function CanvasView({
         y: clientY - gesture.startY
       };
       panPreviewRef.current = offset;
-      worldRef.current?.style.setProperty(
-        'transform',
-        `translate3d(${offset.x}px, ${offset.y}px, 0)`,
-        'important'
-      );
+      if (panPreviewFrameRef.current === null) {
+        panPreviewFrameRef.current = requestAnimationFrame(() => {
+          panPreviewFrameRef.current = null;
+          const latest = panPreviewRef.current;
+          worldRef.current?.style.setProperty('transform', `translate3d(${latest.x}px, ${latest.y}px, 0)`, 'important');
+        });
+      }
     };
 
     const finishPan = (clientX?: number, clientY?: number) => {
@@ -1740,6 +1798,10 @@ export function CanvasView({
     return () => {
       if (panInertiaFrameRef.current !== null) cancelAnimationFrame(panInertiaFrameRef.current);
       panGestureRef.current = null;
+      if (panPreviewFrameRef.current !== null) {
+        cancelAnimationFrame(panPreviewFrameRef.current);
+        panPreviewFrameRef.current = null;
+      }
       panPreviewRef.current = { x: 0, y: 0 };
       worldRef.current?.style.setProperty('transform', 'none', 'important');
       window.removeEventListener('mousedown', handleMousedown, true);
@@ -1838,8 +1900,12 @@ export function CanvasView({
     const tx = nextView.x - view.x * s;
     const ty = nextView.y - view.y * s;
 
-    if (worldRef.current) {
-      worldRef.current.style.setProperty('transform', `translate3d(${tx}px, ${ty}px, 0) scale(${s})`, 'important');
+    wheelPreviewTransformRef.current = `translate3d(${tx}px, ${ty}px, 0) scale(${s})`;
+    if (wheelPreviewFrameRef.current === null) {
+      wheelPreviewFrameRef.current = requestAnimationFrame(() => {
+        wheelPreviewFrameRef.current = null;
+        worldRef.current?.style.setProperty('transform', wheelPreviewTransformRef.current, 'important');
+      });
     }
 
     if (viewportRef.current) {
@@ -2693,7 +2759,7 @@ export function CanvasView({
       >
         {showGrid && !lowZoom && <div className="canvas-grid" />}
         {overviewMode && <OverviewImageLayer items={allImageRenderItems} width={viewportSize.width} height={viewportSize.height} onCompositedIdsChange={handleOverviewCompositedIds} />}
-        {gpuImageItems.length > 0 && <GpuImageLayer items={gpuImageItems} width={viewportSize.width} height={viewportSize.height} textureLimit={gpuTextureLimit} onSupportChange={handleGpuSupport} onCompositedIdsChange={handleGpuCompositedIds} />}
+        {gpuImageItems.length > 0 && <GpuImageLayer items={gpuImageItems} width={viewportSize.width} height={viewportSize.height} textureLimit={gpuTextureLimit} textureBudgetBytes={gpuTextureBudgetBytes} onSupportChange={handleGpuSupport} onCompositedIdsChange={handleGpuCompositedIds} />}
         <svg className="mindmap-layer" width={viewportSize.width} height={viewportSize.height} viewBox={`0 0 ${viewportSize.width} ${viewportSize.height}`}>
           {renderedLinks.map((link) => {
             const fromNode = nodesById.get(link.fromNodeId);
@@ -2816,6 +2882,7 @@ export function CanvasView({
                     alt={node.title}
                     selected={selected}
                     title={node.title}
+                    diagnostics={imageDiagnostics}
                   />
                 )}
                 {node.type === 'video' && asset && (

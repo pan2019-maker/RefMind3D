@@ -20,6 +20,14 @@ export interface PreparedImageCache {
   tileColumns: number;
   imageWidth: number;
   imageHeight: number;
+  tileLevels?: Array<{
+    maxEdge: number;
+    urls: string[];
+    tileSize: number;
+    tileColumns: number;
+    imageWidth: number;
+    imageHeight: number;
+  }>;
   cacheHit: boolean;
 }
 

@@ -10,6 +10,7 @@ export interface SelectedImageMip {
   url: string;
   band: ImageResolutionBand;
   targetPhysicalEdge: number;
+  maxEdge: number;
 }
 
 /**
@@ -35,7 +36,8 @@ export function selectImageMip(
   return {
     url: selected?.url || '',
     band: selected?.band || 'full',
-    targetPhysicalEdge
+    targetPhysicalEdge,
+    maxEdge: selected?.maxEdge || 0
   };
 }
 

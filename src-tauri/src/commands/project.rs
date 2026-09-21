@@ -79,12 +79,25 @@ fn payload_hash(bytes: &[u8]) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-fn open_previous_canvases(path: &Path) -> Option<(ZipArchive<File>, HashMap<String, PackedCanvas>)> {
+fn open_previous_canvases(
+    path: &Path,
+) -> Option<(ZipArchive<File>, HashMap<String, PackedCanvas>)> {
     let mut archive = ZipArchive::new(File::open(path).ok()?).ok()?;
     let mut manifest_text = String::new();
-    archive.by_name("project.json").ok()?.read_to_string(&mut manifest_text).ok()?;
+    archive
+        .by_name("project.json")
+        .ok()?
+        .read_to_string(&mut manifest_text)
+        .ok()?;
     let manifest: PackedProjectFile = serde_json::from_str(&manifest_text).ok()?;
-    Some((archive, manifest.canvases.into_iter().map(|canvas| (canvas.id.clone(), canvas)).collect()))
+    Some((
+        archive,
+        manifest
+            .canvases
+            .into_iter()
+            .map(|canvas| (canvas.id.clone(), canvas))
+            .collect(),
+    ))
 }
 
 enum ResourceSource {
@@ -447,24 +460,6 @@ pub fn load_project_index(path: String) -> Result<Value, String> {
     if manifest.version < 3 || manifest.canvases.is_empty() {
         return load_project(path, None);
     }
-    let mut path_resources = Vec::new();
-    for resource in &manifest.resources {
-        let out_path = runtime_assets::register_packed_resource(
-            &path,
-            &PackedResourceRegistration {
-                asset_id: resource.asset_id.clone(),
-                field: resource.field.clone(),
-                file_name: resource.file_name.clone(),
-                mime: resource.mime.clone(),
-                zip_path: resource.zip_path.clone(),
-            },
-        );
-        path_resources.push(PathResource {
-            asset_id: resource.asset_id.clone(),
-            field: resource.field.clone(),
-            path: out_path,
-        });
-    }
     let active_id = manifest
         .project
         .get("activeCanvasId")
@@ -485,6 +480,9 @@ pub fn load_project_index(path: String) -> Result<Value, String> {
                         .map_err(|e| format!("Read canvas failed: {e}"))?;
                     let mut value: Value = serde_json::from_str(&text)
                         .map_err(|e| format!("Parse canvas failed: {e}"))?;
+                    let wanted = project_asset_ids(&value);
+                    let path_resources =
+                        register_project_resources(&path, &manifest.resources, &wanted);
                     patch_path_resources(&mut value, &path_resources);
                     canvas["project"] = value;
                 }
@@ -524,14 +522,35 @@ pub fn load_project_canvas(path: String, canvas_id: String) -> Result<Value, Str
         .map_err(|e| format!("Read canvas failed: {e}"))?;
     let mut value: Value =
         serde_json::from_str(&text).map_err(|e| format!("Parse canvas failed: {e}"))?;
-    let resources = manifest
-        .resources
+    let wanted = project_asset_ids(&value);
+    let resources = register_project_resources(&path, &manifest.resources, &wanted);
+    patch_path_resources(&mut value, &resources);
+    Ok(value)
+}
+
+fn project_asset_ids(project: &Value) -> HashSet<String> {
+    project
+        .get("assets")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|asset| asset.get("id").and_then(Value::as_str).map(str::to_owned))
+        .collect()
+}
+
+fn register_project_resources(
+    path: &str,
+    resources: &[PackedResource],
+    wanted: &HashSet<String>,
+) -> Vec<PathResource> {
+    resources
         .iter()
+        .filter(|resource| wanted.contains(&resource.asset_id))
         .map(|resource| PathResource {
             asset_id: resource.asset_id.clone(),
             field: resource.field.clone(),
             path: runtime_assets::register_packed_resource(
-                &path,
+                path,
                 &PackedResourceRegistration {
                     asset_id: resource.asset_id.clone(),
                     field: resource.field.clone(),
@@ -541,9 +560,7 @@ pub fn load_project_canvas(path: String, canvas_id: String) -> Result<Value, Str
                 },
             ),
         })
-        .collect::<Vec<_>>();
-    patch_path_resources(&mut value, &resources);
-    Ok(value)
+        .collect()
 }
 
 fn recovery_directory() -> PathBuf {
@@ -712,11 +729,16 @@ fn save_packed_project(path: String, mut project: Value) -> Result<(), String> {
                     .to_string();
                 if let Some(project_value) = canvas.get_mut("project") {
                     let payload = std::mem::replace(project_value, Value::Null);
-                    let bytes = serde_json::to_vec(&payload).map_err(|e| format!("Serialize canvas failed: {e}"))?;
-                    canvas_payloads.push((PackedCanvas {
-                        id: id.clone(), zip_path: format!("canvases/{}.json", sanitize_file_name(&id)),
-                        content_hash: payload_hash(&bytes),
-                    }, bytes));
+                    let bytes = serde_json::to_vec(&payload)
+                        .map_err(|e| format!("Serialize canvas failed: {e}"))?;
+                    canvas_payloads.push((
+                        PackedCanvas {
+                            id: id.clone(),
+                            zip_path: format!("canvases/{}.json", sanitize_file_name(&id)),
+                            content_hash: payload_hash(&bytes),
+                        },
+                        bytes,
+                    ));
                 }
             }
         }
@@ -764,16 +786,25 @@ fn save_packed_project(path: String, mut project: Value) -> Result<(), String> {
         .map_err(|e| format!("Write project index failed: {e}"))?;
 
     for (meta, bytes) in &canvas_payloads {
-        let reused = previous.as_mut().and_then(|(archive, prior)| {
-            let old = prior.get(&meta.id)?;
-            if old.content_hash != meta.content_hash || old.content_hash.is_empty() { return None; }
-            let file = archive.by_name(&old.zip_path).ok()?;
-            zip.raw_copy_file_rename(file, &meta.zip_path).ok()?;
-            Some(())
-        }).is_some();
-        if reused { continue; }
-        zip.start_file(&meta.zip_path, deflated).map_err(|e| format!("Write canvas index failed: {e}"))?;
-        zip.write_all(bytes).map_err(|e| format!("Write canvas failed: {e}"))?;
+        let reused = previous
+            .as_mut()
+            .and_then(|(archive, prior)| {
+                let old = prior.get(&meta.id)?;
+                if old.content_hash != meta.content_hash || old.content_hash.is_empty() {
+                    return None;
+                }
+                let file = archive.by_name(&old.zip_path).ok()?;
+                zip.raw_copy_file_rename(file, &meta.zip_path).ok()?;
+                Some(())
+            })
+            .is_some();
+        if reused {
+            continue;
+        }
+        zip.start_file(&meta.zip_path, deflated)
+            .map_err(|e| format!("Write canvas index failed: {e}"))?;
+        zip.write_all(bytes)
+            .map_err(|e| format!("Write canvas failed: {e}"))?;
     }
 
     for item in sources {
@@ -1743,6 +1774,15 @@ mod tests {
             legacy_embedded_resource_mime(&asset, &resource),
             "image/png"
         );
+    }
+
+    #[test]
+    fn streaming_open_collects_only_current_canvas_asset_ids() {
+        let canvas = json!({ "assets": [{ "id": "visible-a" }, { "id": "visible-b" }], "nodes": [] });
+        let ids = project_asset_ids(&canvas);
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains("visible-a"));
+        assert!(!ids.contains("other-canvas"));
     }
 
     #[test]

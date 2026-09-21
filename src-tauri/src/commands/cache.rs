@@ -42,6 +42,17 @@ pub struct CacheStatus {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PreparedTileLevel {
+    max_edge: u32,
+    urls: Vec<String>,
+    tile_size: u32,
+    tile_columns: u32,
+    image_width: u32,
+    image_height: u32,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PreparedImageCache {
     preview_url: String,
     medium_url: String,
@@ -51,7 +62,19 @@ pub struct PreparedImageCache {
     tile_columns: u32,
     image_width: u32,
     image_height: u32,
+    tile_levels: Vec<PreparedTileLevel>,
     cache_hit: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CacheTileLevel {
+    max_edge: u32,
+    files: Vec<String>,
+    tile_size: u32,
+    tile_columns: u32,
+    image_width: u32,
+    image_height: u32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -74,7 +97,31 @@ struct CacheManifest {
     image_width: u32,
     #[serde(default)]
     image_height: u32,
+    #[serde(default)]
+    tile_levels: Vec<CacheTileLevel>,
     last_accessed_ms: u64,
+}
+
+struct TileRegistration {
+    max_edge: u32,
+    paths: Vec<PathBuf>,
+    tile_size: u32,
+    tile_columns: u32,
+    image_width: u32,
+    image_height: u32,
+}
+
+fn tile_level_edges(max_edge: u32) -> Vec<u32> {
+    if max_edge <= 2400 {
+        return Vec::new();
+    }
+    let mut levels = vec![max_edge.min(4096)];
+    if max_edge > 4096 {
+        levels.push(max_edge.min(8192));
+    }
+    levels.sort_unstable();
+    levels.dedup();
+    levels
 }
 
 enum SourceLocation {
@@ -368,6 +415,35 @@ fn prepare_sync(
                     .map(|file| dir.join(file))
                     .filter(|path| path.is_file())
                     .collect::<Vec<_>>();
+                let tile_levels = if manifest.tile_levels.is_empty() && !tiles.is_empty() {
+                    vec![TileRegistration {
+                        max_edge: manifest.image_width.max(manifest.image_height),
+                        paths: tiles.clone(),
+                        tile_size: manifest.tile_size,
+                        tile_columns: manifest.tile_columns,
+                        image_width: manifest.image_width,
+                        image_height: manifest.image_height,
+                    }]
+                } else {
+                    manifest
+                        .tile_levels
+                        .iter()
+                        .map(|level| TileRegistration {
+                            max_edge: level.max_edge,
+                            paths: level
+                                .files
+                                .iter()
+                                .map(|file| dir.join(file))
+                                .filter(|path| path.is_file())
+                                .collect(),
+                            tile_size: level.tile_size,
+                            tile_columns: level.tile_columns,
+                            image_width: level.image_width,
+                            image_height: level.image_height,
+                        })
+                        .filter(|level| !level.paths.is_empty())
+                        .collect()
+                };
                 return Ok(register(
                     &asset_id,
                     project_id,
@@ -379,6 +455,7 @@ fn prepare_sync(
                     manifest.tile_columns,
                     manifest.image_width,
                     manifest.image_height,
+                    &tile_levels,
                     &format!("{}-{}-{}", size, modified, hash),
                     true,
                 ));
@@ -412,39 +489,42 @@ fn prepare_sync(
     write_png(&medium, resize(image.clone(), 1200), icc_profile.as_deref())?;
     write_png(&thumb, resize(image.clone(), 512), icc_profile.as_deref())?;
     let tile_size = 1024;
-    let tiled = source_width.max(source_height) > 4096;
-    let pyramid = if tiled {
-        resize(image, 8192)
-    } else {
-        DynamicImage::new_rgba8(1, 1)
-    };
-    let (image_width, image_height) = if tiled { pyramid.dimensions() } else { (0, 0) };
-    let tile_columns = if tiled {
-        image_width.div_ceil(tile_size)
-    } else {
-        0
-    };
-    let tile_rows = if tiled {
-        image_height.div_ceil(tile_size)
-    } else {
-        0
-    };
-    let mut tile_files = Vec::new();
-    for row in 0..tile_rows {
-        for column in 0..tile_columns {
-            let x = column * tile_size;
-            let y = row * tile_size;
-            let width = tile_size.min(image_width - x);
-            let height = tile_size.min(image_height - y);
-            let file = format!("tile-{row}-{column}.png");
-            write_png(
-                &dir.join(&file),
-                pyramid.crop_imm(x, y, width, height),
-                icc_profile.as_deref(),
-            )?;
-            tile_files.push(file);
+    let mut tile_levels = Vec::new();
+    for max_edge in tile_level_edges(source_width.max(source_height)) {
+        let pyramid = resize(image.clone(), max_edge);
+        let (image_width, image_height) = pyramid.dimensions();
+        let tile_columns = image_width.div_ceil(tile_size);
+        let tile_rows = image_height.div_ceil(tile_size);
+        let mut files = Vec::new();
+        for row in 0..tile_rows {
+            for column in 0..tile_columns {
+                let x = column * tile_size;
+                let y = row * tile_size;
+                let width = tile_size.min(image_width - x);
+                let height = tile_size.min(image_height - y);
+                let file = format!("tile-{max_edge}-{row}-{column}.png");
+                write_png(
+                    &dir.join(&file),
+                    pyramid.crop_imm(x, y, width, height),
+                    icc_profile.as_deref(),
+                )?;
+                files.push(file);
+            }
         }
+        tile_levels.push(CacheTileLevel {
+            max_edge,
+            files,
+            tile_size,
+            tile_columns,
+            image_width,
+            image_height,
+        });
     }
+    let highest = tile_levels.last();
+    let tile_files = highest.map(|level| level.files.clone()).unwrap_or_default();
+    let tile_columns = highest.map(|level| level.tile_columns).unwrap_or(0);
+    let image_width = highest.map(|level| level.image_width).unwrap_or(0);
+    let image_height = highest.map(|level| level.image_height).unwrap_or(0);
     let manifest = CacheManifest {
         source_size: size,
         source_modified_ms: modified,
@@ -457,6 +537,7 @@ fn prepare_sync(
         tile_columns,
         image_width,
         image_height,
+        tile_levels: tile_levels.clone(),
         last_accessed_ms: now_ms(),
     };
     fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
@@ -464,6 +545,17 @@ fn prepare_sync(
     let tiles = tile_files
         .iter()
         .map(|file| dir.join(file))
+        .collect::<Vec<_>>();
+    let tile_registrations = tile_levels
+        .iter()
+        .map(|level| TileRegistration {
+            max_edge: level.max_edge,
+            paths: level.files.iter().map(|file| dir.join(file)).collect(),
+            tile_size: level.tile_size,
+            tile_columns: level.tile_columns,
+            image_width: level.image_width,
+            image_height: level.image_height,
+        })
         .collect::<Vec<_>>();
     Ok(register(
         &asset_id,
@@ -476,6 +568,7 @@ fn prepare_sync(
         tile_columns,
         image_width,
         image_height,
+        &tile_registrations,
         &format!("{}-{}-{}", size, modified, hash),
         false,
     ))
@@ -591,6 +684,7 @@ fn register(
     tile_columns: u32,
     image_width: u32,
     image_height: u32,
+    tile_levels: &[TileRegistration],
     generation: &str,
     hit: bool,
 ) -> PreparedImageCache {
@@ -639,6 +733,31 @@ fn register(
         tile_columns,
         image_width,
         image_height,
+        tile_levels: tile_levels
+            .iter()
+            .enumerate()
+            .map(|(level_index, level)| PreparedTileLevel {
+                max_edge: level.max_edge,
+                urls: level
+                    .paths
+                    .iter()
+                    .enumerate()
+                    .map(|(index, path)| {
+                        runtime_assets::register_file_resource(
+                            asset_id,
+                            &format!("cacheTileLevel:{suffix}:{generation}:{level_index}:{index}"),
+                            format!("tile-{}-{index}.png", level.max_edge),
+                            "image/png".into(),
+                            path.clone(),
+                        )
+                    })
+                    .collect(),
+                tile_size: level.tile_size,
+                tile_columns: level.tile_columns,
+                image_width: level.image_width,
+                image_height: level.image_height,
+            })
+            .collect(),
         cache_hit: hit,
     }
 }
@@ -973,7 +1092,15 @@ mod tests {
         .unwrap();
         assert_eq!(prepared.tile_columns, 5);
         assert_eq!(prepared.tile_urls.len(), 5);
+        assert_eq!(prepared.tile_levels.len(), 2);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tile_pyramid_levels_are_bounded_and_deduplicated() {
+        assert!(tile_level_edges(2200).is_empty());
+        assert_eq!(tile_level_edges(4100), vec![4096, 4100]);
+        assert_eq!(tile_level_edges(12000), vec![4096, 8192]);
     }
 
     #[test]
@@ -999,6 +1126,7 @@ mod tests {
                 tile_columns: 0,
                 image_width: 0,
                 image_height: 0,
+                tile_levels: Vec::new(),
                 last_accessed_ms: accessed,
             };
             fs::write(
